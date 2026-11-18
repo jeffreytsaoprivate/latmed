@@ -337,14 +337,15 @@ async function makeLocal() {
 /* ---------------- state ---------------- */
 let store = null;
 const S = { accounts: [], txns: [], docs: [], pos: [], settings: {...DEFAULT_SETTINGS} };
-const UI = { tab: location.hash.slice(1) || 'overview', range: LS.get('ledger.range', '12m'), tx: { acct:'', cls:'all', q:'', tag:'', from:'', to:'' }, sel: new Set(), docF: { type:'', status:'', q:'', tag:'' }, viewIdx: 0, pendingImport: null };
+const UI = { tab: location.hash.slice(1) || 'overview', range: LS.get('ledger.range', '12m'), tx: { acct:'', cls:'all', q:'', tag:'', from:'', to:'', link:'' }, sel: new Set(), docF: { type:'', status:'', q:'', tag:'' }, viewIdx: 0, pendingImport: null };
 let docsByTxn = {};
 const charts = {};
 
 function derive() {
   S.txns.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : (a.seq || 0) - (b.seq || 0));
   docsByTxn = {};
-  S.docs.forEach(d => (d.linkedTxnIds || []).forEach(t => (docsByTxn[t] ??= []).push(d)));
+  S.docs.forEach(d => (d.linkedTxnIds || []).forEach(t => (docsByTxn[t] ??= []).push(linkItem('doc', d))));
+  S.pos.forEach(p => (p.linkedTxnIds || []).forEach(t => (docsByTxn[t] ??= []).push(linkItem('po', p))));
   const byAcct = {};
   S.txns.forEach(t => (byAcct[t.accountId] ??= []).push(t));
   for (const a of S.accounts) {
@@ -399,7 +400,9 @@ function burn() {
 /* ---------------- modal ---------------- */
 function modal(title, html, { wide } = {}) {
   const m = $('#modal'); $('.mbox', m).className = 'mbox' + (wide ? ' wide' : '');
-  $('.mtitle', m).textContent = title; $('.mbody', m).innerHTML = html; m.hidden = false; return $('.mbody', m);
+  $('.mtitle', m).textContent = title;
+  const old = $('.mbody', m), nb = old.cloneNode(false); old.replaceWith(nb); // fresh element: no listeners left over from the previous form
+  nb.innerHTML = html; m.hidden = false; return nb;
 }
 let previewBlobUrl = null;
 const PDFJS = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/';
@@ -424,22 +427,14 @@ async function renderPdf(el, data) {
   if (pdf.numPages > 30) el.insertAdjacentHTML('beforeend', `<div class="muted small" style="text-align:center;padding:10px">Showing 30 of ${pdf.numPages} pages — use Open ↗ for the rest.</div>`);
 }
 function closeModal() { $('#modal').hidden = true; $('#modal .mbody').innerHTML = ''; if (previewBlobUrl) { URL.revokeObjectURL(previewBlobUrl); previewBlobUrl = null; } }
-/* Split an open modal into form (left) + file preview (right). src = a File, or a record with .file/.fileName */
-async function attachPreview(body, src) {
-  if (!src || (!(src instanceof File) && !src.file)) return;
-  $('#modal .mbox').classList.add('xwide');
-  const left = document.createElement('div'); left.className = 'splitL';
-  while (body.firstChild) left.appendChild(body.firstChild);
+async function fillPreview(right, src) {
   const name = src instanceof File ? src.name : (src.fileName || '');
-  const right = document.createElement('div'); right.className = 'splitR';
-  right.innerHTML = `<div class="pvbar"><span title="${esc(name)}">📄 ${esc(name)}</span><button class="b sm" type="button" data-pvopen>Open ↗</button></div><div class="pv"><span class="muted">Loading preview…</span></div>`;
-  const wrap = document.createElement('div'); wrap.className = 'split'; wrap.append(left, right); body.appendChild(wrap);
   let url, type;
   try {
     if (src instanceof File) { if (previewBlobUrl) URL.revokeObjectURL(previewBlobUrl); url = previewBlobUrl = URL.createObjectURL(src); type = src.type; }
     else { url = await store.fileUrl(src.file); type = src.file.contentType; }
   } catch (e) { DBG.err('preview: could not get file URL', e); }
-  const pv = $('.pv', right); if (!pv.isConnected) return;
+  const pv = $('.pv', right); pv.style.display = ''; pv.style.alignItems = ''; pv.innerHTML = '<span class="muted">Loading preview…</span>'; if (!pv.isConnected) return;
   $('[data-pvopen]', right).onclick = () => url && window.open(url, '_blank');
   if (!url) { pv.innerHTML = '<span class="muted">Preview unavailable.</span>'; return; }
   const nm = name.toLowerCase(); type = type || '';
@@ -451,6 +446,18 @@ async function attachPreview(body, src) {
   }
   else if (type.startsWith('text/') || /\.(txt|csv)$/.test(nm)) pv.innerHTML = `<iframe src="${esc(url)}"></iframe>`;
   else pv.innerHTML = `<div style="text-align:center;padding:20px"><div class="muted" style="margin-bottom:8px">No inline preview for this file type (${esc(nm.split('.').pop())}).</div><button class="b" type="button" data-pvopen2>Open file</button></div>`, $('[data-pvopen2]', pv).onclick = () => window.open(url, '_blank');
+}
+/* Split an open modal into form (left) + file preview (right). src = a File, or a record with .file/.fileName */
+async function attachPreview(body, src) {
+  if (!src || (!(src instanceof File) && !src.file)) return;
+  $('#modal .mbox').classList.add('xwide');
+  const left = document.createElement('div'); left.className = 'splitL';
+  while (body.firstChild) left.appendChild(body.firstChild);
+  const name = src instanceof File ? src.name : (src.fileName || '');
+  const right = document.createElement('div'); right.className = 'splitR';
+  right.innerHTML = `<div class="pvbar"><span title="${esc(name)}">📄 ${esc(name)}</span><button class="b sm" type="button" data-pvopen>Open ↗</button></div><div class="pv"><span class="muted">Loading preview…</span></div>`;
+  const wrap = document.createElement('div'); wrap.className = 'split'; wrap.append(left, right); body.appendChild(wrap);
+  await fillPreview(right, src);
 }
 $('#modal').addEventListener('click', e => { if (e.target.id === 'modal' || e.target.closest('[data-close]')) closeModal(); });
 document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#modal').hidden) closeModal(); });
@@ -581,10 +588,123 @@ function drawCats(from) {
   charts.cat = new Chart($('#cCat'), { type: 'bar', options: o, data: { labels: rows.map(r => r[0]), datasets: [{ data: rows.map(r => r[1]), backgroundColor: cssVar('--series-1'), borderRadius: { topRight: 4, bottomRight: 4 }, borderSkipped: 'start', maxBarThickness: 18 }] } });
 }
 
+/* ======================= LINKING (transactions ↔ quotes / invoices / POs) ======================= */
+const LINK_TYPES = { quote: ['Quote', 'Q'], invoice: ['Invoice', 'INV'], receipt: ['Receipt', 'R'], other: ['Other', 'D'], po: ['Purchase order', 'PO'] };
+function linkItem(kind, r) {
+  const type = kind === 'po' ? 'po' : r.type;
+  return { kind, id: r.id, rec: r, type, typeLabel: LINK_TYPES[type]?.[0] || type, short: LINK_TYPES[type]?.[1] || '?', number: r.number || '', vendor: r.vendor || '', date: r.date || '', amount: kind === 'po' ? poTotals(r).total : (+r.amount || 0), status: r.status || '', file: r.file, fileName: r.fileName, linked: r.linkedTxnIds || [] };
+}
+const linkCandidates = () => [...S.docs.map(d => linkItem('doc', d)), ...S.pos.map(p => linkItem('po', p))];
+const STOP = new Set(['inc','llc','ltd','corp','corporation','company','the','and','usa','co','of','group','services','international','intl','des','ach','pos','purchase','payment','online','bank']);
+const tokens = s => String(s || '').toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length >= 3 && !STOP.has(w));
+/* Score how likely transaction t pays/relates to item c. ≥50 = suggested, ≥90 = strong. */
+function matchScore(t, c) {
+  let sc = 0; const why = [];
+  const amt = Math.abs(t.amount), ia = Math.abs(c.amount);
+  if (ia > 0) {
+    const diff = Math.abs(amt - ia);
+    if (diff < 0.005) { sc += 60; why.push('exact amount'); }
+    else if (diff <= Math.max(1, ia * 0.02)) { sc += 45; why.push('amount ±2%'); }
+    else if (amt < ia && amt >= ia * 0.1) { sc += 8; why.push('partial?'); }
+  }
+  if (c.date && t.date) {
+    const days = Math.abs(ts(t.date) - ts(c.date)) / 864e5;
+    if (days <= 7) { sc += 15; why.push('≤1 wk'); } else if (days <= 45) { sc += 10; why.push('≤45 d'); } else if (days <= 120) sc += 4; else if (days > 365) sc -= 20;
+  }
+  const desc = (t.description + ' ' + (t.notes || '')).toLowerCase();
+  const vt = tokens(c.vendor);
+  if (vt.length && vt.some(w => desc.includes(w))) { sc += 35; why.push('vendor name'); }
+  if (c.number && c.number.length >= 3 && desc.includes(c.number.toLowerCase().replace(/^po[-\s]*/, ''))) { sc += 40; why.push('number in memo'); }
+  return { score: sc, why };
+}
+function suggestionsFor(t, cands = linkCandidates()) {
+  if (t.cls === 'transfer') return [];
+  return cands.filter(c => !c.linked.includes(t.id)).map(c => ({ c, ...matchScore(t, c) })).filter(x => x.score >= 50).sort((a, b) => b.score - a.score);
+}
+async function setLink(item, txnId, on) {
+  const r = item.kind === 'po' ? S.pos.find(x => x.id === item.id) : S.docs.find(x => x.id === item.id);
+  if (!r) return;
+  const cur = new Set(r.linkedTxnIds || []); on ? cur.add(txnId) : cur.delete(txnId);
+  r.linkedTxnIds = [...cur];
+  let note = '';
+  if (on && r.type === 'invoice' && r.status === 'unpaid') { r.status = 'paid'; note = ' · invoice marked paid'; }
+  await persist(item.kind === 'po' ? 'pos' : 'docs', r);
+  derive(); return note;
+}
+function linkChips(t) {
+  return (docsByTxn[t.id] || []).map(l => `<a href="#" class="chip openLink" data-id="${l.id}" title="${esc(l.typeLabel + ' ' + l.number + ' · ' + l.vendor + ' · ' + money(l.amount))}" style="text-decoration:none;color:var(--text-primary)"><b>${l.short}</b> ${esc(l.number || l.vendor || '')}</a>`).join('');
+}
+/* Picker: list candidates (linked first, then best matches), toggle links instantly, preview on the right. */
+function linkPicker(t, onDone) {
+  const st = { type: '', q: '', show: 'best' };
+  const body = modal(`Link: ${fmtDate(t.date)} · ${money(t.amount)}`, `
+    <div class="banner" style="margin-bottom:10px"><b>${esc(t.description)}</b> <span class="muted small">· ${esc(acctById(t.accountId)?.name || '')}${t.cls ? ' · ' + CLASSES[t.cls] : ''}</span></div>
+    <div class="split" style="grid-template-columns:minmax(0,1.1fr) minmax(0,1fr)"><div>
+      <div class="toolbar">
+        <div class="seg" id="lkType">${[['', 'All'], ['quote', 'Quotes'], ['invoice', 'Invoices'], ['po', 'POs'], ['receipt', 'Receipts']].map(([v, l]) => `<button data-v="${v}" class="${v === '' ? 'on' : ''}">${l}</button>`).join('')}</div>
+        <input id="lkQ" class="grow" placeholder="Search vendor, number, amount">
+      </div>
+      <div class="linklist" id="lkList" style="max-height:58vh"></div>
+      <div class="small muted" style="margin-top:6px">Ticking a box saves immediately. Click a row to preview its file. Linking an unpaid invoice marks it paid.</div>
+      <div class="mfoot"><button class="b pri" id="lkDone">Done</button></div>
+    </div>
+    <div class="splitR"><div class="pvbar"><span id="lkPvName">Select a row to preview</span><button class="b sm" type="button" data-pvopen>Open ↗</button></div><div class="pv"><span class="muted">No file selected</span></div></div></div>`, { wide: true });
+  $('#modal .mbox').classList.add('xwide');
+  const draw = () => {
+    const q = st.q.toLowerCase();
+    const all = linkCandidates().map(c => ({ c, ...matchScore(t, c), on: c.linked.includes(t.id) }))
+      .filter(x => (!st.type || x.c.type === st.type) && (!q || [x.c.vendor, x.c.number, x.c.amount, x.c.typeLabel, x.c.rec.description, x.c.rec.notes].join(' ').toLowerCase().includes(q)));
+    all.sort((a, b) => (b.on - a.on) || (b.score - a.score) || b.c.date.localeCompare(a.c.date));
+    const list = all.slice(0, 150);
+    $('#lkList', body).innerHTML = list.length ? list.map(x => `<label data-id="${x.c.id}" data-kind="${x.c.kind}">
+      <input type="checkbox" ${x.on ? 'checked' : ''}>
+      ${x.score >= 90 && !x.on ? '<span class="sugg">BEST MATCH</span>' : x.score >= 50 && !x.on ? '<span class="sugg">MATCH</span>' : ''}
+      <span><b>${x.c.short}</b> ${esc(x.c.number)} · ${esc(x.c.vendor)} <span class="muted small">${fmtDate(x.c.date)}${x.c.status ? ' · ' + esc(x.c.status) : ''}${x.c.file ? ' · 📎' : ''}${x.score >= 50 ? ' · ' + x.why.join(', ') : ''}${x.c.linked.length && !x.on ? ` · already linked to ${x.c.linked.length} txn` : ''}</span></span>
+      <span class="amt">${money(x.c.amount)}</span></label>`).join('') : '<div class="muted small" style="padding:10px">Nothing matches. Upload quotes/invoices on the Quotes &amp; Invoices tab, or POs on the Purchase orders tab.</div>';
+  };
+  draw();
+  $('#lkType', body).onclick = e => { const b = e.target.closest('button'); if (!b) return; st.type = b.dataset.v; $$('#lkType button', body).forEach(x => x.classList.toggle('on', x === b)); draw(); };
+  $('#lkQ', body).oninput = e => { st.q = e.target.value; draw(); };
+  $('#lkList', body).addEventListener('change', async e => {
+    if (e.target.type !== 'checkbox') return; const row = e.target.closest('label');
+    const item = linkCandidates().find(c => c.id === row.dataset.id); if (!item) return;
+    e.target.disabled = true;
+    try { const note = await setLink(item, t.id, e.target.checked); toast((e.target.checked ? 'Linked ' : 'Unlinked ') + item.typeLabel.toLowerCase() + ' ' + (item.number || item.vendor) + (note || '')); }
+    catch { e.target.checked = !e.target.checked; }
+    e.target.disabled = false; draw();
+  });
+  $('#lkList', body).addEventListener('click', e => {
+    if (e.target.type === 'checkbox') return; const row = e.target.closest('label'); if (!row) return; e.preventDefault();
+    const item = linkCandidates().find(c => c.id === row.dataset.id); if (!item) return;
+    $$('#lkList label', body).forEach(l => l.style.background = l === row ? 'color-mix(in srgb,var(--accent) 10%,transparent)' : '');
+    const right = $('.splitR', body); $('#lkPvName', body).textContent = `${item.typeLabel} ${item.number} · ${item.vendor}`;
+    if (item.file) fillPreview(right, item.rec); else { $('.pv', right).innerHTML = '<span class="muted">No file attached to this record.</span>'; }
+  });
+  $('#lkDone', body).onclick = () => { closeModal(); onDone ? onDone() : render(); };
+}
+/* Review & apply strong, unambiguous matches across all unlinked transactions */
+function autoLinkReview() {
+  const cands = linkCandidates(); const used = new Set(); const props = [];
+  S.txns.filter(t => !(docsByTxn[t.id] || []).length && t.cls !== 'transfer').slice().reverse().forEach(t => {
+    const sug = suggestionsFor(t, cands).filter(x => !x.c.linked.length && !used.has(x.c.id));
+    if (sug.length && sug[0].score >= 90 && (sug.length === 1 || sug[0].score - sug[1].score >= 20)) { used.add(sug[0].c.id); props.push({ t, ...sug[0] }); }
+  });
+  const body = modal('Auto-link strong matches', props.length ? `
+    <div class="small muted" style="margin-bottom:8px">Each pair below has a matching amount plus vendor name, document number or date, and no competing candidate. Untick any you don't want.</div>
+    <div class="linklist" style="max-height:60vh">${props.map((x, i) => `<label><input type="checkbox" data-i="${i}" checked><span>${fmtDate(x.t.date)} · ${esc(x.t.description)} <b>${money(x.t.amount)}</b><br><span class="muted small">→ <b>${x.c.short}</b> ${esc(x.c.number)} · ${esc(x.c.vendor)} · ${money(x.c.amount)} · ${x.why.join(', ')}</span></span></label>`).join('')}</div>
+    <div class="mfoot"><button class="b" data-close>Cancel</button><button class="b pri" id="alGo">Link ${props.length} selected</button></div>` : `<div class="muted">No strong, unambiguous matches right now. Use the 🔗 Link button on individual rows.</div><div class="mfoot"><button class="b" data-close>Close</button></div>`);
+  $('#alGo', body)?.addEventListener('click', async () => {
+    const pick = $$('input[data-i]:checked', body).map(i => props[+i.dataset.i]); let n = 0;
+    for (const x of pick) { await setLink(x.c, x.t.id, true); n++; }
+    closeModal(); toast(`Linked ${n} transaction${n === 1 ? '' : 's'}`); render();
+  });
+}
+
 /* ======================= TRANSACTIONS ======================= */
 function filteredTxns() {
   const f = UI.tx, q = f.q.toLowerCase();
-  return S.txns.filter(t => (!f.acct || t.accountId === f.acct) && (f.cls === 'all' || (f.cls === 'untagged' ? (!t.cls && !(t.tags || []).length && !t.category) : (t.cls || '') === f.cls)) && (!f.tag || (t.tags || []).includes(f.tag)) && (!f.from || t.date >= f.from) && (!f.to || t.date <= f.to) && (!q || (t.description + ' ' + (t.notes || '') + ' ' + (t.category || '') + ' ' + t.amount).toLowerCase().includes(q)));
+  const cands = f.link === 'suggested' ? linkCandidates() : null;
+  return S.txns.filter(t => (!f.link || (f.link === 'linked' ? (docsByTxn[t.id] || []).length : f.link === 'unlinked' ? !(docsByTxn[t.id] || []).length : !(docsByTxn[t.id] || []).length && suggestionsFor(t, cands).length)) && (!f.acct || t.accountId === f.acct) && (f.cls === 'all' || (f.cls === 'untagged' ? (!t.cls && !(t.tags || []).length && !t.category) : (t.cls || '') === f.cls)) && (!f.tag || (t.tags || []).includes(f.tag)) && (!f.from || t.date >= f.from) && (!f.to || t.date <= f.to) && (!q || (t.description + ' ' + (t.notes || '') + ' ' + (t.category || '') + ' ' + t.amount).toLowerCase().includes(q)));
 }
 function vTxns(root) {
   const f = UI.tx; const rows = filteredTxns().slice().reverse(); const shown = rows.slice(0, 600);
@@ -595,8 +715,10 @@ function vTxns(root) {
       <select id="fAcct"><option value="">All accounts</option>${S.accounts.map(a => `<option value="${a.id}" ${f.acct === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select>
       <select id="fCls">${[['all','All types'],['','Operating'],['infusion','Capital infusion'],['withdrawal','Capital withdrawal'],['transfer','Internal transfer'],['untagged','Untagged']].map(([v, l]) => `<option value="${v}" ${f.cls === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
       <select id="fTag"><option value="">Any tag</option>${allTags().map(t => `<option ${f.tag === t ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>
+      <select id="fLink">${[['', 'Linked or not'], ['linked', 'Linked to docs'], ['unlinked', 'Not linked'], ['suggested', 'Has suggested match']].map(([v, l]) => `<option value="${v}" ${f.link === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
       <input type="date" id="fFrom" value="${f.from}" title="From"><input type="date" id="fTo" value="${f.to}" title="To">
       <input id="fQ" placeholder="Search description, notes, amount" value="${esc(f.q)}" class="grow">
+      <button class="b" id="autoLink" title="Find transactions that clearly match a quote, invoice or PO">🔗 Auto-link matches</button>
       <button class="b" id="addTx">+ Manual entry</button>
     </div>
     <div class="toolbar" id="bulk" style="${UI.sel.size ? '' : 'display:none'}">
@@ -607,8 +729,8 @@ function vTxns(root) {
       <button class="b sm" id="bClear">Clear selection</button>
     </div>
     <div class="small muted" style="margin-bottom:6px">${rows.length} transactions · net ${money(total)}${rows.length > shown.length ? ` · showing latest ${shown.length}` : ''}</div>
-    <div class="tw"><table><thead><tr><th><input type="checkbox" id="selAll"></th><th>Date</th><th>Account</th><th>Description</th><th class="r">Amount</th><th>Type</th><th>Tags / category</th><th>Docs</th><th></th></tr></thead><tbody>
-    ${shown.map(t => { const ds = docsByTxn[t.id] || []; return `<tr data-id="${t.id}">
+    <div class="tw"><table><thead><tr><th><input type="checkbox" id="selAll"></th><th>Date</th><th>Account</th><th>Description</th><th class="r">Amount</th><th>Type</th><th>Tags / category</th><th>Quotes · invoices · POs</th><th></th></tr></thead><tbody>
+    ${(() => { const cands = linkCandidates(); return shown.map(t => { const ds = docsByTxn[t.id] || []; const sg = ds.length ? [] : suggestionsFor(t, cands); return `<tr data-id="${t.id}">
       <td><input type="checkbox" class="sel" ${UI.sel.has(t.id) ? 'checked' : ''}></td>
       <td style="white-space:nowrap">${fmtDate(t.date)}</td>
       <td class="small muted">${esc(acctById(t.accountId)?.name || '?')}</td>
@@ -616,8 +738,8 @@ function vTxns(root) {
       <td class="r" style="white-space:nowrap">${money(t.amount)}</td>
       <td><select class="clsSel" style="padding:2px 4px;font-size:12px">${Object.entries(CLASSES).map(([v, l]) => `<option value="${v}" ${(t.cls || '') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></td>
       <td>${t.category ? `<span class="chip" style="font-weight:600">${esc(t.category)}</span>` : ''}${(t.tags || []).map(g => `<span class="chip">${esc(g)}</span>`).join('')}</td>
-      <td class="small">${ds.map(d => `<a href="#" class="openDoc" data-doc="${d.id}">${DOC_TYPES[d.type]?.[0] || 'D'}:${esc(d.number || d.vendor || '')}</a>`).join('<br>')}</td>
-      <td><button class="b sm editTx">Edit</button></td></tr>`; }).join('')}
+      <td class="small" style="min-width:150px">${linkChips(t)}${sg.length ? `<button class="b sm linkTx" style="border-color:var(--accent);color:var(--accent);font-weight:600" title="${esc(sg.slice(0, 3).map(x => x.c.typeLabel + ' ' + x.c.number + ' · ' + x.c.vendor + ' (' + x.why.join(', ') + ')').join('\n'))}">🔗 ${sg.length} match${sg.length > 1 ? 'es' : ''}</button>` : `<button class="b sm linkTx" title="Link to quotes, invoices or POs">🔗${ds.length ? '' : ' Link'}</button>`}</td>
+      <td><button class="b sm editTx">Edit</button></td></tr>`; }).join(''); })()}
     </tbody></table></div>
     <datalist id="tagList">${allTags().map(t => `<option value="${esc(t)}">`).join('')}</datalist>
   </div>`;
@@ -625,6 +747,8 @@ function vTxns(root) {
   $('#fAcct').onchange = e => { f.acct = e.target.value; rf(); };
   $('#fCls').onchange = e => { f.cls = e.target.value; rf(); };
   $('#fTag').onchange = e => { f.tag = e.target.value; rf(); };
+  $('#fLink').onchange = e => { f.link = e.target.value; rf(); };
+  $('#autoLink').onclick = () => autoLinkReview();
   $('#fFrom').onchange = e => { f.from = e.target.value; rf(); };
   $('#fTo').onchange = e => { f.to = e.target.value; rf(); };
   let qh; $('#fQ').oninput = e => { clearTimeout(qh); qh = setTimeout(() => { f.q = e.target.value; rf(); setTimeout(() => { const i = $('#fQ'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }); }, 300); };
@@ -637,7 +761,8 @@ function vTxns(root) {
   });
   root.querySelector('tbody').addEventListener('click', e => {
     const tr = e.target.closest('tr'); if (e.target.classList.contains('editTx')) editTxn(S.txns.find(x => x.id === tr.dataset.id));
-    const od = e.target.closest('.openDoc'); if (od) { e.preventDefault(); openDocViewer(od.dataset.doc); }
+    if (e.target.closest('.linkTx')) linkPicker(S.txns.find(x => x.id === tr.dataset.id));
+    const ol = e.target.closest('.openLink'); if (ol) { e.preventDefault(); const it = linkCandidates().find(c => c.id === ol.dataset.id); if (it?.file) openDocViewer(it.id); else if (it) it.kind === 'po' ? editPO(it.rec) : editDoc(it.rec); }
   });
   const bulk = async fn => { const list = S.txns.filter(t => UI.sel.has(t.id)); list.forEach(fn); await persistMany('txns', list); toast(`Updated ${list.length}`); rf(); };
   $('#bClsGo').onclick = () => bulk(t => t.cls = $('#bCls').value);
@@ -647,9 +772,7 @@ function vTxns(root) {
 }
 function editTxn(t) {
   const isNew = !t; t = t ? structuredClone(t) : { id: 'm_' + uid(), date: today(), description: '', amount: 0, accountId: S.accounts[0]?.id || '', cls: '', tags: [], manual: true };
-  const linked = new Set((S.docs.filter(d => (d.linkedTxnIds || []).includes(t.id))).map(d => d.id));
-  const sugg = new Set(S.docs.filter(d => d.amount && Math.abs(Math.abs(d.amount) - Math.abs(t.amount)) <= Math.max(1, Math.abs(d.amount) * 0.02) && d.date && Math.abs(ts(d.date) - ts(t.date)) < 120 * 864e5).map(d => d.id));
-  const docs = S.docs.slice().sort((a, b) => (sugg.has(b.id) - sugg.has(a.id)) || (b.date || '').localeCompare(a.date || ''));
+  const nSug = isNew ? 0 : suggestionsFor(t).length;
   if (!S.accounts.length) { toast('Create an account first (Accounts & import).'); return; }
   const body = modal(isNew ? 'New transaction' : 'Edit transaction', `
     <div class="form">
@@ -661,8 +784,7 @@ function editTxn(t) {
       <label>Category<input id="tCat" value="${esc(t.category || '')}" list="catList" placeholder="e.g. Lab supplies"></label>
       <label>Tags (comma-separated)<input id="tTags" value="${esc((t.tags || []).join(', '))}"></label>
       <label class="full">Notes<textarea id="tNotes">${esc(t.notes || '')}</textarea></label>
-      <label class="full">Linked quotes / invoices ${sugg.size ? '<span class="sugg">· matches by amount &amp; date shown first</span>' : ''}
-        <div class="linklist">${docs.length ? docs.map(d => `<label><input type="checkbox" value="${d.id}" ${linked.has(d.id) ? 'checked' : ''}> ${sugg.has(d.id) ? '<span class="sugg">MATCH</span>' : ''} <b>${DOC_TYPES[d.type]}</b> ${esc(d.number || '')} · ${esc(d.vendor || '')} <span class="muted small">${fmtDate(d.date)}</span><span class="amt">${money(d.amount)}</span></label>`).join('') : '<div class="muted small" style="padding:8px">No documents uploaded yet.</div>'}</div></label>
+      ${isNew ? '' : `<label class="full">Linked quotes / invoices / POs<div>${linkChips(t) || '<span class="muted small">None linked.</span>'} <button class="b sm" id="tLinks" type="button">🔗 Manage links${nSug ? ` (${nSug} suggested)` : ''}</button></div></label>`}
     </div>
     <datalist id="catList">${[...new Set(S.txns.map(x => x.category).filter(Boolean))].map(c => `<option value="${esc(c)}">`).join('')}</datalist>
     <div class="mfoot">${!isNew && t.manual ? '<button class="b danger" id="tDel">Delete</button>' : ''}<span style="flex:1"></span><button class="b" data-close>Cancel</button><button class="b pri" id="tSave">Save</button></div>`);
@@ -671,11 +793,9 @@ function editTxn(t) {
     Object.assign(t, { cls: $('#tCls', body).value, category: $('#tCat', body).value.trim(), tags: parseTags($('#tTags', body).value), notes: $('#tNotes', body).value.trim() });
     if (t.manual) Object.assign(t, { date: $('#tDate', body).value, accountId: $('#tAcct', body).value, amount: +$('#tAmt', body).value || 0, description: $('#tDesc', body).value.trim() });
     await persist('txns', t);
-    const want = new Set($$('.linklist input:checked', body).map(i => i.value)); const changed = [];
-    S.docs.forEach(d => { const has = (d.linkedTxnIds || []).includes(t.id); if (want.has(d.id) !== has) { d.linkedTxnIds = want.has(d.id) ? [...(d.linkedTxnIds || []), t.id] : d.linkedTxnIds.filter(x => x !== t.id); if (want.has(d.id) && d.type === 'invoice' && d.status === 'unpaid') d.status = 'paid'; changed.push(d); } });
-    if (changed.length) await persistMany('docs', changed);
     closeModal(); toast('Saved'); render();
   };
+  $('#tLinks', body)?.addEventListener('click', () => linkPicker(S.txns.find(x => x.id === t.id) || t, () => editTxn(S.txns.find(x => x.id === t.id))));
 }
 async function persist(n, o) {
   try { await store.save(n, o); } catch (e) { DBG.err('persist failed', e); toast('Save failed: ' + e.message, 5000); throw e; }
@@ -1189,7 +1309,7 @@ function vSettings(root) {
   $('#sSave').onclick = async () => { Object.assign(S.settings, { id: 'main', company: $('#sCo').value.trim(), email: $('#sEm').value.trim(), phone: $('#sPh').value.trim(), poPrefix: $('#sPP').value.trim() || 'PO', address: $('#sAd').value.trim(), paymentTerms: $('#sTerms').value.trim(), taxRate: +$('#sTax').value || 0, burnMonths: Math.max(1, +$('#sBurn').value || 3), largeTxn: +$('#sLg').value || 5000 }); await persist('settings', S.settings); toast('Settings saved'); };
   const dl = (name, text, type) => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type })); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 4000); };
   $('#sExp').onclick = () => dl(`ledger-backup-${today()}.json`, JSON.stringify(clean({ exportedAt: new Date().toISOString(), accounts: S.accounts, txns: S.txns, docs: S.docs, pos: S.pos, settings: S.settings }), null, 1), 'application/json');
-  $('#sExpCsv').onclick = () => { const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`; dl(`transactions-${today()}.csv`, ['Date,Account,Description,Amount,Type,Category,Tags,Notes,Linked documents', ...S.txns.map(t => [t.date, acctById(t.accountId)?.name, t.description, t.amount, CLASSES[t.cls || ''], t.category, (t.tags || []).join('; '), t.notes, (docsByTxn[t.id] || []).map(d => `${DOC_TYPES[d.type]} ${d.number || ''} ${d.vendor}`).join('; ')].map(q).join(','))].join('\n'), 'text/csv'); };
+  $('#sExpCsv').onclick = () => { const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`; dl(`transactions-${today()}.csv`, ['Date,Account,Description,Amount,Type,Category,Tags,Notes,Linked documents', ...S.txns.map(t => [t.date, acctById(t.accountId)?.name, t.description, t.amount, CLASSES[t.cls || ''], t.category, (t.tags || []).join('; '), t.notes, (docsByTxn[t.id] || []).map(d => `${d.typeLabel} ${d.number || ''} ${d.vendor || ''}`).join('; ')].map(q).join(','))].join('\n'), 'text/csv'); };
   $('#sImp').onclick = () => $('#sImpF').click();
   $('#sImpF').onchange = async e => { try { const j = JSON.parse(await e.target.files[0].text()); for (const n of ['accounts', 'txns', 'docs', 'pos']) if (Array.isArray(j[n]) && j[n].length) await persistMany(n, j[n]); if (j.settings) { S.settings = { ...DEFAULT_SETTINGS, ...j.settings, id: 'main' }; await persist('settings', S.settings); } toast('Backup merged'); render(); } catch (err) { toast('Import failed: ' + err.message, 5000); } };
 }
