@@ -129,6 +129,15 @@ tr:hover td{background:color-mix(in srgb,var(--surface-2) 60%,transparent)}
 #dbgPanel[hidden]{display:none}
 .dbgHead{display:flex;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--border);flex-wrap:wrap}
 #dbgLog{flex:1;margin:0;overflow:auto;padding:10px 12px;font:11.5px/1.45 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-word;color:var(--text-primary)}
+.mbox.xwide{width:min(1500px,100%)}
+.split{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.05fr);gap:18px;align-items:start}
+.splitR{position:sticky;top:0;height:min(82vh,1100px);display:flex;flex-direction:column;border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.splitR .pvbar{display:flex;gap:8px;align-items:center;padding:6px 10px;border-bottom:1px solid var(--border);font-size:12px;color:var(--text-secondary)}
+.splitR .pvbar span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.splitR .pv{flex:1;display:flex;align-items:center;justify-content:center;background:var(--surface-2);overflow:auto}
+.splitR .pv iframe{width:100%;height:100%;border:0;background:#fff}
+.splitR .pv img{max-width:100%;max-height:100%;object-fit:contain}
+@media (max-width:1000px){.split{grid-template-columns:1fr}.splitR{position:static;height:70vh}}
 @media (max-width:760px){.g2{grid-template-columns:1fr}.viewer{grid-template-columns:1fr;height:auto}.vlist{max-height:200px}.vframe{height:60vh}}
 </style>
 </head>
@@ -381,7 +390,57 @@ function modal(title, html, { wide } = {}) {
   const m = $('#modal'); $('.mbox', m).className = 'mbox' + (wide ? ' wide' : '');
   $('.mtitle', m).textContent = title; $('.mbody', m).innerHTML = html; m.hidden = false; return $('.mbody', m);
 }
-function closeModal() { $('#modal').hidden = true; $('#modal .mbody').innerHTML = ''; }
+let previewBlobUrl = null;
+const PDFJS = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/';
+let pdfjsP = null;
+function loadPdfJs() {
+  if (window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
+  return pdfjsP ||= new Promise((res, rej) => { const sc = document.createElement('script'); sc.src = PDFJS + 'pdf.min.js'; sc.onload = () => { window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS + 'pdf.worker.min.js'; res(window.pdfjsLib); }; sc.onerror = () => { pdfjsP = null; rej(new Error('pdf.js failed to load')); }; document.head.appendChild(sc); });
+}
+/* Render every page of a PDF (ArrayBuffer or URL) as canvases into el. Throws on failure so callers can fall back. */
+async function renderPdf(el, data) {
+  const lib = await loadPdfJs();
+  const pdf = await lib.getDocument(typeof data === 'string' ? { url: data } : { data }).promise;
+  el.innerHTML = ''; el.style.alignItems = 'flex-start'; el.style.display = 'block';
+  const w = Math.max(300, el.clientWidth - 24);
+  for (let n = 1; n <= Math.min(pdf.numPages, 30); n++) {
+    if (!el.isConnected) return;
+    const page = await pdf.getPage(n); const v1 = page.getViewport({ scale: 1 }); const scale = w / v1.width; const dpr = window.devicePixelRatio || 1;
+    const vp = page.getViewport({ scale: scale * dpr }); const c = document.createElement('canvas');
+    c.width = vp.width; c.height = vp.height; c.style.cssText = `width:${w}px;display:block;margin:12px auto;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.2)`;
+    el.appendChild(c); await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
+  }
+  if (pdf.numPages > 30) el.insertAdjacentHTML('beforeend', `<div class="muted small" style="text-align:center;padding:10px">Showing 30 of ${pdf.numPages} pages — use Open ↗ for the rest.</div>`);
+}
+function closeModal() { $('#modal').hidden = true; $('#modal .mbody').innerHTML = ''; if (previewBlobUrl) { URL.revokeObjectURL(previewBlobUrl); previewBlobUrl = null; } }
+/* Split an open modal into form (left) + file preview (right). src = a File, or a record with .file/.fileName */
+async function attachPreview(body, src) {
+  if (!src || (!(src instanceof File) && !src.file)) return;
+  $('#modal .mbox').classList.add('xwide');
+  const left = document.createElement('div'); left.className = 'splitL';
+  while (body.firstChild) left.appendChild(body.firstChild);
+  const name = src instanceof File ? src.name : (src.fileName || '');
+  const right = document.createElement('div'); right.className = 'splitR';
+  right.innerHTML = `<div class="pvbar"><span title="${esc(name)}">📄 ${esc(name)}</span><button class="b sm" type="button" data-pvopen>Open ↗</button></div><div class="pv"><span class="muted">Loading preview…</span></div>`;
+  const wrap = document.createElement('div'); wrap.className = 'split'; wrap.append(left, right); body.appendChild(wrap);
+  let url, type;
+  try {
+    if (src instanceof File) { if (previewBlobUrl) URL.revokeObjectURL(previewBlobUrl); url = previewBlobUrl = URL.createObjectURL(src); type = src.type; }
+    else { url = await store.fileUrl(src.file); type = src.file.contentType; }
+  } catch (e) { DBG.err('preview: could not get file URL', e); }
+  const pv = $('.pv', right); if (!pv.isConnected) return;
+  $('[data-pvopen]', right).onclick = () => url && window.open(url, '_blank');
+  if (!url) { pv.innerHTML = '<span class="muted">Preview unavailable.</span>'; return; }
+  const nm = name.toLowerCase(); type = type || '';
+  if (type.startsWith('image/') || /\.(png|jpe?g|gif|webp|bmp)$/.test(nm)) pv.innerHTML = `<img src="${esc(url)}" alt="">`;
+  else if (type === 'application/pdf' || nm.endsWith('.pdf')) {
+    pv.innerHTML = '<span class="muted">Rendering PDF…</span>';
+    try { await renderPdf(pv, src instanceof File ? await src.arrayBuffer() : url); }
+    catch (e) { DBG.warn('preview: pdf.js render failed, using browser viewer', e); if (pv.isConnected) { pv.style.display = ''; pv.innerHTML = `<iframe src="${esc(url)}#view=FitH"></iframe>`; } }
+  }
+  else if (type.startsWith('text/') || /\.(txt|csv)$/.test(nm)) pv.innerHTML = `<iframe src="${esc(url)}"></iframe>`;
+  else pv.innerHTML = `<div style="text-align:center;padding:20px"><div class="muted" style="margin-bottom:8px">No inline preview for this file type (${esc(nm.split('.').pop())}).</div><button class="b" type="button" data-pvopen2>Open file</button></div>`, $('[data-pvopen2]', pv).onclick = () => window.open(url, '_blank');
+}
 $('#modal').addEventListener('click', e => { if (e.target.id === 'modal' || e.target.closest('[data-close]')) closeModal(); });
 document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#modal').hidden) closeModal(); });
 
@@ -709,6 +768,7 @@ function editDoc(d, file, rest = []) {
     </div>
     <datalist id="vendList">${vendors.map(v => `<option value="${esc(v)}">`).join('')}</datalist>
     <div class="mfoot">${!isNew ? '<button class="b danger" id="dDel">Delete</button>' : ''}<span style="flex:1"></span>${rest.length ? '<button class="b" id="dSkip">Skip file</button>' : ''}<button class="b" data-close>Cancel</button><button class="b pri" id="dSave">${rest.length ? 'Save & next' : 'Save'}</button></div>`, { wide: true });
+  attachPreview(body, file || (d.file ? d : null));
   const sel = new Set(d.linkedTxnIds || []);
   const fillStatus = () => { const t = $('#dT', body).value; $('#dS', body).innerHTML = DOC_STATUS[t].map(s => `<option ${d.status === s ? 'selected' : ''}>${s}</option>`).join(''); $('#dueLbl', body).textContent = t === 'quote' ? 'Valid until' : 'Due date'; };
   fillStatus(); $('#dT', body).onchange = fillStatus;
@@ -752,7 +812,14 @@ function editDoc(d, file, rest = []) {
 /* ======================= FILE BROWSER ======================= */
 async function openFile(d) { const u = await store.fileUrl(d.file); if (u) window.open(u, '_blank'); else toast('File not found'); }
 function openDocViewer(id) { const list = filteredViewer(); const i = list.findIndex(d => d.id === id); UI.viewIdx = Math.max(0, i); if (i < 0) { UI.docF = { type: '', status: '', q: '', tag: '' }; UI.viewIdx = Math.max(0, filteredViewer().findIndex(d => d.id === id)); } go('files'); }
-function filteredViewer() { return filteredDocs().filter(d => d.file); }
+const VIEW_TYPES = { ...DOC_TYPES, po: 'Purchase order' };
+function filteredViewer() {
+  const f = UI.docF, q = f.q.toLowerCase();
+  const docs = f.type === 'po' ? [] : filteredDocs().filter(d => d.file).map(d => ({ ...d, kind: 'doc' }));
+  const pos = (f.type && f.type !== 'po') || f.status ? [] : S.pos.filter(p => p.file && (!f.tag || (p.tags || []).includes(f.tag)) && (!q || [p.vendor, p.number, p.notes, p.fileName, (p.tags || []).join(' ')].join(' ').toLowerCase().includes(q)))
+    .map(p => ({ ...p, kind: 'po', type: 'po', amount: poTotals(p).total, linkedTxnIds: [] }));
+  return [...docs, ...pos].sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+}
 function vFiles(root) {
   const list = filteredViewer(); const f = UI.docF;
   if (UI.viewIdx >= list.length) UI.viewIdx = Math.max(0, list.length - 1);
@@ -760,12 +827,12 @@ function vFiles(root) {
   <div class="card">
     <div class="toolbar">
       <b style="font-size:15px">File browser</b>
-      <select id="vType"><option value="">All types</option>${Object.entries(DOC_TYPES).map(([v, l]) => `<option value="${v}" ${f.type === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+      <select id="vType"><option value="">All types</option>${Object.entries(VIEW_TYPES).map(([v, l]) => `<option value="${v}" ${f.type === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
       <select id="vTag"><option value="">Any tag</option>${allTags().map(t => `<option ${f.tag === t ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>
       <input id="vQ" class="grow" placeholder="Filter files" value="${esc(f.q)}">
       <span class="small muted">↑/↓ or J/K to move · Enter to open full size</span>
     </div>
-    ${list.length ? `<div class="viewer"><div class="vlist" id="vlist">${list.map((d, i) => `<div class="vitem ${i === UI.viewIdx ? 'on' : ''}" data-i="${i}"><b>${DOC_TYPES[d.type]}</b> ${esc(d.number || '')} · ${esc(d.vendor || '')}<div class="small muted">${fmtDate(d.date)} · ${money(d.amount)} · ${esc(d.fileName || '')}</div></div>`).join('')}</div>
+    ${list.length ? `<div class="viewer"><div class="vlist" id="vlist">${list.map((d, i) => `<div class="vitem ${i === UI.viewIdx ? 'on' : ''}" data-i="${i}"><b>${VIEW_TYPES[d.type]}</b> ${esc(d.number || '')} · ${esc(d.vendor || '')}<div class="small muted">${fmtDate(d.date)} · ${money(d.amount)} · ${esc(d.fileName || '')}</div></div>`).join('')}</div>
       <div class="vpane"><div class="vbar" id="vbar"></div><div class="vframe" id="vframe"></div></div></div>` : `<div class="muted">No files${f.q || f.type || f.tag ? ' match these filters' : ' uploaded yet'}.</div>`}
   </div>`;
   const rf = () => { UI.viewIdx = 0; render(); };
@@ -782,11 +849,11 @@ async function showFile(i) {
   $$('.vitem').forEach((el, k) => el.classList.toggle('on', k === i)); $$('.vitem')[i]?.scrollIntoView({ block: 'nearest' });
   const tx = (d.linkedTxnIds || []).map(id => S.txns.find(t => t.id === id)).filter(Boolean);
   $('#vbar').innerHTML = `<button class="b sm" id="vPrev" ${i === 0 ? 'disabled' : ''}>‹ Prev</button><button class="b sm" id="vNext" ${i === list.length - 1 ? 'disabled' : ''}>Next ›</button><span class="small muted">${i + 1} / ${list.length}</span>
-    <b>${DOC_TYPES[d.type]} ${esc(d.number || '')}</b><span>${esc(d.vendor || '')}</span><span>${money(d.amount)}</span>${statusHTML(d)}${(d.tags || []).map(g => `<span class="chip">${esc(g)}</span>`).join('')}
-    <span class="small muted">${tx.length ? '💳 ' + tx.map(t => fmtDate(t.date) + ' ' + money(t.amount)).join(', ') : 'not linked to a transaction'}</span>
+    <b>${VIEW_TYPES[d.type]} ${esc(d.number || '')}</b><span>${esc(d.vendor || '')}</span><span>${money(d.amount)}</span>${statusHTML(d)}${(d.tags || []).map(g => `<span class="chip">${esc(g)}</span>`).join('')}
+    <span class="small muted">${d.kind === 'po' ? (S.docs.filter(x => x.poId === d.id).map(x => '🧾 ' + (x.number || x.vendor)).join(', ') || 'no invoices linked') : tx.length ? '💳 ' + tx.map(t => fmtDate(t.date) + ' ' + money(t.amount)).join(', ') : 'not linked to a transaction'}</span>
     <span style="flex:1"></span><button class="b sm" id="vEdit">Edit details</button><button class="b sm" id="vOpen">Open ↗</button>${d.type === 'quote' ? '<button class="b sm" id="vPO">→ PO</button>' : ''}`;
   $('#vPrev').onclick = () => showFile(i - 1); $('#vNext').onclick = () => showFile(i + 1);
-  $('#vEdit').onclick = () => editDoc(S.docs.find(x => x.id === d.id)); $('#vOpen').onclick = () => openFile(d);
+  $('#vEdit').onclick = () => d.kind === 'po' ? editPO(S.pos.find(x => x.id === d.id)) : editDoc(S.docs.find(x => x.id === d.id)); $('#vOpen').onclick = () => openFile(d);
   $('#vPO')?.addEventListener('click', () => editPO(null, d));
   const fr = $('#vframe'); fr.innerHTML = '<span class="muted">Loading…</span>';
   const url = await store.fileUrl(d.file); if (lastBlobUrl && lastBlobUrl !== url && lastBlobUrl.startsWith('blob:')) URL.revokeObjectURL(lastBlobUrl); lastBlobUrl = url;
@@ -805,7 +872,7 @@ document.addEventListener('keydown', e => {
 });
 
 /* ======================= PURCHASE ORDERS ======================= */
-function poTotals(p) { const sub = (p.items || []).reduce((s, i) => s + i.qty * i.price, 0); const tax = sub * (+p.taxRate || 0) / 100; const total = sub + tax + (+p.shipping || 0); return { sub, tax, total }; }
+function poTotals(p) { if (!(p.items || []).length && +p.totalOverride) return { sub: +p.totalOverride, tax: 0, total: +p.totalOverride }; const sub = (p.items || []).reduce((s, i) => s + i.qty * i.price, 0); const tax = sub * (+p.taxRate || 0) / 100; const total = sub + tax + (+p.shipping || 0); return { sub, tax, total }; }
 function nextPONumber() {
   const pre = (S.settings.poPrefix || 'PO') + '-' + today().slice(0, 4) + '-';
   const n = S.pos.map(p => p.number || '').filter(x => x.startsWith(pre)).map(x => parseInt(x.slice(pre.length)) || 0);
@@ -818,28 +885,42 @@ function vPOs(root) {
   <div class="card"><div class="toolbar"><b style="font-size:15px">Purchase orders</b><span class="grow"></span>
     <select id="fromQuote"><option value="">Generate from quote…</option>${quotes.map(q => `<option value="${q.id}">${esc(q.vendor)} · ${esc(q.number || '')} · ${money(q.amount)}</option>`).join('')}</select>
     <button class="b pri" id="newPO">+ Blank PO</button></div>
+    <div class="drop" id="poDrop" style="margin-bottom:12px;padding:14px">Upload existing POs (PDF, image, Word…) — drop here or <u>click to choose</u>. You'll fill in the details for each one.<input type="file" id="poFileIn" multiple hidden accept=".pdf,image/*,.doc,.docx,.xls,.xlsx"></div>
     ${!S.settings.company ? `<div class="banner">Add your company name and address in <a href="#settings">Settings</a> so they print on POs.</div>` : ''}
     <div class="tw"><table><thead><tr><th>PO #</th><th>Date</th><th>Vendor</th><th>Quote</th><th class="r">Total</th><th class="r">Invoiced</th><th>Status</th><th></th></tr></thead><tbody>
-    ${rows.map(p => { const q = S.docs.find(d => d.id === p.quoteId); const inv = S.docs.filter(d => d.type === 'invoice' && d.poId === p.id); const invAmt = inv.reduce((s, d) => s + (+d.amount || 0), 0); return `<tr data-id="${p.id}"><td><b>${esc(p.number)}</b></td><td>${fmtDate(p.date)}</td><td>${esc(p.vendor)}</td><td class="small">${q ? esc((q.number || '') + ' ' + q.vendor) : '—'}</td><td class="r">${money(poTotals(p).total)}</td><td class="r small">${inv.length ? money(invAmt) + ` (${inv.length})` : '—'}</td><td><span class="status ${statusCls(p.status)}">${esc(p.status)}</span></td><td style="white-space:nowrap"><button class="b sm pdf">PDF</button> <button class="b sm edit">Edit</button></td></tr>`; }).join('') || '<tr><td colspan="8" class="muted">No purchase orders yet.</td></tr>'}
+    ${rows.map(p => { const q = S.docs.find(d => d.id === p.quoteId); const inv = S.docs.filter(d => d.type === 'invoice' && d.poId === p.id); const invAmt = inv.reduce((s, d) => s + (+d.amount || 0), 0); return `<tr data-id="${p.id}"><td><b>${esc(p.number)}</b></td><td>${fmtDate(p.date)}</td><td>${esc(p.vendor)}</td><td class="small">${q ? esc((q.number || '') + ' ' + q.vendor) : '—'}</td><td class="r">${money(poTotals(p).total)}</td><td class="r small">${inv.length ? money(invAmt) + ` (${inv.length})` : '—'}</td><td><span class="status ${statusCls(p.status)}">${esc(p.status)}</span></td><td style="white-space:nowrap">${p.file ? '<button class="b sm view" title="View uploaded file">📎 File</button> ' : ''}<button class="b sm pdf" title="Generate a PDF from these details">PDF</button> <button class="b sm edit">Edit</button></td></tr>`; }).join('') || '<tr><td colspan="8" class="muted">No purchase orders yet.</td></tr>'}
     </tbody></table></div></div>`;
   $('#newPO').onclick = () => editPO(null, null);
+  const pd = $('#poDrop'), pin = $('#poFileIn');
+  pd.onclick = e => { if (e.target !== pin) pin.click(); };
+  pd.ondragover = e => { e.preventDefault(); pd.classList.add('over'); };
+  pd.ondragleave = () => pd.classList.remove('over');
+  pd.ondrop = e => { e.preventDefault(); pd.classList.remove('over'); queuePOFiles([...e.dataTransfer.files]); };
+  pin.onchange = () => queuePOFiles([...pin.files]);
   $('#fromQuote').onchange = e => { const q = S.docs.find(d => d.id === e.target.value); if (q) editPO(null, q); };
-  root.querySelector('tbody').addEventListener('click', e => { const tr = e.target.closest('tr'); const p = S.pos.find(x => x.id === tr?.dataset.id); if (!p) return; if (e.target.classList.contains('edit')) editPO(p); if (e.target.classList.contains('pdf')) poPDF(p); });
+  root.querySelector('tbody').addEventListener('click', e => { const tr = e.target.closest('tr'); const p = S.pos.find(x => x.id === tr?.dataset.id); if (!p) return; if (e.target.classList.contains('edit')) editPO(p); if (e.target.classList.contains('pdf')) poPDF(p); if (e.target.classList.contains('view')) openDocViewer(p.id); });
 }
-function editPO(p, quote) {
+function queuePOFiles(files) { if (!files.length) return; const f = files.shift(); editPO(null, null, f, files); }
+function editPO(p, quote, file = null, rest = []) {
   const isNew = !p;
   if (!p) {
     p = { id: 'po_' + uid(), number: nextPONumber(), date: today(), status: 'draft', vendor: quote?.vendor || '', vendorAddress: '', vendorContact: '', quoteId: quote?.id || '', quoteRef: quote?.number || '', items: structuredClone(quote?.items?.length ? quote.items : quote ? [{ desc: quote.description || `Per quote ${quote.number || ''}`, qty: 1, price: +quote.amount || 0 }] : []), taxRate: +S.settings.taxRate || 0, shipping: 0, terms: S.settings.paymentTerms || 'Net 30', deliveryDate: '', shipTo: S.settings.address || '', notes: '', tags: quote?.tags || [] };
+    if (file) {
+      const m = file.name.match(/\bP\.?O\.?[\s_#-]*([A-Z0-9][A-Z0-9-]{2,})/i);
+      Object.assign(p, { number: m ? 'PO-' + m[1].replace(/^-/, '') : '', status: 'issued', imported: true, shipTo: '', terms: '', taxRate: 0 });
+    }
     const prev = S.pos.find(x => x.vendor && x.vendor === p.vendor); if (prev) { p.vendorAddress = prev.vendorAddress; p.vendorContact = prev.vendorContact; }
   } else p = structuredClone(p);
+  const vendors = [...new Set([...S.docs.map(x => x.vendor), ...S.pos.map(x => x.vendor)].filter(Boolean))];
   const quotes = S.docs.filter(d => d.type === 'quote');
-  const body = modal(isNew ? 'New purchase order' : 'Edit ' + p.number, `
+  const body = modal((file ? 'Existing PO — ' + file.name : isNew ? 'New purchase order' : 'Edit ' + p.number) + (rest.length ? ` (${rest.length} more queued)` : ''), `
+    ${file ? '<div class="banner">Fill in the details from this PO. Line items are optional — if you skip them, enter the PO total.</div>' : ''}
     <div class="form">
       <label>PO number<input id="pN" value="${esc(p.number)}"></label>
       <label>Date<input type="date" id="pD" value="${p.date}"></label>
       <label>Status<select id="pS">${PO_STATUS.map(s => `<option ${p.status === s ? 'selected' : ''}>${s}</option>`).join('')}</select></label>
       <label>Based on quote<select id="pQ"><option value="">—</option>${quotes.map(q => `<option value="${q.id}" ${p.quoteId === q.id ? 'selected' : ''}>${esc(q.vendor)} · ${esc(q.number || '')}</option>`).join('')}</select></label>
-      <label>Vendor<input id="pV" value="${esc(p.vendor)}"></label>
+      <label>Vendor<input id="pV" value="${esc(p.vendor)}" list="poVendList"></label>
       <label>Vendor contact / email<input id="pVC" value="${esc(p.vendorContact || '')}"></label>
       <label>Payment terms<input id="pT" value="${esc(p.terms || '')}"></label>
       <label>Requested delivery<input type="date" id="pDel" value="${p.deliveryDate || ''}"></label>
@@ -849,22 +930,40 @@ function editPO(p, quote) {
       <label>Tax rate %<input type="number" step="0.001" id="pTax" value="${p.taxRate || 0}"></label>
       <label>Shipping / handling<input type="number" step="0.01" id="pShip" value="${p.shipping || 0}"></label>
       <label>Tags<input id="pTags" value="${esc((p.tags || []).join(', '))}"></label>
+      <label>PO total (used when there are no line items)<input type="number" step="0.01" id="pOver" value="${p.totalOverride || ''}"></label>
       <label><span>Total</span><div id="pTot" style="font-size:18px;font-weight:650;padding-top:4px"></div></label>
       <label class="full">Notes / special instructions<textarea id="pNotes">${esc(p.notes || '')}</textarea></label>
+      <label class="full">PO document ${p.file ? `<div class="small">${esc(p.fileName)} <button class="b sm" id="pView" type="button">View</button> — choose a file below to replace it</div>` : ''}${file ? `<div class="small">${esc(file.name)} · ${(file.size / 1024).toFixed(0)} KB</div>` : `<input type="file" id="pFile" accept=".pdf,image/*,.doc,.docx,.xls,.xlsx">`}</label>
     </div>
-    <div class="mfoot">${!isNew ? '<button class="b danger" id="pDelBtn">Delete</button>' : ''}<span style="flex:1"></span><button class="b" data-close>Cancel</button><button class="b" id="pSave">Save</button><button class="b pri" id="pSavePdf">Save &amp; download PDF</button></div>`, { wide: true });
-  const tot = () => { const t = poTotals({ items: readItems(body), taxRate: $('#pTax', body).value, shipping: $('#pShip', body).value }); $('#pTot', body).textContent = money(t.total); };
+    <datalist id="poVendList">${vendors.map(v => `<option value="${esc(v)}">`).join('')}</datalist>
+    <div class="mfoot">${!isNew ? '<button class="b danger" id="pDelBtn">Delete</button>' : ''}<span style="flex:1"></span>${rest.length ? '<button class="b" id="pSkip">Skip file</button>' : ''}<button class="b" data-close>Cancel</button>${file || p.imported ? `<button class="b pri" id="pSave">${rest.length ? 'Save &amp; next' : 'Save'}</button>` : '<button class="b" id="pSave">Save</button><button class="b pri" id="pSavePdf">Save &amp; download PDF</button>'}</div>`, { wide: true });
+  attachPreview(body, file || (p.file ? p : null));
+  const tot = () => { const t = poTotals({ items: readItems(body), taxRate: $('#pTax', body).value, shipping: $('#pShip', body).value, totalOverride: $('#pOver', body).value }); $('#pTot', body).textContent = money(t.total); };
   bindItems(body, tot); body.addEventListener('input', tot); tot();
-  const collect = () => Object.assign(p, { number: $('#pN', body).value.trim(), date: $('#pD', body).value, status: $('#pS', body).value, quoteId: $('#pQ', body).value, quoteRef: S.docs.find(d => d.id === $('#pQ', body).value)?.number || '', vendor: $('#pV', body).value.trim(), vendorContact: $('#pVC', body).value.trim(), terms: $('#pT', body).value.trim(), deliveryDate: $('#pDel', body).value, vendorAddress: $('#pVA', body).value.trim(), shipTo: $('#pST', body).value.trim(), items: readItems(body), taxRate: +$('#pTax', body).value || 0, shipping: +$('#pShip', body).value || 0, tags: parseTags($('#pTags', body).value), notes: $('#pNotes', body).value.trim(), updatedAt: new Date().toISOString() });
+  const collect = () => Object.assign(p, { number: $('#pN', body).value.trim(), date: $('#pD', body).value, status: $('#pS', body).value, quoteId: $('#pQ', body).value, quoteRef: S.docs.find(d => d.id === $('#pQ', body).value)?.number || '', vendor: $('#pV', body).value.trim(), vendorContact: $('#pVC', body).value.trim(), terms: $('#pT', body).value.trim(), deliveryDate: $('#pDel', body).value, vendorAddress: $('#pVA', body).value.trim(), shipTo: $('#pST', body).value.trim(), items: readItems(body), taxRate: +$('#pTax', body).value || 0, shipping: +$('#pShip', body).value || 0, tags: parseTags($('#pTags', body).value), notes: $('#pNotes', body).value.trim(), totalOverride: +$('#pOver', body).value || 0, updatedAt: new Date().toISOString() });
   const save = async pdf => {
     collect();
+    if (!p.number) { toast('Enter the PO number'); return; }
     if (S.pos.some(x => x.number === p.number && x.id !== p.id)) { toast('That PO number is already used'); return; }
-    await persist('pos', p);
+    const btn = $('#pSave', body); btn.disabled = true; btn.textContent = 'Saving…';
+    try {
+      const f = file || $('#pFile', body)?.files[0];
+      if (f) {
+        if (p.file) await store.removeFile(p.file.path);
+        const up = await store.upload(`accounting/pos/${p.id}/${safeId(f.name)}`, f);
+        p.file = { path: up.path, url: up.url, contentType: f.type || '', size: f.size }; p.fileName = f.name;
+      }
+      await persist('pos', p);
+    } catch (e) { btn.disabled = false; btn.textContent = 'Save'; DBG.err('PO save failed', e); toast('Save failed: ' + (e.code || e.message), 6000); return; }
     const q = S.docs.find(d => d.id === p.quoteId); if (q && q.status === 'open' && p.status !== 'draft' && p.status !== 'cancelled') { q.status = 'accepted'; await persist('docs', q); }
-    closeModal(); toast('Saved ' + p.number); render(); if (pdf) poPDF(p);
+    toast('Saved ' + p.number);
+    if (rest.length) { render(); queuePOFiles(rest); return; }
+    closeModal(); render(); if (pdf) poPDF(p);
   };
-  $('#pSave', body).onclick = () => save(false); $('#pSavePdf', body).onclick = () => save(true);
-  $('#pDelBtn', body)?.addEventListener('click', async () => { if (!confirm('Delete ' + p.number + '?')) return; await store.del('pos', p.id); S.pos = S.pos.filter(x => x.id !== p.id); closeModal(); render(); });
+  $('#pSave', body).onclick = () => save(false); $('#pSavePdf', body)?.addEventListener('click', () => save(true));
+  $('#pSkip', body)?.addEventListener('click', () => queuePOFiles(rest));
+  $('#pView', body)?.addEventListener('click', () => openFile(p));
+  $('#pDelBtn', body)?.addEventListener('click', async () => { if (!confirm('Delete ' + p.number + (p.file ? ' and its file' : '') + '?')) return; if (p.file) await store.removeFile(p.file.path); await store.del('pos', p.id); S.pos = S.pos.filter(x => x.id !== p.id); closeModal(); render(); });
 }
 function poPDF(p) {
   if (!window.jspdf) { toast('PDF library did not load'); return; }
@@ -1111,102 +1210,3 @@ function signIn() {
       <div class="small" id="siErr" style="margin-top:6px;color:var(--crit)"></div>
       <div class="mfoot"><button class="b" id="siDbg">Debug</button><span style="flex:1"></span><button class="b" id="siLocal">Use local mode instead</button><button class="b" id="siGo">Sign in with email</button></div>`);
     const fail = (how, e) => { DBG.err(`sign-in (${how}) failed`, e); const h = authHint(e); $('#siErr', body).textContent = (e.code || e.message) + (h ? ' — ' + h : ''); };
-    const prov = () => { const p = new store.A.GoogleAuthProvider(); p.setCustomParameters({ prompt: 'select_account' }); return p; };
-    $('#siGoogle', body).onclick = async () => { DBG.info('sign-in: Google popup start'); try { const r = await store.A.signInWithPopup(store.auth, prov()); DBG.info('sign-in: Google popup ok', { uid: r.user.uid, email: r.user.email }); closeModal(); res(true); } catch (e) { fail('google-popup', e); } };
-    $('#siGoogleR', body).onclick = async () => { DBG.info('sign-in: Google redirect start (page will reload)'); try { await store.A.signInWithRedirect(store.auth, prov()); } catch (e) { fail('google-redirect', e); } };
-    $('#siGo', body).onclick = async () => { DBG.info('sign-in: email start', { email: $('#siE', body).value.trim() }); try { const r = await store.A.signInWithEmailAndPassword(store.auth, $('#siE', body).value.trim(), $('#siP', body).value); DBG.info('sign-in: email ok', { uid: r.user.uid }); closeModal(); res(true); } catch (e) { fail('email', e); } };
-    $('#siLocal', body).onclick = () => { DBG.info('sign-in: user chose local mode'); closeModal(); res(false); };
-    $('#siDbg', body).onclick = () => toggleDebug(true);
-  });
-}
-async function boot() {
-  DBG.mark('boot');
-  setConn('', 'Connecting…');
-  const cfg = LS.get('ledger.fbConfig', FIREBASE_CONFIG); const prefix = LS.get('ledger.prefix', defaultPrefix(cfg));
-  DBG.info('boot config', { source: localStorage.getItem('ledger.fbConfig') ? 'localStorage (Settings)' : 'hard-coded FIREBASE_CONFIG', projectId: cfg?.projectId, authDomain: cfg?.authDomain, storageBucket: cfg?.storageBucket, prefix, requireAuth: LS.get('ledger.auth', false), forceLocal: LS.get('ledger.forceLocal', false) });
-  store = null;
-  if (cfg && !LS.get('ledger.forceLocal', false)) {
-    try {
-      store = await makeFirebase(cfg, prefix);
-      if (LS.get('ledger.auth', false) && !store.auth.currentUser) { const ok = await signIn(); if (!ok) { LS.set('ledger.forceLocal', true); store = null; } }
-    } catch (e) { DBG.err('boot: Firebase setup failed → local mode', e); toast('Firebase failed: ' + (e.code || e.message) + ' — using local mode. Open Debug for details.', 7000); store = null; }
-  }
-  if (!store) store = await makeLocal();
-  DBG.info('boot: storage backend = ' + store.kind);
-  try {
-    const d = await store.loadAll();
-    S.accounts = d.accounts || []; S.txns = d.txns || []; S.docs = d.docs || []; S.pos = d.pos || [];
-    S.settings = { ...DEFAULT_SETTINGS, ...((d.settings || []).find(x => x.id === 'main') || {}) };
-    setConn(store.kind === 'firebase' ? 'ok' : 'warn', store.kind === 'firebase' ? `Firebase · ${store.projectId}${store.auth.currentUser ? ' · ' + (store.auth.currentUser.email || 'anon') : ''}` : 'Local mode');
-    DBG.info('boot: data loaded', { accounts: S.accounts.length, txns: S.txns.length, docs: S.docs.length, pos: S.pos.length });
-  } catch (e) {
-    DBG.err('boot: data load failed', e);
-    setConn('bad', 'Load failed'); toast('Could not load data: ' + (e.code || e.message) + (e.code === 'permission-denied' ? ' — Firestore rules rejected this user.' : '') + ' Open Debug for details.', 9000);
-    if (store.kind === 'firebase') { const fb = store; store = await makeLocal(); store._failedFirebase = fb; const d = await store.loadAll(); Object.assign(S, { accounts: d.accounts, txns: d.txns, docs: d.docs, pos: d.pos }); setConn('bad', 'Firebase error — local mode'); }
-  }
-  go(UI.tab);
-}
-
-/* ---------------- debug panel & diagnostics ---------------- */
-function envInfo() {
-  const cfg = LS.get('ledger.fbConfig', FIREBASE_CONFIG) || {};
-  const fb = store?.kind === 'firebase' ? store : store?._failedFirebase;
-  const u = fb?.auth?.currentUser;
-  let ls = false, ss = false; try { localStorage.setItem('_t', '1'); localStorage.removeItem('_t'); ls = true; } catch {} try { sessionStorage.setItem('_t', '1'); sessionStorage.removeItem('_t'); ss = true; } catch {}
-  return {
-    when: new Date().toString(), href: location.href, origin: location.origin, protocol: location.protocol, hostname: location.hostname,
-    userAgent: navigator.userAgent, cookiesEnabled: navigator.cookieEnabled, localStorage: ls, sessionStorage: ss, indexedDB: !!window.indexedDB,
-    inIframe: window.top !== window.self, online: navigator.onLine,
-    config: { apiKey: cfg.apiKey ? cfg.apiKey.slice(0, 8) + '…' + cfg.apiKey.slice(-4) : null, authDomain: cfg.authDomain, projectId: cfg.projectId, storageBucket: cfg.storageBucket, appId: cfg.appId, source: localStorage.getItem('ledger.fbConfig') ? 'Settings/localStorage' : 'hard-coded' },
-    prefix: LS.get('ledger.prefix', defaultPrefix(cfg)), requireAuth: LS.get('ledger.auth', false), forceLocal: LS.get('ledger.forceLocal', false),
-    backend: store?.kind, firebaseSdk: FB_VER,
-    user: u ? { uid: u.uid, email: u.email, emailVerified: u.emailVerified, anonymous: u.isAnonymous, providers: u.providerData.map(p => p.providerId) } : null,
-    libs: { Chart: !!window.Chart, jsPDF: !!window.jspdf }
-  };
-}
-function report() { return ['=== LEDGER DEBUG REPORT ===', JSON.stringify(envInfo(), null, 2), '', '=== LOG ===', ...DBG.lines()].join('\n'); }
-async function runDiagnostics() {
-  DBG.mark('diagnostics start');
-  const env = envInfo(); DBG.info('env', env);
-  if (location.protocol === 'file:') DBG.warn('Opened as file:// — Google sign-in cannot work here.');
-  if (env.inIframe) DBG.warn('Page is inside an iframe — popups/storage may be restricted.');
-  if (/github\.io$/.test(location.hostname)) DBG.info(`GitHub Pages host — make sure "${location.hostname}" is in Firebase Authorized domains (no https://, no path).`);
-  const fb = store?.kind === 'firebase' ? store : store?._failedFirebase;
-  if (!fb) { DBG.warn('Firebase not active (local mode). Try Settings → Save & reconnect, then rerun.'); return; }
-  try { const r = await fetch(`https://${env.config.authDomain}/__/auth/handler`, { method: 'HEAD', mode: 'no-cors' }); DBG.info('authDomain handler reachable (opaque response)', { type: r.type }); } catch (e) { DBG.err('authDomain handler NOT reachable', e); }
-  const u = fb.auth.currentUser;
-  if (!u) { DBG.warn('Not signed in — Firestore/Storage tests will use no auth.'); }
-  else {
-    try { const t = await u.getIdTokenResult(true); DBG.info('ID token claims', { email: t.claims.email, email_verified: t.claims.email_verified, sign_in_provider: t.signInProvider, aud: t.claims.aud, expires: t.expirationTime }); if (t.claims.aud !== env.config.projectId) DBG.err('token audience ≠ projectId'); }
-    catch (e) { DBG.err('getIdTokenResult failed', e); }
-  }
-  const { F, S, db, st, prefix } = fb;
-  try { const s = await F.getDocs(F.query(F.collection(db, prefix + 'settings'), F.limit(1))); DBG.info(`TEST firestore read ${prefix}settings: OK (${s.size} doc)`); } catch (e) { DBG.err(`TEST firestore read ${prefix}settings: FAILED`, e); }
-  const probe = F.doc(db, prefix + 'settings', '_debug_probe');
-  try { await F.setDoc(probe, { at: new Date().toISOString(), uid: u?.uid || null }); DBG.info('TEST firestore write: OK'); await F.deleteDoc(probe); DBG.info('TEST firestore delete: OK'); } catch (e) { DBG.err('TEST firestore write/delete: FAILED', e); }
-  try { const l = await S.list(S.ref(st, 'accounting/docs'), { maxResults: 1 }); DBG.info(`TEST storage list accounting/docs: OK (${l.prefixes.length + l.items.length} entries)`); } catch (e) { DBG.err('TEST storage list: FAILED', e); }
-  const pr = S.ref(st, 'accounting/_debug_probe.txt');
-  try { await S.uploadString(pr, 'probe ' + new Date().toISOString()); DBG.info('TEST storage upload: OK'); await S.getDownloadURL(pr); DBG.info('TEST storage getDownloadURL: OK'); await S.deleteObject(pr); DBG.info('TEST storage delete: OK'); } catch (e) { DBG.err('TEST storage upload/url/delete: FAILED', e); }
-  DBG.mark('diagnostics done');
-}
-function toggleDebug(show) {
-  const p = $('#dbgPanel'); p.hidden = show === undefined ? !p.hidden : !show;
-  if (!p.hidden) { $('#dbgLog').textContent = DBG.lines().join('\n'); $('#dbgLog').scrollTop = 1e9; }
-}
-document.body.insertAdjacentHTML('beforeend', `
-<button id="dbgBtn" title="Debug log">🐞 Debug</button>
-<div id="dbgPanel" hidden>
-  <div class="dbgHead"><b>Debug</b><span class="small muted">Run diagnostics, then copy the report and paste it to Claude. API key is redacted.</span><span style="flex:1"></span>
-    <button class="b sm" id="dbgRun">Run diagnostics</button><button class="b sm pri" id="dbgCopy">Copy debug report</button><button class="b sm" id="dbgDl">Download .txt</button><button class="b sm" id="dbgClear">Clear</button><button class="x" id="dbgX">&times;</button></div>
-  <pre id="dbgLog"></pre>
-</div>`);
-$('#dbgBtn').onclick = () => toggleDebug(); $('#dbgX').onclick = () => toggleDebug(false);
-$('#dbgClear').onclick = () => DBG.clear();
-$('#dbgRun').onclick = async () => { const b = $('#dbgRun'); b.disabled = true; b.textContent = 'Running…'; try { await runDiagnostics(); } finally { b.disabled = false; b.textContent = 'Run diagnostics'; } };
-$('#dbgCopy').onclick = async () => { const txt = report(); try { await navigator.clipboard.writeText(txt); toast('Debug report copied — paste it into the chat'); } catch { const ta = document.createElement('textarea'); ta.value = txt; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); toast('Debug report copied'); } };
-$('#dbgDl').onclick = () => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([report()], { type: 'text/plain' })); a.download = `ledger-debug-${today()}.txt`; a.click(); };
-if (/[?&]debug\b/.test(location.search)) toggleDebug(true);
-boot();
-</script>
-</body>
-</html>
