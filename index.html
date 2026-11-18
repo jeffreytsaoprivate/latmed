@@ -123,6 +123,12 @@ tr:hover td{background:color-mix(in srgb,var(--surface-2) 60%,transparent)}
 .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--text-secondary);margin-bottom:8px}
 .legend span{display:inline-flex;align-items:center;gap:6px}
 .legend i{width:10px;height:10px;border-radius:2px;display:inline-block}
+#dbgBtn{position:fixed;right:14px;bottom:14px;z-index:60;font:12px system-ui;padding:6px 10px;border-radius:99px;border:1px solid var(--border);background:var(--surface-1);color:var(--text-secondary);cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.12)}
+#dbgBtn.err{border-color:var(--crit);color:var(--crit);font-weight:600}
+#dbgPanel{position:fixed;left:12px;right:12px;bottom:56px;height:45vh;z-index:61;background:var(--surface-1);border:1px solid var(--border);border-radius:10px;box-shadow:0 10px 40px rgba(0,0,0,.25);display:flex;flex-direction:column}
+#dbgPanel[hidden]{display:none}
+.dbgHead{display:flex;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--border);flex-wrap:wrap}
+#dbgLog{flex:1;margin:0;overflow:auto;padding:10px 12px;font:11.5px/1.45 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-word;color:var(--text-primary)}
 @media (max-width:760px){.g2{grid-template-columns:1fr}.viewer{grid-template-columns:1fr;height:auto}.vlist{max-height:200px}.vframe{height:60vh}}
 </style>
 </head>
@@ -190,6 +196,34 @@ const hash = s => { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h << 
 const safeId = s => String(s).replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 140);
 const cssVar = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const LS = { get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } }, set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} } };
+/* ---------------- debug log (shared via "Copy debug report") ---------------- */
+const DBG = (() => {
+  const KEY = 'ledger.debug.log', MAX = 400;
+  let lines = []; try { lines = JSON.parse(sessionStorage.getItem(KEY) || '[]'); } catch {}
+  const t0 = performance.now();
+  const save = () => { try { sessionStorage.setItem(KEY, JSON.stringify(lines.slice(-MAX))); } catch {} };
+  const fmt = v => { if (v == null) return ''; if (v instanceof Error || (v && (v.code || v.message))) return JSON.stringify(errInfo(v)); try { return typeof v === 'string' ? v : JSON.stringify(v); } catch { return String(v); } };
+  function add(level, msg, data) {
+    const ln = `${new Date().toISOString().slice(11, 23)} +${((performance.now() - t0) / 1000).toFixed(2)}s [${level}] ${msg}${data !== undefined ? ' ' + fmt(data) : ''}`;
+    lines.push(ln); if (lines.length > MAX) lines = lines.slice(-MAX); save();
+    (level === 'ERR' ? console.error : level === 'WARN' ? console.warn : console.log)('[ledger]', ln);
+    const box = document.getElementById('dbgLog'); if (box) { box.textContent = lines.join('\n'); box.scrollTop = box.scrollHeight; }
+    if (level === 'ERR') { const b = document.getElementById('dbgBtn'); if (b) b.classList.add('err'); }
+  }
+  return { info: (m, d) => add('INFO', m, d), warn: (m, d) => add('WARN', m, d), err: (m, d) => add('ERR', m, d), lines: () => lines, clear: () => { lines = []; save(); add('INFO', 'log cleared'); }, mark: m => add('----', m) };
+})();
+function errInfo(e) {
+  if (!e) return e;
+  const o = { code: e.code, name: e.name, message: e.message };
+  if (e.customData) { try { o.customData = JSON.parse(JSON.stringify(e.customData)); } catch {} }
+  if (e.status_) o.status = e.status_;
+  if (e.serverResponse) o.serverResponse = String(e.serverResponse).slice(0, 600);
+  if (e.stack) o.stack = String(e.stack).split('\n').slice(0, 4).join(' | ');
+  return o;
+}
+window.addEventListener('error', e => DBG.err('window.onerror', { message: e.message, src: e.filename, line: e.lineno, col: e.colno }));
+window.addEventListener('unhandledrejection', e => DBG.err('unhandledrejection', e.reason));
+DBG.mark(`page load ${location.href}`);
 function toast(msg, ms = 2600) { const t = $('#toast'); t.textContent = msg; t.classList.add('on'); clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('on'), ms); }
 function parseDate(s) {
   if (!s) return null; s = String(s).trim();
@@ -223,22 +257,39 @@ const DEFAULT_SETTINGS = { id:'main', company:'', address:'', email:'', phone:''
 const TRANSFER_RE = /(payment\s*-?\s*thank you|online banking transfer|transfer (to|from)|bank of america credit card bill payment|online payment|autopay)/i;
 
 /* ---------------- storage adapters ---------------- */
+const FB_VER = '10.12.2';
 async function makeFirebase(cfg, prefix) {
-  const B = 'https://www.gstatic.com/firebasejs/10.12.2/';
-  const [{initializeApp, getApps}, F, S, A] = await Promise.all([import(B+'firebase-app.js'), import(B+'firebase-firestore.js'), import(B+'firebase-storage.js'), import(B+'firebase-auth.js')]);
-  const app = getApps().find(a => a.name === 'ledger') || initializeApp(cfg, 'ledger');
+  const B = `https://www.gstatic.com/firebasejs/${FB_VER}/`;
+  DBG.info('firebase: importing SDK modules', { version: FB_VER });
+  let mods;
+  try { mods = await Promise.all([import(B+'firebase-app.js'), import(B+'firebase-firestore.js'), import(B+'firebase-storage.js'), import(B+'firebase-auth.js')]); }
+  catch (e) { DBG.err('firebase: SDK import failed (network / CSP / ad-blocker?)', e); throw e; }
+  const [{initializeApp, getApps}, F, S, A] = mods;
+  DBG.info('firebase: SDK loaded');
+  let app;
+  try { app = getApps().find(a => a.name === 'ledger') || initializeApp(cfg, 'ledger'); DBG.info('firebase: app initialized', { projectId: cfg.projectId, authDomain: cfg.authDomain, storageBucket: cfg.storageBucket, appId: cfg.appId }); }
+  catch (e) { DBG.err('firebase: initializeApp failed', e); throw e; }
   const db = F.getFirestore(app), st = S.getStorage(app), auth = A.getAuth(app);
+  try { await A.setPersistence(auth, A.browserLocalPersistence); DBG.info('auth: persistence = browserLocal'); } catch (e) { DBG.warn('auth: setPersistence failed', e); }
+  A.onAuthStateChanged(auth, u => DBG.info('auth: state changed', u ? { uid: u.uid, email: u.email, emailVerified: u.emailVerified, anonymous: u.isAnonymous, providers: u.providerData.map(p => p.providerId) } : 'signed out'));
   await new Promise(r => { const u = A.onAuthStateChanged(auth, () => { u(); r(); }); });
+  try {
+    const rr = await A.getRedirectResult(auth);
+    if (rr) DBG.info('auth: redirect sign-in completed', { uid: rr.user.uid, email: rr.user.email, providerId: rr.providerId });
+    else DBG.info('auth: no pending redirect result');
+  } catch (e) { DBG.err('auth: getRedirectResult error', e); }
+  DBG.info('auth: initial user', auth.currentUser ? { uid: auth.currentUser.uid, email: auth.currentUser.email } : null);
   const c = n => F.collection(db, prefix + n);
+  const wrap = async (label, fn) => { const t = performance.now(); try { const r = await fn(); DBG.info(`${label} ok (${Math.round(performance.now() - t)} ms)`); return r; } catch (e) { DBG.err(`${label} FAILED`, e); throw e; } };
   return {
-    kind: 'firebase', auth, A, projectId: cfg.projectId,
-    async loadAll() { const out = {}; for (const n of COLS) { const s = await F.getDocs(c(n)); out[n] = s.docs.map(d => ({...d.data(), id: d.id})); } return out; },
-    async save(n, o) { await F.setDoc(F.doc(db, prefix + n, o.id), clean(o)); },
-    async del(n, id) { await F.deleteDoc(F.doc(db, prefix + n, id)); },
-    async saveMany(n, arr) { for (let i = 0; i < arr.length; i += 400) { const b = F.writeBatch(db); arr.slice(i, i+400).forEach(o => b.set(F.doc(db, prefix + n, o.id), clean(o))); await b.commit(); } },
-    async delMany(n, ids) { for (let i = 0; i < ids.length; i += 400) { const b = F.writeBatch(db); ids.slice(i, i+400).forEach(id => b.delete(F.doc(db, prefix + n, id))); await b.commit(); } },
-    async upload(path, file) { const r = S.ref(st, path); await S.uploadBytes(r, file, {contentType: file.type || 'application/octet-stream'}); return { path, url: await S.getDownloadURL(r) }; },
-    async removeFile(path) { try { await S.deleteObject(S.ref(st, path)); } catch (e) { console.warn('delete file', e); } },
+    kind: 'firebase', auth, A, F, S, db, st, projectId: cfg.projectId, prefix,
+    async loadAll() { const out = {}; for (const n of COLS) { out[n] = await wrap(`firestore read ${prefix}${n}`, async () => { const s = await F.getDocs(c(n)); DBG.info(`  ${n}: ${s.size} docs`); return s.docs.map(d => ({...d.data(), id: d.id})); }); } return out; },
+    async save(n, o) { await wrap(`firestore write ${prefix}${n}/${o.id}`, () => F.setDoc(F.doc(db, prefix + n, o.id), clean(o))); },
+    async del(n, id) { await wrap(`firestore delete ${prefix}${n}/${id}`, () => F.deleteDoc(F.doc(db, prefix + n, id))); },
+    async saveMany(n, arr) { for (let i = 0; i < arr.length; i += 400) { const b = F.writeBatch(db); arr.slice(i, i+400).forEach(o => b.set(F.doc(db, prefix + n, o.id), clean(o))); await wrap(`firestore batch ${prefix}${n} [${i}..${Math.min(i+400, arr.length)})`, () => b.commit()); } },
+    async delMany(n, ids) { for (let i = 0; i < ids.length; i += 400) { const b = F.writeBatch(db); ids.slice(i, i+400).forEach(id => b.delete(F.doc(db, prefix + n, id))); await wrap(`firestore batch delete ${prefix}${n}`, () => b.commit()); } },
+    async upload(path, file) { return wrap(`storage upload ${path} (${file.size} B, ${file.type})`, async () => { const r = S.ref(st, path); await S.uploadBytes(r, file, {contentType: file.type || 'application/octet-stream'}); return { path, url: await S.getDownloadURL(r) }; }); },
+    async removeFile(path) { try { await wrap(`storage delete ${path}`, () => S.deleteObject(S.ref(st, path))); } catch {} },
     async fileUrl(f) { return f.url; }
   };
 }
@@ -557,11 +608,11 @@ function editTxn(t) {
   };
 }
 async function persist(n, o) {
-  try { await store.save(n, o); } catch (e) { console.error(e); toast('Save failed: ' + e.message, 5000); throw e; }
+  try { await store.save(n, o); } catch (e) { DBG.err('persist failed', e); toast('Save failed: ' + e.message, 5000); throw e; }
   const arr = n === 'settings' ? null : S[n]; if (arr) { const i = arr.findIndex(x => x.id === o.id); i >= 0 ? arr[i] = o : arr.push(o); }
 }
 async function persistMany(n, list) {
-  try { await store.saveMany(n, list); } catch (e) { console.error(e); toast('Save failed: ' + e.message, 5000); throw e; }
+  try { await store.saveMany(n, list); } catch (e) { DBG.err('persistMany failed', e); toast('Save failed: ' + e.message, 5000); throw e; }
   const idx = new Map(S[n].map((x, i) => [x.id, i])); list.forEach(o => { const i = idx.get(o.id); i != null ? S[n][i] = o : S[n].push(o); });
 }
 
@@ -694,7 +745,7 @@ function editDoc(d, file, rest = []) {
       await persist('docs', d); toast('Saved ' + (DOC_TYPES[d.type] || 'document'));
       if (rest.length) queueFiles(rest); else { closeModal(); render(); }
       if (rest.length) render();
-    } catch (e) { btn.disabled = false; btn.textContent = 'Save'; toast('Save failed: ' + e.message, 6000); console.error(e); }
+    } catch (e) { btn.disabled = false; btn.textContent = 'Save'; toast('Save failed: ' + e.message, 6000); DBG.err('document save failed', e); }
   };
 }
 
@@ -953,7 +1004,7 @@ async function readImport(file) {
     const match = S.accounts.find(a => last4 && a.last4 === last4) || (S.accounts.length === 1 ? S.accounts[0] : null);
     UI.pendingImport = { fileName: file.name, ...r, guessType, last4, acctId: match?.id || (S.accounts.length ? S.accounts[0].id : '__new'), format: isOFX ? 'QFX/OFX' : 'CSV' };
     render();
-  } catch (e) { toast('Import failed: ' + e.message, 6000); console.error(e); }
+  } catch (e) { toast('Import failed: ' + e.message, 6000); DBG.err('import parse failed', e); }
 }
 function importIds(pi, acctId) {
   const occ = {};
@@ -1001,7 +1052,7 @@ function vSettings(root) {
     <div class="form"><label class="full">firebaseConfig<textarea id="sCfg" style="min-height:120px;font-family:ui-monospace,monospace;font-size:12px" placeholder='{ apiKey: "...", authDomain: "...", projectId: "...", storageBucket: "...", appId: "..." }'>${cfg ? esc(JSON.stringify(cfg, null, 2)) : ''}</textarea></label>
     <label>Collection path prefix<input id="sPre" value="${esc(LS.get('ledger.prefix', defaultPrefix(cfg)))}"></label>
     <label>Require sign-in (Google or email/password)<select id="sAuth"><option value="0">No</option><option value="1" ${LS.get('ledger.auth', false) ? 'selected' : ''}>Yes</option></select></label></div>
-    <div class="mfoot" style="justify-content:flex-start"><button class="b pri" id="sConnect">Save &amp; reconnect</button><button class="b" id="sLocal">Use local mode</button>${user ? `<span class="small muted">Signed in as ${esc(user.email || '')} · UID <code style="user-select:all">${esc(user.uid)}</code></span><button class="b sm" id="sOut">Sign out</button>` : ''}<span class="small muted">Status: ${store?.kind === 'firebase' ? 'connected to ' + esc(store.projectId) : 'local mode'}</span></div>
+    <div class="mfoot" style="justify-content:flex-start"><button class="b pri" id="sConnect">Save &amp; reconnect</button><button class="b" id="sLocal">Use local mode</button>${!user && store?.kind === 'firebase' ? '<button class="b sm" id="sIn">Sign in…</button>' : ''}${user ? `<span class="small muted">Signed in as ${esc(user.email || '')} · UID <code style="user-select:all">${esc(user.uid)}</code></span><button class="b sm" id="sOut">Sign out</button>` : ''}<span class="small muted">Status: ${store?.kind === 'firebase' ? 'connected to ' + esc(store.projectId) : 'local mode'}</span></div>
   </div>
   <div class="card"><h3>Company (printed on POs)</h3><div class="form">
     <label>Company name<input id="sCo" value="${esc(st.company)}"></label>
@@ -1023,6 +1074,7 @@ function vSettings(root) {
     await boot();
   };
   $('#sLocal').onclick = async () => { LS.set('ledger.forceLocal', true); await boot(); };
+  $('#sIn')?.addEventListener('click', async () => { if (await signIn()) await boot(); });
   $('#sOut')?.addEventListener('click', async () => { await store.A.signOut(store.auth); await boot(); });
   $('#sSave').onclick = async () => { Object.assign(S.settings, { id: 'main', company: $('#sCo').value.trim(), email: $('#sEm').value.trim(), phone: $('#sPh').value.trim(), poPrefix: $('#sPP').value.trim() || 'PO', address: $('#sAd').value.trim(), paymentTerms: $('#sTerms').value.trim(), taxRate: +$('#sTax').value || 0, burnMonths: Math.max(1, +$('#sBurn').value || 3), largeTxn: +$('#sLg').value || 5000 }); await persist('settings', S.settings); toast('Settings saved'); };
   const dl = (name, text, type) => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type })); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 4000); };
@@ -1034,44 +1086,126 @@ function vSettings(root) {
 
 /* ======================= BOOT ======================= */
 function setConn(kind, text) { $('#conn').innerHTML = `<span class="dot ${kind}"></span><span>${esc(text)}</span>`; }
+function authHint(e) {
+  const c = e?.code || '';
+  if (c === 'auth/unauthorized-domain') return `"${location.hostname}" is not an authorized domain. Firebase console → Security → Authentication → Settings → Authorized domains → Add domain → ${location.hostname}`;
+  if (c === 'auth/popup-blocked') return 'The browser blocked the popup. Allow popups for this site, or use "Sign in with Google (redirect)".';
+  if (c === 'auth/popup-closed-by-user' || c === 'auth/cancelled-popup-request') return 'The popup was closed before sign-in finished.';
+  if (c === 'auth/operation-not-allowed') return 'Google (or Email/Password) sign-in is not enabled in Firebase → Authentication → Sign-in method.';
+  if (c === 'auth/operation-not-supported-in-this-environment') return 'Sign-in needs http(s) — this page was opened as a local file.';
+  if (c === 'auth/network-request-failed') return 'Network request failed — ad-blocker, VPN, or firewall blocking googleapis.com?';
+  if (c === 'auth/internal-error') return 'Internal error — often third-party cookies/storage blocked, or a misconfigured authDomain.';
+  if (c === 'auth/invalid-api-key' || c.startsWith('auth/api-key')) return 'API key rejected — check apiKey and any key restrictions (HTTP referrers) in Google Cloud console → Credentials.';
+  return '';
+}
 function signIn() {
   return new Promise(res => {
     const fileProto = location.protocol === 'file:';
+    DBG.info('sign-in dialog shown', { origin: location.origin, protocol: location.protocol });
     const body = modal('Sign in', `
       <button class="b pri" id="siGoogle" style="width:100%;padding:10px">Sign in with Google</button>
-      ${fileProto ? `<div class="small" style="margin-top:6px;color:var(--warn)">Google sign-in can't run from a file opened directly from disk. Serve this folder (e.g. <code>npx serve</code>, then open http://localhost:3000/ledger.html) or host it on Firebase Hosting.</div>` : ''}
+      <button class="b" id="siGoogleR" style="width:100%;padding:8px;margin-top:6px">Sign in with Google (redirect — use if the popup fails)</button>
+      ${fileProto ? `<div class="small" style="margin-top:6px;color:var(--warn)">Google sign-in can't run from a file opened directly from disk. Serve this folder (e.g. <code>npx serve</code>) or host it.</div>` : ''}
       <div class="small muted" style="text-align:center;margin:14px 0 8px">or email &amp; password</div>
       <div class="form"><label class="full">Email<input id="siE" type="email" autocomplete="username"></label><label class="full">Password<input id="siP" type="password" autocomplete="current-password"></label></div>
       <div class="small" id="siErr" style="margin-top:6px;color:var(--crit)"></div>
-      <div class="mfoot"><button class="b" id="siLocal">Use local mode instead</button><button class="b" id="siGo">Sign in with email</button></div>`);
-    const fail = e => { $('#siErr', body).textContent = e.code === 'auth/unauthorized-domain' ? `This domain (${location.hostname || 'file'}) isn't in Firebase → Authentication → Settings → Authorized domains.` : (e.code || e.message); };
-    $('#siGoogle', body).onclick = async () => { try { const p = new store.A.GoogleAuthProvider(); p.setCustomParameters({ prompt: 'select_account' }); await store.A.signInWithPopup(store.auth, p); closeModal(); res(true); } catch (e) { fail(e); } };
-    $('#siGo', body).onclick = async () => { try { await store.A.signInWithEmailAndPassword(store.auth, $('#siE', body).value.trim(), $('#siP', body).value); closeModal(); res(true); } catch (e) { fail(e); } };
-    $('#siLocal', body).onclick = () => { closeModal(); res(false); };
+      <div class="mfoot"><button class="b" id="siDbg">Debug</button><span style="flex:1"></span><button class="b" id="siLocal">Use local mode instead</button><button class="b" id="siGo">Sign in with email</button></div>`);
+    const fail = (how, e) => { DBG.err(`sign-in (${how}) failed`, e); const h = authHint(e); $('#siErr', body).textContent = (e.code || e.message) + (h ? ' — ' + h : ''); };
+    const prov = () => { const p = new store.A.GoogleAuthProvider(); p.setCustomParameters({ prompt: 'select_account' }); return p; };
+    $('#siGoogle', body).onclick = async () => { DBG.info('sign-in: Google popup start'); try { const r = await store.A.signInWithPopup(store.auth, prov()); DBG.info('sign-in: Google popup ok', { uid: r.user.uid, email: r.user.email }); closeModal(); res(true); } catch (e) { fail('google-popup', e); } };
+    $('#siGoogleR', body).onclick = async () => { DBG.info('sign-in: Google redirect start (page will reload)'); try { await store.A.signInWithRedirect(store.auth, prov()); } catch (e) { fail('google-redirect', e); } };
+    $('#siGo', body).onclick = async () => { DBG.info('sign-in: email start', { email: $('#siE', body).value.trim() }); try { const r = await store.A.signInWithEmailAndPassword(store.auth, $('#siE', body).value.trim(), $('#siP', body).value); DBG.info('sign-in: email ok', { uid: r.user.uid }); closeModal(); res(true); } catch (e) { fail('email', e); } };
+    $('#siLocal', body).onclick = () => { DBG.info('sign-in: user chose local mode'); closeModal(); res(false); };
+    $('#siDbg', body).onclick = () => toggleDebug(true);
   });
 }
 async function boot() {
+  DBG.mark('boot');
   setConn('', 'Connecting…');
   const cfg = LS.get('ledger.fbConfig', FIREBASE_CONFIG); const prefix = LS.get('ledger.prefix', defaultPrefix(cfg));
+  DBG.info('boot config', { source: localStorage.getItem('ledger.fbConfig') ? 'localStorage (Settings)' : 'hard-coded FIREBASE_CONFIG', projectId: cfg?.projectId, authDomain: cfg?.authDomain, storageBucket: cfg?.storageBucket, prefix, requireAuth: LS.get('ledger.auth', false), forceLocal: LS.get('ledger.forceLocal', false) });
   store = null;
   if (cfg && !LS.get('ledger.forceLocal', false)) {
     try {
       store = await makeFirebase(cfg, prefix);
       if (LS.get('ledger.auth', false) && !store.auth.currentUser) { const ok = await signIn(); if (!ok) { LS.set('ledger.forceLocal', true); store = null; } }
-    } catch (e) { console.error(e); toast('Firebase failed: ' + e.message + ' — using local mode', 7000); store = null; }
+    } catch (e) { DBG.err('boot: Firebase setup failed → local mode', e); toast('Firebase failed: ' + (e.code || e.message) + ' — using local mode. Open Debug for details.', 7000); store = null; }
   }
   if (!store) store = await makeLocal();
+  DBG.info('boot: storage backend = ' + store.kind);
   try {
     const d = await store.loadAll();
     S.accounts = d.accounts || []; S.txns = d.txns || []; S.docs = d.docs || []; S.pos = d.pos || [];
     S.settings = { ...DEFAULT_SETTINGS, ...((d.settings || []).find(x => x.id === 'main') || {}) };
-    setConn(store.kind === 'firebase' ? 'ok' : 'warn', store.kind === 'firebase' ? `Firebase · ${store.projectId}` : 'Local mode');
+    setConn(store.kind === 'firebase' ? 'ok' : 'warn', store.kind === 'firebase' ? `Firebase · ${store.projectId}${store.auth.currentUser ? ' · ' + (store.auth.currentUser.email || 'anon') : ''}` : 'Local mode');
+    DBG.info('boot: data loaded', { accounts: S.accounts.length, txns: S.txns.length, docs: S.docs.length, pos: S.pos.length });
   } catch (e) {
-    console.error(e); setConn('bad', 'Load failed'); toast('Could not load data: ' + (e.code || e.message) + '. Check Firestore rules.', 8000);
-    if (store.kind === 'firebase') { store = await makeLocal(); const d = await store.loadAll(); Object.assign(S, { accounts: d.accounts, txns: d.txns, docs: d.docs, pos: d.pos }); setConn('bad', 'Firebase error — local mode'); }
+    DBG.err('boot: data load failed', e);
+    setConn('bad', 'Load failed'); toast('Could not load data: ' + (e.code || e.message) + (e.code === 'permission-denied' ? ' — Firestore rules rejected this user.' : '') + ' Open Debug for details.', 9000);
+    if (store.kind === 'firebase') { const fb = store; store = await makeLocal(); store._failedFirebase = fb; const d = await store.loadAll(); Object.assign(S, { accounts: d.accounts, txns: d.txns, docs: d.docs, pos: d.pos }); setConn('bad', 'Firebase error — local mode'); }
   }
   go(UI.tab);
 }
+
+/* ---------------- debug panel & diagnostics ---------------- */
+function envInfo() {
+  const cfg = LS.get('ledger.fbConfig', FIREBASE_CONFIG) || {};
+  const fb = store?.kind === 'firebase' ? store : store?._failedFirebase;
+  const u = fb?.auth?.currentUser;
+  let ls = false, ss = false; try { localStorage.setItem('_t', '1'); localStorage.removeItem('_t'); ls = true; } catch {} try { sessionStorage.setItem('_t', '1'); sessionStorage.removeItem('_t'); ss = true; } catch {}
+  return {
+    when: new Date().toString(), href: location.href, origin: location.origin, protocol: location.protocol, hostname: location.hostname,
+    userAgent: navigator.userAgent, cookiesEnabled: navigator.cookieEnabled, localStorage: ls, sessionStorage: ss, indexedDB: !!window.indexedDB,
+    inIframe: window.top !== window.self, online: navigator.onLine,
+    config: { apiKey: cfg.apiKey ? cfg.apiKey.slice(0, 8) + '…' + cfg.apiKey.slice(-4) : null, authDomain: cfg.authDomain, projectId: cfg.projectId, storageBucket: cfg.storageBucket, appId: cfg.appId, source: localStorage.getItem('ledger.fbConfig') ? 'Settings/localStorage' : 'hard-coded' },
+    prefix: LS.get('ledger.prefix', defaultPrefix(cfg)), requireAuth: LS.get('ledger.auth', false), forceLocal: LS.get('ledger.forceLocal', false),
+    backend: store?.kind, firebaseSdk: FB_VER,
+    user: u ? { uid: u.uid, email: u.email, emailVerified: u.emailVerified, anonymous: u.isAnonymous, providers: u.providerData.map(p => p.providerId) } : null,
+    libs: { Chart: !!window.Chart, jsPDF: !!window.jspdf }
+  };
+}
+function report() { return ['=== LEDGER DEBUG REPORT ===', JSON.stringify(envInfo(), null, 2), '', '=== LOG ===', ...DBG.lines()].join('\n'); }
+async function runDiagnostics() {
+  DBG.mark('diagnostics start');
+  const env = envInfo(); DBG.info('env', env);
+  if (location.protocol === 'file:') DBG.warn('Opened as file:// — Google sign-in cannot work here.');
+  if (env.inIframe) DBG.warn('Page is inside an iframe — popups/storage may be restricted.');
+  if (/github\.io$/.test(location.hostname)) DBG.info(`GitHub Pages host — make sure "${location.hostname}" is in Firebase Authorized domains (no https://, no path).`);
+  const fb = store?.kind === 'firebase' ? store : store?._failedFirebase;
+  if (!fb) { DBG.warn('Firebase not active (local mode). Try Settings → Save & reconnect, then rerun.'); return; }
+  try { const r = await fetch(`https://${env.config.authDomain}/__/auth/handler`, { method: 'HEAD', mode: 'no-cors' }); DBG.info('authDomain handler reachable (opaque response)', { type: r.type }); } catch (e) { DBG.err('authDomain handler NOT reachable', e); }
+  const u = fb.auth.currentUser;
+  if (!u) { DBG.warn('Not signed in — Firestore/Storage tests will use no auth.'); }
+  else {
+    try { const t = await u.getIdTokenResult(true); DBG.info('ID token claims', { email: t.claims.email, email_verified: t.claims.email_verified, sign_in_provider: t.signInProvider, aud: t.claims.aud, expires: t.expirationTime }); if (t.claims.aud !== env.config.projectId) DBG.err('token audience ≠ projectId'); }
+    catch (e) { DBG.err('getIdTokenResult failed', e); }
+  }
+  const { F, S, db, st, prefix } = fb;
+  try { const s = await F.getDocs(F.query(F.collection(db, prefix + 'settings'), F.limit(1))); DBG.info(`TEST firestore read ${prefix}settings: OK (${s.size} doc)`); } catch (e) { DBG.err(`TEST firestore read ${prefix}settings: FAILED`, e); }
+  const probe = F.doc(db, prefix + 'settings', '_debug_probe');
+  try { await F.setDoc(probe, { at: new Date().toISOString(), uid: u?.uid || null }); DBG.info('TEST firestore write: OK'); await F.deleteDoc(probe); DBG.info('TEST firestore delete: OK'); } catch (e) { DBG.err('TEST firestore write/delete: FAILED', e); }
+  try { const l = await S.list(S.ref(st, 'accounting/docs'), { maxResults: 1 }); DBG.info(`TEST storage list accounting/docs: OK (${l.prefixes.length + l.items.length} entries)`); } catch (e) { DBG.err('TEST storage list: FAILED', e); }
+  const pr = S.ref(st, 'accounting/_debug_probe.txt');
+  try { await S.uploadString(pr, 'probe ' + new Date().toISOString()); DBG.info('TEST storage upload: OK'); await S.getDownloadURL(pr); DBG.info('TEST storage getDownloadURL: OK'); await S.deleteObject(pr); DBG.info('TEST storage delete: OK'); } catch (e) { DBG.err('TEST storage upload/url/delete: FAILED', e); }
+  DBG.mark('diagnostics done');
+}
+function toggleDebug(show) {
+  const p = $('#dbgPanel'); p.hidden = show === undefined ? !p.hidden : !show;
+  if (!p.hidden) { $('#dbgLog').textContent = DBG.lines().join('\n'); $('#dbgLog').scrollTop = 1e9; }
+}
+document.body.insertAdjacentHTML('beforeend', `
+<button id="dbgBtn" title="Debug log">🐞 Debug</button>
+<div id="dbgPanel" hidden>
+  <div class="dbgHead"><b>Debug</b><span class="small muted">Run diagnostics, then copy the report and paste it to Claude. API key is redacted.</span><span style="flex:1"></span>
+    <button class="b sm" id="dbgRun">Run diagnostics</button><button class="b sm pri" id="dbgCopy">Copy debug report</button><button class="b sm" id="dbgDl">Download .txt</button><button class="b sm" id="dbgClear">Clear</button><button class="x" id="dbgX">&times;</button></div>
+  <pre id="dbgLog"></pre>
+</div>`);
+$('#dbgBtn').onclick = () => toggleDebug(); $('#dbgX').onclick = () => toggleDebug(false);
+$('#dbgClear').onclick = () => DBG.clear();
+$('#dbgRun').onclick = async () => { const b = $('#dbgRun'); b.disabled = true; b.textContent = 'Running…'; try { await runDiagnostics(); } finally { b.disabled = false; b.textContent = 'Run diagnostics'; } };
+$('#dbgCopy').onclick = async () => { const txt = report(); try { await navigator.clipboard.writeText(txt); toast('Debug report copied — paste it into the chat'); } catch { const ta = document.createElement('textarea'); ta.value = txt; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); toast('Debug report copied'); } };
+$('#dbgDl').onclick = () => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([report()], { type: 'text/plain' })); a.download = `ledger-debug-${today()}.txt`; a.click(); };
+if (/[?&]debug\b/.test(location.search)) toggleDebug(true);
 boot();
 </script>
 </body>
