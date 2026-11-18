@@ -934,10 +934,10 @@ function vAccounts(root) {
     <div class="sub">Bank of America has no API a web page can call, so syncing works by importing the statement export. Re-importing an overlapping date range is safe: duplicates are skipped and your tags are kept.</div>
     <ol class="small" style="margin:0 0 12px 18px;color:var(--text-secondary)">
       <li>Sign in at bankofamerica.com → open the account → <b>Download</b> (above the transaction list).</li>
-      <li>Choose a date range and file type <b>Microsoft Excel (.csv)</b> or <b>Quicken/Web Connect (.qfx)</b>. QFX includes bank transaction IDs and the ledger balance — the most reliable option.</li>
+      <li>Choose a date range and file type <b>QuickBooks Web Connect (.qbo)</b>, <b>Quicken Web Connect (.qfx)</b> or <b>Microsoft Excel (.csv)</b>. QBO/QFX include bank transaction IDs and the ledger balance — the most reliable option.</li>
       <li>Drop the file below, choose the account, review, and import.</li>
     </ol>
-    <div class="drop" id="impDrop">Drop a BofA .csv / .qfx / .ofx file here or <u>click to choose</u><input type="file" id="impFile" hidden accept=".csv,.qfx,.ofx,.txt"></div>
+    <div class="drop" id="impDrop">Drop a BofA .qbo / .qfx / .csv file here or <u>click to choose</u><input type="file" id="impFile" hidden accept=".csv,.qfx,.qbo,.ofx,.txt"></div>
     <div id="impPrev" style="margin-top:12px">${pi ? importPreviewHTML(pi) : ''}</div>
   </div>
   <div class="card"><h3>Auto-classification on import</h3><div class="sub">Transactions that look like card payments or transfers between your own accounts (e.g. "PAYMENT - THANK YOU", "Online Banking transfer to …") are marked <i>Internal transfer</i> so they don't count as income or spending. You can change any of them on the Transactions tab.</div></div>`;
@@ -1002,7 +1002,7 @@ async function readImport(file) {
     const guessType = r.type || (/posted date|payee|reference number/i.test(text.slice(0, 500)) ? 'credit' : 'checking');
     const m = file.name.match(/(\d{4})(?!.*\d{4})/); const last4 = r.last4 || '';
     const match = S.accounts.find(a => last4 && a.last4 === last4) || (S.accounts.length === 1 ? S.accounts[0] : null);
-    UI.pendingImport = { fileName: file.name, ...r, guessType, last4, acctId: match?.id || (S.accounts.length ? S.accounts[0].id : '__new'), format: isOFX ? 'QFX/OFX' : 'CSV' };
+    UI.pendingImport = { fileName: file.name, ...r, guessType, last4, acctId: match?.id || (S.accounts.length ? S.accounts[0].id : '__new'), format: isOFX ? ((file.name.match(/\.(qbo|qfx|ofx)$/i) || [, 'OFX'])[1].toUpperCase() + ' (Web Connect)') : 'CSV' };
     render();
   } catch (e) { toast('Import failed: ' + e.message, 6000); DBG.err('import parse failed', e); }
 }
