@@ -75,8 +75,10 @@ tr:hover td{background:color-mix(in srgb,var(--surface-2) 60%,transparent)}
 .muted{color:var(--text-muted)}.small{font-size:12px}
 .chip{display:inline-block;font-size:11.5px;padding:1px 7px;border-radius:99px;background:var(--surface-2);border:1px solid var(--border);color:var(--text-secondary);margin:1px 2px 1px 0}
 .cls{font-size:11.5px;padding:2px 7px;border-radius:99px;border:1px solid var(--border);white-space:nowrap}
-.cls.infusion{border-color:var(--series-3);color:var(--text-primary);background:color-mix(in srgb,var(--series-3) 14%,transparent)}
-.cls.withdrawal{border-color:var(--series-2);color:var(--text-primary);background:color-mix(in srgb,var(--series-2) 14%,transparent)}
+.cls.capital{border-color:var(--series-3);color:var(--text-primary);background:color-mix(in srgb,var(--series-3) 14%,transparent)}
+.cls.capital.neg{border-color:var(--series-2);background:color-mix(in srgb,var(--series-2) 14%,transparent)}
+.xfer{display:block;font-size:11.5px;margin-top:3px;color:var(--text-secondary);cursor:pointer;text-decoration:none}
+.xfer.need{color:var(--warn);font-weight:600}
 .cls.transfer{color:var(--text-muted)}
 .status{font-size:11.5px;font-weight:600}
 .status.good{color:var(--good)}.status.warn{color:var(--warn)}.status.crit{color:var(--crit)}
@@ -137,6 +139,9 @@ tr:hover td{background:color-mix(in srgb,var(--surface-2) 60%,transparent)}
 .splitR .pv{flex:1;display:flex;align-items:center;justify-content:center;background:var(--surface-2);overflow:auto}
 .splitR .pv iframe{width:100%;height:100%;border:0;background:#fff}
 .splitR .pv img{max-width:100%;max-height:100%;object-fit:contain}
+tr.pending td{background:color-mix(in srgb,var(--warn) 11%,transparent)}
+tr.pending td:first-child{box-shadow:inset 3px 0 0 var(--warn)}
+.pbadge{display:inline-block;min-width:18px;padding:0 6px;margin-left:4px;border-radius:99px;background:var(--warn);color:#fff;font-size:11px;font-weight:700;line-height:18px;text-align:center}
 @media (max-width:1000px){.split{grid-template-columns:1fr}.splitR{position:static;height:70vh}}
 @media (max-width:760px){.g2{grid-template-columns:1fr}.viewer{grid-template-columns:1fr;height:auto}.vlist{max-height:200px}.vframe{height:60vh}}
 </style>
@@ -152,9 +157,8 @@ tr:hover td{background:color-mix(in srgb,var(--surface-2) 60%,transparent)}
   <nav id="tabs">
     <button data-tab="overview" class="active">Overview</button>
     <button data-tab="txns">Transactions</button>
-    <button data-tab="docs">Quotes &amp; Invoices</button>
+    <button data-tab="docs">Documents<span id="pendBadge"></span></button>
     <button data-tab="files">File browser</button>
-    <button data-tab="pos">Purchase orders</button>
     <button data-tab="timeline">Timeline</button>
     <button data-tab="accounts">Accounts &amp; import</button>
     <button data-tab="settings">Settings</button>
@@ -257,9 +261,11 @@ function parseCSV(text) {
 }
 
 /* ---------------- constants ---------------- */
-const CLASSES = { '': 'Operating', infusion: 'Capital infusion', withdrawal: 'Capital withdrawal', transfer: 'Internal transfer' };
+const CLASSES = { '': 'Operating', capital: 'Capital (+ in / − out)', transfer: 'Internal transfer' };
+const LEGACY_CAPITAL = new Set(['infusion', 'withdrawal']);
+const capLabel = t => t.amount >= 0 ? 'Capital +' : 'Capital −';
 const DOC_TYPES = { quote: 'Quote', invoice: 'Invoice', receipt: 'Receipt', other: 'Other' };
-const DOC_STATUS = { quote: ['open','accepted','rejected','expired'], invoice: ['unpaid','paid','void'], receipt: ['filed'], other: ['filed'] };
+const DOC_STATUS = { quote: ['open','accepted','rejected','expired'], invoice: ['unpaid','paid','void'], receipt: ['unreconciled','reconciled'], other: ['filed'] };
 const PO_STATUS = ['draft','issued','partially received','received','closed','cancelled'];
 const COLS = ['accounts','txns','docs','pos','settings'];
 const DEFAULT_SETTINGS = { id:'main', company:'', address:'', email:'', phone:'', poPrefix:'PO', taxRate:0, burnMonths:3, largeTxn:5000, paymentTerms:'Net 30', currency:'USD' };
@@ -337,11 +343,14 @@ async function makeLocal() {
 /* ---------------- state ---------------- */
 let store = null;
 const S = { accounts: [], txns: [], docs: [], pos: [], settings: {...DEFAULT_SETTINGS} };
-const UI = { tab: location.hash.slice(1) || 'overview', range: LS.get('ledger.range', '12m'), tx: { acct:'', cls:'all', q:'', tag:'', from:'', to:'', link:'' }, sel: new Set(), docF: { type:'', status:'', q:'', tag:'' }, viewIdx: 0, pendingImport: null };
+const UI = { tab: location.hash.slice(1) || 'overview', range: LS.get('ledger.range', '12m'), tx: { acct:'', cls:'all', q:'', tag:'', from:'', to:'', link:'' }, sel: new Set(), docF: { type:'', status:'', q:'', tag:'' }, skipped: new Set(), viewIdx: 0, pendingImport: null };
 let docsByTxn = {};
 const charts = {};
 
 function derive() {
+  { const n = S.docs.filter(d => d.needsReview).length + S.pos.filter(p => p.needsReview).length; const b = document.getElementById('pendBadge'); if (b) b.innerHTML = n ? `<span class="pbadge" title="${n} uploaded file(s) need details">${n}</span>` : ''; }
+  S.docs.forEach(d => { if (d.type === 'receipt' && (!d.status || d.status === 'filed')) d.status = (d.linkedTxnIds || []).length ? 'reconciled' : 'unreconciled'; });
+  S.txns.forEach(t => { if (LEGACY_CAPITAL.has(t.cls)) t.cls = 'capital'; });
   S.txns.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : (a.seq || 0) - (b.seq || 0));
   docsByTxn = {};
   S.docs.forEach(d => (d.linkedTxnIds || []).forEach(t => (docsByTxn[t] ??= []).push(linkItem('doc', d))));
@@ -381,7 +390,7 @@ function monthly(from) {
   for (const t of S.txns) {
     if (t.date < from || t.cls === 'transfer') continue;
     const k = monthKey(t.date); const r = (m[k] ??= { inflow: 0, outflow: 0, capital: 0 });
-    if (t.cls === 'infusion' || t.cls === 'withdrawal') r.capital += t.amount;
+    if (t.cls === 'capital') r.capital += t.amount;
     else if (t.amount >= 0) r.inflow += t.amount; else r.outflow += -t.amount;
   }
   const keys = []; let k = monthKey(from); const end = monthKey(today());
@@ -465,11 +474,11 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#modal
 /* ---------------- tabs ---------------- */
 $('#tabs').addEventListener('click', e => { const b = e.target.closest('button[data-tab]'); if (b) go(b.dataset.tab); });
 window.addEventListener('hashchange', () => { const t = location.hash.slice(1); if (t && t !== UI.tab) go(t); });
-function go(tab) { UI.tab = tab; if (location.hash.slice(1) !== tab) location.hash = tab; $$('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab)); render(); }
+function go(tab) { if (tab === 'pos') { UI.docF.type = 'po'; tab = 'docs'; } UI.tab = tab; if (location.hash.slice(1) !== tab) location.hash = tab; $$('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab)); render(); }
 function render() {
   Object.values(charts).forEach(c => c.destroy()); for (const k in charts) delete charts[k];
   derive();
-  const v = { overview: vOverview, txns: vTxns, docs: vDocs, files: vFiles, pos: vPOs, timeline: vTimeline, accounts: vAccounts, settings: vSettings }[UI.tab] || vOverview;
+  const v = { overview: vOverview, txns: vTxns, docs: vDocs, files: vFiles, timeline: vTimeline, accounts: vAccounts, settings: vSettings }[UI.tab] || vOverview;
   v($('#main'));
 }
 function banner() {
@@ -500,8 +509,8 @@ function vOverview(root) {
   const from = rangeStart();
   const cash = S.accounts.filter(isCash).reduce((s, a) => s + a._balance, 0);
   const credit = S.accounts.filter(a => a.type === 'credit').reduce((s, a) => s + a._balance, 0);
-  const inf = S.txns.filter(t => t.cls === 'infusion').reduce((s, t) => s + t.amount, 0);
-  const wd = S.txns.filter(t => t.cls === 'withdrawal').reduce((s, t) => s + t.amount, 0);
+  const inf = S.txns.filter(t => t.cls === 'capital' && t.amount > 0).reduce((s, t) => s + t.amount, 0);
+  const wd = S.txns.filter(t => t.cls === 'capital' && t.amount < 0).reduce((s, t) => s + t.amount, 0);
   const b = burn(); const runway = b.burn > 0 ? cash / b.burn : null;
   const openQ = S.docs.filter(d => d.type === 'quote' && d.status === 'open');
   const unpaid = S.docs.filter(d => d.type === 'invoice' && d.status === 'unpaid');
@@ -525,7 +534,7 @@ function vOverview(root) {
     ${kpi('Open POs', money(openPO.reduce((s, p) => s + poTotals(p).total, 0)), `${openPO.length} issued / partial`)}
   </div>
   <div class="card"><h3>Cash trajectory</h3><div class="sub">Total balance across deposit accounts, with capital events marked and a ${b.burn > 0 ? '6-month projection at the current burn rate' : 'flat projection (no burn)'}.</div>
-    ${legendHTML([[cssVar('--series-1'), 'Cash balance'], [cssVar('--series-1'), 'Projection', true], [cssVar('--series-3'), 'Capital infusion'], [cssVar('--series-2'), 'Capital withdrawal']])}
+    ${legendHTML([[cssVar('--series-1'), 'Cash balance'], [cssVar('--series-1'), 'Projection', true], [cssVar('--series-3'), 'Capital + (in)'], [cssVar('--series-2'), 'Capital − (out)']])}
     <div class="chartbox tall"><canvas id="cCash"></canvas></div></div>
   <div class="grid g2">
     <div class="card"><h3>Monthly cash flow</h3><div class="sub">Operating inflow and outflow, plus net capital movement. Internal transfers excluded.</div>
@@ -534,16 +543,16 @@ function vOverview(root) {
     <div class="card"><h3>Spending by category</h3><div class="sub">Operating outflow in range, by category (or first tag). Top 8.</div><div class="chartbox"><canvas id="cCat"></canvas></div></div>
   </div>
   <div class="grid g2">
-    <div class="card"><h3>Capital events</h3><div class="sub">Transactions tagged as capital infusion or withdrawal.</div>${capTable()}</div>
+    <div class="card"><h3>Capital events</h3><div class="sub">Transactions typed as Capital: + money put in, − money taken out.</div>${capTable()}</div>
     <div class="card"><h3>Needs attention</h3><div class="sub">Overdue invoices, invoices without a payment link, untagged large transactions.</div>${attention()}</div>
   </div>`;
   bindRange(root);
   drawCash(from, b); drawMonthly(from); drawCats(from);
 }
 function capTable() {
-  const rows = S.txns.filter(t => t.cls === 'infusion' || t.cls === 'withdrawal').slice().reverse();
-  if (!rows.length) return `<div class="muted small">None yet. Mark transactions as capital infusion or withdrawal on the Transactions tab.</div>`;
-  return `<div class="tw" style="max-height:300px"><table><thead><tr><th>Date</th><th>Description</th><th>Type</th><th class="r">Amount</th></tr></thead><tbody>${rows.map(t => `<tr><td>${fmtDate(t.date)}</td><td>${esc(t.description)}</td><td><span class="cls ${t.cls}">${CLASSES[t.cls]}</span></td><td class="r">${money(t.amount)}</td></tr>`).join('')}</tbody></table></div>`;
+  const rows = S.txns.filter(t => t.cls === 'capital').slice().reverse();
+  if (!rows.length) return `<div class="muted small">None yet. Set a transaction's type to Capital on the Transactions tab.</div>`;
+  return `<div class="tw" style="max-height:300px"><table><thead><tr><th>Date</th><th>Description</th><th>Type</th><th class="r">Amount</th></tr></thead><tbody>${rows.map(t => `<tr><td>${fmtDate(t.date)}</td><td>${esc(t.description)}</td><td><span class="cls capital ${t.amount < 0 ? 'neg' : ''}">${capLabel(t)}</span></td><td class="r">${money(t.amount)}</td></tr>`).join('')}</tbody></table></div>`;
 }
 function attention() {
   const out = [];
@@ -551,6 +560,12 @@ function attention() {
   S.docs.filter(d => d.type === 'invoice' && d.status === 'paid' && !(d.linkedTxnIds || []).length).forEach(d => out.push(`<span class="status warn">● Unlinked</span> paid invoice ${esc(d.number || '')} · ${esc(d.vendor)} · ${money(d.amount)}`));
   const lg = +S.settings.largeTxn || 5000;
   S.txns.filter(t => Math.abs(t.amount) >= lg && !t.cls && !(t.tags || []).length && !t.category && !docsByTxn[t.id]).slice(-15).reverse().forEach(t => out.push(`<span class="status warn">● Untagged</span> ${fmtDate(t.date)} · ${esc(t.description)} · ${money(t.amount)}`));
+  const pn = pendingList().length;
+  if (pn) out.unshift(`<span class="status warn">⚑ To review</span> ${pn} uploaded file${pn > 1 ? 's need' : ' needs'} details — <a href="#docs">Documents</a>`);
+  const ur = S.docs.filter(d => d.type === 'receipt' && d.status !== 'reconciled' && !d.needsReview);
+  if (ur.length) out.push(`<span class="status warn">● Receipts</span> ${ur.length} receipt${ur.length > 1 ? 's are' : ' is'} not linked to a bank/card transaction`);
+  const unp = S.txns.filter(t => t.cls === 'transfer' && !t.transferPairId && t.transferAcct !== '');
+  if (unp.length) out.push(`<span class="status warn">● Transfers</span> ${unp.length} internal transfer${unp.length > 1 ? 's have' : ' has'} no balancing account yet — filter Transactions by "Internal transfer" and click "⇄ choose other account…"`);
   if (!out.length) return `<div class="muted small"><span class="status good">✓</span> Nothing needs attention.</div>`;
   return `<div class="feed" style="max-height:300px">${out.map(o => `<div class="ev">${o}</div>`).join('')}</div>`;
 }
@@ -563,12 +578,11 @@ function drawCash(from, b) {
   const s1 = cssVar('--series-1'), surf = cssVar('--surface-1');
   const o = baseOpts();
   o.scales.x = { ...o.scales.x, type: 'linear', min: ts(from), max: ts(addMonths(t, 6)), ticks: { ...o.scales.x.ticks, ...timeTicks } };
-  o.plugins.tooltip.callbacks = { title: it => fromTs(it[0].parsed.x) && fmtDate(fromTs(it[0].parsed.x)), label: it => { const r = it.raw; return r.t ? `${CLASSES[r.t.cls]}: ${money(r.t.amount)} — ${r.t.description}` : `${it.dataset.label}: ${money(it.parsed.y)}`; } };
+  o.plugins.tooltip.callbacks = { title: it => fromTs(it[0].parsed.x) && fmtDate(fromTs(it[0].parsed.x)), label: it => { const r = it.raw; return r.t ? `${capLabel(r.t)}: ${money(r.t.amount)} — ${r.t.description}` : `${it.dataset.label}: ${money(it.parsed.y)}`; } };
   charts.cash = new Chart($('#cCash'), { type: 'line', options: o, data: { datasets: [
     { label: 'Cash balance', data: pts, stepped: 'before', borderColor: s1, borderWidth: 2, pointRadius: 0, pointHitRadius: 6, fill: { target: 'origin', above: s1 + '14' } },
     { label: 'Projection', data: proj, borderColor: s1, borderDash: [5, 4], borderWidth: 2, pointRadius: 0, pointHitRadius: 6 },
-    { label: 'Capital infusion', type: 'scatter', data: ev('infusion'), backgroundColor: cssVar('--series-3'), borderColor: surf, borderWidth: 2, pointRadius: 6, pointHoverRadius: 8 },
-    { label: 'Capital withdrawal', type: 'scatter', data: ev('withdrawal'), backgroundColor: cssVar('--series-2'), borderColor: surf, borderWidth: 2, pointRadius: 6, pointHoverRadius: 8, pointStyle: 'rectRot' }
+    { label: 'Capital', type: 'scatter', data: ev('capital'), backgroundColor: c => c.raw?.t?.amount < 0 ? cssVar('--series-2') : cssVar('--series-3'), pointStyle: c => c.raw?.t?.amount < 0 ? 'rectRot' : 'circle', borderColor: surf, borderWidth: 2, pointRadius: 6, pointHoverRadius: 8 }
   ] } });
 }
 function drawMonthly(from) {
@@ -628,6 +642,7 @@ async function setLink(item, txnId, on) {
   r.linkedTxnIds = [...cur];
   let note = '';
   if (on && r.type === 'invoice' && r.status === 'unpaid') { r.status = 'paid'; note = ' · invoice marked paid'; }
+  if (r.type === 'receipt') { const was = r.status; r.status = r.linkedTxnIds.length ? 'reconciled' : 'unreconciled'; if (was !== r.status) note = ' · receipt ' + r.status; }
   await persist(item.kind === 'po' ? 'pos' : 'docs', r);
   derive(); return note;
 }
@@ -660,7 +675,7 @@ function linkPicker(t, onDone) {
       <input type="checkbox" ${x.on ? 'checked' : ''}>
       ${x.score >= 90 && !x.on ? '<span class="sugg">BEST MATCH</span>' : x.score >= 50 && !x.on ? '<span class="sugg">MATCH</span>' : ''}
       <span><b>${x.c.short}</b> ${esc(x.c.number)} · ${esc(x.c.vendor)} <span class="muted small">${fmtDate(x.c.date)}${x.c.status ? ' · ' + esc(x.c.status) : ''}${x.c.file ? ' · 📎' : ''}${x.score >= 50 ? ' · ' + x.why.join(', ') : ''}${x.c.linked.length && !x.on ? ` · already linked to ${x.c.linked.length} txn` : ''}</span></span>
-      <span class="amt">${money(x.c.amount)}</span></label>`).join('') : '<div class="muted small" style="padding:10px">Nothing matches. Upload quotes/invoices on the Quotes &amp; Invoices tab, or POs on the Purchase orders tab.</div>';
+      <span class="amt">${money(x.c.amount)}</span></label>`).join('') : '<div class="muted small" style="padding:10px">Nothing matches. Upload quotes, invoices, receipts or POs on the Documents tab.</div>';
   };
   draw();
   $('#lkType', body).onclick = e => { const b = e.target.closest('button'); if (!b) return; st.type = b.dataset.v; $$('#lkType button', body).forEach(x => x.classList.toggle('on', x === b)); draw(); };
@@ -700,6 +715,99 @@ function autoLinkReview() {
   });
 }
 
+/* ======================= INTERNAL TRANSFERS ======================= */
+const acctName = id => acctById(id)?.name || 'unknown account';
+/* Remove t's pairing; auto-created balancing entries are deleted, real ones are just unpaired. */
+async function clearTransferPair(t) {
+  const pid = t.transferPairId; if (!pid) return;
+  const other = S.txns.find(x => x.id === pid);
+  t.transferPairId = '';
+  if (other) {
+    if (other.autoTransfer) { await store.del('txns', other.id); S.txns = S.txns.filter(x => x.id !== other.id); DBG.info('transfer: removed balancing entry ' + other.id); }
+    else { other.transferPairId = ''; await persist('txns', other); }
+  }
+}
+/* Ask which account the money went to / came from; pair with an existing opposite entry or create a balancing one. */
+function transferDialog(t, onDone) {
+  const others = S.accounts.filter(a => a.id !== t.accountId);
+  const cur = t.transferPairId ? S.txns.find(x => x.id === t.transferPairId) : null;
+  const dir = t.amount < 0 ? 'to' : 'from';
+  const body = modal('Internal transfer', `
+    <div class="banner"><b>${esc(t.description)}</b><br><span class="small">${fmtDate(t.date)} · ${esc(acctName(t.accountId))} · <b>${money(t.amount)}</b></span></div>
+    <div class="form" style="margin-top:12px">
+      <label class="full">Money moved ${dir} which account?
+        <select id="xAcct">${others.map(a => `<option value="${a.id}" ${(cur?.accountId || t.transferAcct) === a.id ? 'selected' : ''}>${esc(a.name)}${a.last4 ? ' ··' + esc(a.last4) : ''} (${esc(a.type)})</option>`).join('')}<option value="">Not tracked in Ledger — no balancing entry</option></select></label>
+      <div class="full" id="xOpts"></div>
+    </div>
+    ${!others.length ? '<div class="small muted">Tip: add the other account on Accounts &amp; import to keep both sides balanced.</div>' : ''}
+    <div class="mfoot"><button class="b" data-close id="xCancel">Cancel</button><button class="b pri" id="xGo">Save transfer</button></div>`);
+  const draw = () => {
+    const aid = $('#xAcct', body).value;
+    if (!aid) { $('#xOpts', body).innerHTML = '<div class="small muted">The transaction is marked as an internal transfer (excluded from income/spending) with no entry in another account.</div>'; return; }
+    const cands = S.txns.filter(x => x.accountId === aid && x.id !== t.id && Math.abs(x.amount + t.amount) < 0.01 && Math.abs(ts(x.date) - ts(t.date)) <= 10 * 864e5 && (!x.transferPairId || x.transferPairId === t.id))
+      .sort((a, b) => Math.abs(ts(a.date) - ts(t.date)) - Math.abs(ts(b.date) - ts(t.date)));
+    const pre = cands.find(x => x.id === t.transferPairId) || cands.find(x => !x.autoTransfer) || null;
+    $('#xOpts', body).innerHTML = `<div class="small" style="color:var(--text-secondary);margin-bottom:6px">Balancing entry in <b>${esc(acctName(aid))}</b> (${money(-t.amount)}):</div>
+      <div class="linklist">${cands.map(x => `<label><input type="radio" name="xPick" value="${x.id}" ${pre?.id === x.id ? 'checked' : ''}> ${x.autoTransfer ? '<span class="chip">auto-created</span>' : '<span class="sugg">EXISTING</span>'} ${fmtDate(x.date)} · ${esc(x.description)}<span class="amt">${money(x.amount)}</span></label>`).join('')}
+      <label><input type="radio" name="xPick" value="__new" ${pre ? '' : 'checked'}> <b>Create</b> a balancing entry on ${fmtDate(t.date)}<span class="amt">${money(-t.amount)}</span></label></div>
+      <div class="small muted" style="margin-top:6px">If you later import a statement for that account, Ledger swaps an auto-created entry for the real one.</div>`;
+  };
+  if (others.length) draw(); else $('#xAcct', body).value = '';
+  draw();
+  $('#xAcct', body).onchange = draw;
+  $('#xCancel', body).onclick = () => { closeModal(); onDone?.(false); };
+  $('#xGo', body).onclick = async () => {
+    const btn = $('#xGo', body); btn.disabled = true;
+    try {
+      const aid = $('#xAcct', body).value; const pick = $('input[name=xPick]:checked', body)?.value;
+      const keep = pick && pick !== '__new' && pick === t.transferPairId;
+      if (!keep) await clearTransferPair(t);
+      t.cls = 'transfer'; t.transferAcct = aid;
+      const changed = [t];
+      if (aid && pick === '__new') {
+        const nb = { id: 'xfer_' + uid(), accountId: aid, date: t.date, amount: +(-t.amount).toFixed(2), description: `Transfer ${t.amount < 0 ? 'from' : 'to'} ${acctName(t.accountId)} — ${t.description}`, cls: 'transfer', transferAcct: t.accountId, transferPairId: t.id, manual: true, autoTransfer: true, tags: [], category: '', createdAt: new Date().toISOString() };
+        t.transferPairId = nb.id; changed.push(nb);
+      } else if (aid && pick) {
+        const o = S.txns.find(x => x.id === pick); if (o.transferPairId && o.transferPairId !== t.id) { const prev = S.txns.find(x => x.id === o.transferPairId); if (prev) { prev.transferPairId = ''; changed.push(prev); } }
+        Object.assign(o, { cls: 'transfer', transferPairId: t.id, transferAcct: t.accountId }); t.transferPairId = o.id; changed.push(o);
+      }
+      await persistMany('txns', changed);
+      closeModal(); toast(aid ? `Transfer balanced against ${acctName(aid)}` : 'Marked as internal transfer'); onDone?.(true); render();
+    } catch (e) { btn.disabled = false; DBG.err('transfer save failed', e); toast('Save failed: ' + (e.code || e.message), 6000); }
+  };
+}
+/* Change a transaction's type, handling the transfer dialog / unpairing. */
+async function changeType(t, cls) {
+  if (cls === 'transfer') { transferDialog(t, ok => { if (!ok) render(); }); return; }
+  if (t.cls === 'transfer') await clearTransferPair(t);
+  t.cls = cls; t.transferAcct = ''; await persist('txns', t); toast('Saved'); render();
+}
+function transferBadge(t) {
+  if (t.cls !== 'transfer') return '';
+  const o = t.transferPairId && S.txns.find(x => x.id === t.transferPairId);
+  if (o) return `<a href="#" class="xfer" title="Balanced by: ${esc(o.description)} (${money(o.amount)})">⇄ ${esc(acctName(o.accountId))}${o.autoTransfer ? ' (auto)' : ''}</a>`;
+  if (t.transferAcct === '' && t.transferPairId === '') return `<a href="#" class="xfer" title="Other account not tracked">⇄ untracked account</a>`;
+  return `<a href="#" class="xfer need">⇄ choose other account…</a>`;
+}
+/* On import: replace auto-created balancing entries with the real ones, and auto-pair obvious transfers. */
+function reconcileTransfers(fresh, acctId) {
+  const del = [], upd = [];
+  for (const f of fresh) {
+    const ph = S.txns.find(x => x.autoTransfer && x.accountId === acctId && !del.includes(x) && Math.abs(x.amount - f.amount) < 0.01 && Math.abs(ts(x.date) - ts(f.date)) <= 7 * 864e5);
+    if (ph) {
+      const origin = S.txns.find(x => x.id === ph.transferPairId);
+      Object.assign(f, { cls: 'transfer', transferPairId: origin?.id || '', transferAcct: origin?.accountId || '' });
+      if (origin) { origin.transferPairId = f.id; upd.push(origin); }
+      del.push(ph); continue;
+    }
+    if (f.cls === 'transfer') {
+      const o = S.txns.find(x => x.accountId !== acctId && !x.transferPairId && x.cls === 'transfer' && Math.abs(x.amount + f.amount) < 0.01 && Math.abs(ts(x.date) - ts(f.date)) <= 7 * 864e5 && !upd.includes(x));
+      if (o) { f.transferPairId = o.id; f.transferAcct = o.accountId; Object.assign(o, { transferPairId: f.id, transferAcct: acctId }); upd.push(o); }
+    }
+  }
+  return { del, upd };
+}
+
 /* ======================= TRANSACTIONS ======================= */
 function filteredTxns() {
   const f = UI.tx, q = f.q.toLowerCase();
@@ -713,7 +821,7 @@ function vTxns(root) {
   <div class="card">
     <div class="toolbar">
       <select id="fAcct"><option value="">All accounts</option>${S.accounts.map(a => `<option value="${a.id}" ${f.acct === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select>
-      <select id="fCls">${[['all','All types'],['','Operating'],['infusion','Capital infusion'],['withdrawal','Capital withdrawal'],['transfer','Internal transfer'],['untagged','Untagged']].map(([v, l]) => `<option value="${v}" ${f.cls === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+      <select id="fCls">${[['all','All types'],['','Operating'],['capital','Capital (±)'],['transfer','Internal transfer'],['untagged','Untagged']].map(([v, l]) => `<option value="${v}" ${f.cls === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
       <select id="fTag"><option value="">Any tag</option>${allTags().map(t => `<option ${f.tag === t ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>
       <select id="fLink">${[['', 'Linked or not'], ['linked', 'Linked to docs'], ['unlinked', 'Not linked'], ['suggested', 'Has suggested match']].map(([v, l]) => `<option value="${v}" ${f.link === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
       <input type="date" id="fFrom" value="${f.from}" title="From"><input type="date" id="fTo" value="${f.to}" title="To">
@@ -736,7 +844,7 @@ function vTxns(root) {
       <td class="small muted">${esc(acctById(t.accountId)?.name || '?')}</td>
       <td>${esc(t.description)}${t.notes ? `<div class="small muted">${esc(t.notes)}</div>` : ''}</td>
       <td class="r" style="white-space:nowrap">${money(t.amount)}</td>
-      <td><select class="clsSel" style="padding:2px 4px;font-size:12px">${Object.entries(CLASSES).map(([v, l]) => `<option value="${v}" ${(t.cls || '') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></td>
+      <td><select class="clsSel" style="padding:2px 4px;font-size:12px">${Object.entries(CLASSES).map(([v, l]) => `<option value="${v}" ${(t.cls || '') === v ? 'selected' : ''}>${v === 'capital' ? (t.cls === 'capital' ? capLabel(t) : 'Capital') : l}</option>`).join('')}</select>${transferBadge(t)}</td>
       <td>${t.category ? `<span class="chip" style="font-weight:600">${esc(t.category)}</span>` : ''}${(t.tags || []).map(g => `<span class="chip">${esc(g)}</span>`).join('')}</td>
       <td class="small" style="min-width:150px">${linkChips(t)}${sg.length ? `<button class="b sm linkTx" style="border-color:var(--accent);color:var(--accent);font-weight:600" title="${esc(sg.slice(0, 3).map(x => x.c.typeLabel + ' ' + x.c.number + ' · ' + x.c.vendor + ' (' + x.why.join(', ') + ')').join('\n'))}">🔗 ${sg.length} match${sg.length > 1 ? 'es' : ''}</button>` : `<button class="b sm linkTx" title="Link to quotes, invoices or POs">🔗${ds.length ? '' : ' Link'}</button>`}</td>
       <td><button class="b sm editTx">Edit</button></td></tr>`; }).join(''); })()}
@@ -757,15 +865,21 @@ function vTxns(root) {
   root.querySelector('tbody').addEventListener('change', async e => {
     const tr = e.target.closest('tr'); const t = S.txns.find(x => x.id === tr?.dataset.id); if (!t) return;
     if (e.target.classList.contains('sel')) { e.target.checked ? UI.sel.add(t.id) : UI.sel.delete(t.id); $('#bulk').style.display = UI.sel.size ? '' : 'none'; $('#bulk b').textContent = UI.sel.size + ' selected'; }
-    if (e.target.classList.contains('clsSel')) { t.cls = e.target.value; await persist('txns', t); toast('Saved'); }
+    if (e.target.classList.contains('clsSel')) await changeType(t, e.target.value);
   });
   root.querySelector('tbody').addEventListener('click', e => {
     const tr = e.target.closest('tr'); if (e.target.classList.contains('editTx')) editTxn(S.txns.find(x => x.id === tr.dataset.id));
     if (e.target.closest('.linkTx')) linkPicker(S.txns.find(x => x.id === tr.dataset.id));
+    if (e.target.closest('.xfer')) { e.preventDefault(); transferDialog(S.txns.find(x => x.id === tr.dataset.id)); }
     const ol = e.target.closest('.openLink'); if (ol) { e.preventDefault(); const it = linkCandidates().find(c => c.id === ol.dataset.id); if (it?.file) openDocViewer(it.id); else if (it) it.kind === 'po' ? editPO(it.rec) : editDoc(it.rec); }
   });
   const bulk = async fn => { const list = S.txns.filter(t => UI.sel.has(t.id)); list.forEach(fn); await persistMany('txns', list); toast(`Updated ${list.length}`); rf(); };
-  $('#bClsGo').onclick = () => bulk(t => t.cls = $('#bCls').value);
+  $('#bClsGo').onclick = async () => {
+    const v = $('#bCls').value; const list = S.txns.filter(t => UI.sel.has(t.id));
+    for (const t of list) if (t.cls === 'transfer' && v !== 'transfer') await clearTransferPair(t);
+    await bulk(t => { t.cls = v; if (v !== 'transfer') t.transferAcct = ''; });
+    if (v === 'transfer') toast(`Marked ${list.length} as transfers — use "⇄ choose other account…" on each row to add the balancing side`, 5000);
+  };
   $('#bTagGo').onclick = () => { const g = $('#bTag').value.trim(); if (g) bulk(t => t.tags = [...new Set([...(t.tags || []), g])]); };
   $('#bCatGo').onclick = () => bulk(t => t.category = $('#bCat').value.trim());
   $('#bClear').onclick = () => { UI.sel.clear(); rf(); };
@@ -779,7 +893,7 @@ function editTxn(t) {
       <label>Date<input type="date" id="tDate" value="${t.date}" ${t.manual ? '' : 'disabled'}></label>
       <label>Account<select id="tAcct" ${t.manual ? '' : 'disabled'}>${S.accounts.map(a => `<option value="${a.id}" ${a.id === t.accountId ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select></label>
       <label>Amount (− = money out)<input type="number" step="0.01" id="tAmt" value="${t.amount}" ${t.manual ? '' : 'disabled'}></label>
-      <label>Type<select id="tCls">${Object.entries(CLASSES).map(([v, l]) => `<option value="${v}" ${(t.cls || '') === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+      <label>Type<select id="tCls">${Object.entries(CLASSES).map(([v, l]) => `<option value="${v}" ${(t.cls || '') === v ? 'selected' : ''}>${l}</option>`).join('')}</select>${t.cls === 'transfer' ? transferBadge(t).replace('class="xfer', 'id="tXfer" class="xfer') : ''}</label>
       <label class="full">Description<input id="tDesc" value="${esc(t.description)}" ${t.manual ? '' : 'disabled'}></label>
       <label>Category<input id="tCat" value="${esc(t.category || '')}" list="catList" placeholder="e.g. Lab supplies"></label>
       <label>Tags (comma-separated)<input id="tTags" value="${esc((t.tags || []).join(', '))}"></label>
@@ -788,11 +902,15 @@ function editTxn(t) {
     </div>
     <datalist id="catList">${[...new Set(S.txns.map(x => x.category).filter(Boolean))].map(c => `<option value="${esc(c)}">`).join('')}</datalist>
     <div class="mfoot">${!isNew && t.manual ? '<button class="b danger" id="tDel">Delete</button>' : ''}<span style="flex:1"></span><button class="b" data-close>Cancel</button><button class="b pri" id="tSave">Save</button></div>`);
-  $('#tDel', body)?.addEventListener('click', async () => { if (!confirm('Delete this manual transaction?')) return; await store.del('txns', t.id); S.txns = S.txns.filter(x => x.id !== t.id); closeModal(); render(); });
+  $('#tXfer', body)?.addEventListener('click', e => { e.preventDefault(); transferDialog(S.txns.find(x => x.id === t.id)); });
+  $('#tDel', body)?.addEventListener('click', async () => { if (!confirm('Delete this manual transaction?')) return; { const o = t.transferPairId && S.txns.find(x => x.id === t.transferPairId); if (o) { o.transferPairId = ''; await persist('txns', o); } } await store.del('txns', t.id); S.txns = S.txns.filter(x => x.id !== t.id); closeModal(); render(); });
   $('#tSave', body).onclick = async () => {
-    Object.assign(t, { cls: $('#tCls', body).value, category: $('#tCat', body).value.trim(), tags: parseTags($('#tTags', body).value), notes: $('#tNotes', body).value.trim() });
+    const newCls = $('#tCls', body).value; const wasCls = (S.txns.find(x => x.id === t.id) || {}).cls || '';
+    if (wasCls === 'transfer' && newCls !== 'transfer') { const live = S.txns.find(x => x.id === t.id); await clearTransferPair(live); t.transferPairId = ''; t.transferAcct = ''; }
+    Object.assign(t, { cls: newCls, category: $('#tCat', body).value.trim(), tags: parseTags($('#tTags', body).value), notes: $('#tNotes', body).value.trim() });
     if (t.manual) Object.assign(t, { date: $('#tDate', body).value, accountId: $('#tAcct', body).value, amount: +$('#tAmt', body).value || 0, description: $('#tDesc', body).value.trim() });
     await persist('txns', t);
+    if (newCls === 'transfer' && wasCls !== 'transfer') { transferDialog(S.txns.find(x => x.id === t.id)); return; }
     closeModal(); toast('Saved'); render();
   };
   $('#tLinks', body)?.addEventListener('click', () => linkPicker(S.txns.find(x => x.id === t.id) || t, () => editTxn(S.txns.find(x => x.id === t.id))));
@@ -809,58 +927,152 @@ async function persistMany(n, list) {
 /* ======================= DOCUMENTS ======================= */
 function filteredDocs() {
   const f = UI.docF, q = f.q.toLowerCase();
-  return S.docs.filter(d => (!f.type || d.type === f.type) && (!f.status || d.status === f.status) && (!f.tag || (d.tags || []).includes(f.tag)) && (!q || [d.vendor, d.number, d.description, d.fileName, d.amount, (d.tags || []).join(' ')].join(' ').toLowerCase().includes(q))).sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+  return S.docs.filter(d => (!f.type || d.type === f.type) && (!f.status || (f.status === 'needs review' ? d.needsReview : d.status === f.status)) && (!f.tag || (d.tags || []).includes(f.tag)) && (!q || [d.vendor, d.number, d.description, d.fileName, d.amount, (d.tags || []).join(' ')].join(' ').toLowerCase().includes(q))).sort((a, b) => (b.date || '').localeCompare(a.date || ''));
 }
-function statusCls(s) { return { paid: 'good', accepted: 'good', received: 'good', closed: 'good', unpaid: 'warn', open: 'warn', issued: 'warn', 'partially received': 'warn', rejected: 'crit', void: 'crit', expired: 'crit', cancelled: 'crit' }[s] || ''; }
-function statusHTML(d) { const od = d.type === 'invoice' && d.status === 'unpaid' && d.dueDate && d.dueDate < today(); return `<span class="status ${od ? 'crit' : statusCls(d.status)}">${od ? '⚠ overdue' : esc(d.status || '')}</span>`; }
+function statusCls(s) { return { reconciled: 'good', unreconciled: 'warn', paid: 'good', accepted: 'good', received: 'good', closed: 'good', unpaid: 'warn', open: 'warn', issued: 'warn', 'partially received': 'warn', rejected: 'crit', void: 'crit', expired: 'crit', cancelled: 'crit' }[s] || ''; }
+function statusHTML(d) { if (d.needsReview) return '<span class="status warn">⚑ needs review</span>'; const od = d.type === 'invoice' && d.status === 'unpaid' && d.dueDate && d.dueDate < today(); return `<span class="status ${od ? 'crit' : statusCls(d.status)}">${od ? '⚠ overdue' : esc(d.status || '')}</span>`; }
+function filteredAll() {
+  const f = UI.docF, q = f.q.toLowerCase();
+  const docs = f.type === 'po' ? [] : filteredDocs().map(d => ({ kind: 'doc', rec: d, type: d.type, date: d.date || '', amount: +d.amount || 0 }));
+  const pos = f.type && f.type !== 'po' ? [] : S.pos.filter(p => (!f.status || (f.status === 'needs review' ? p.needsReview : p.status === f.status)) && (!f.tag || (p.tags || []).includes(f.tag)) && (!q || [p.vendor, p.number, p.notes, p.quoteRef, p.fileName, poTotals(p).total, (p.tags || []).join(' ')].join(' ').toLowerCase().includes(q)))
+    .map(p => ({ kind: 'po', rec: p, type: 'po', date: p.date || '', amount: poTotals(p).total }));
+  return [...docs, ...pos].sort((a, b) => (!!b.rec.needsReview - !!a.rec.needsReview) || b.date.localeCompare(a.date));
+}
 function vDocs(root) {
-  const f = UI.docF; const rows = filteredDocs();
+  const f = UI.docF; const rows = filteredAll();
+  const cnt = t => S.docs.filter(d => d.type === t);
+  const sum = [
+    ['quote', 'Quotes', cnt('quote').length, `${cnt('quote').filter(d => d.status === 'open').length} open`],
+    ['invoice', 'Invoices', cnt('invoice').length, `${cnt('invoice').filter(d => d.status === 'unpaid').length} unpaid`],
+    ['receipt', 'Receipts', cnt('receipt').length, `${cnt('receipt').filter(d => d.status !== 'reconciled').length} unreconciled`],
+    ['po', 'POs', S.pos.length, `${S.pos.filter(p => ['issued', 'partially received'].includes(p.status)).length} open`]];
+  const quotes = S.docs.filter(d => d.type === 'quote' && ['open', 'accepted'].includes(d.status));
+  const allStatus = ['needs review', ...new Set([...Object.values(DOC_STATUS).flat(), ...PO_STATUS])];
+  const pend = pendingList();
   root.innerHTML = `${banner()}
-  <div class="card"><h3>Upload quotes &amp; invoices</h3><div class="sub">PDF, images, Word/Excel — files go to ${store.kind === 'firebase' ? 'Firebase Storage' : 'this browser'}; details (tags, description, amounts, links) go to ${store.kind === 'firebase' ? 'Firestore' : 'local storage'}.</div>
-    <div class="drop" id="drop">Drop files here or <u>click to choose</u><input type="file" id="fileIn" multiple hidden accept=".pdf,image/*,.doc,.docx,.xls,.xlsx,.csv,.txt,.eml,.msg"></div>
-    <div style="margin-top:10px"><button class="b sm" id="noFile">+ Add a quote / invoice without a file</button></div>
+  <div class="card"><h3>Upload documents</h3><div class="sub">Drop any mix of quotes, invoices, receipts and purchase orders — PDF, images, Word/Excel. Files are saved right away and marked <b>needs review</b>; then each opens with a preview so you can confirm its type and fill in details. Stop whenever you like — the rest stay highlighted. Files go to ${store.kind === 'firebase' ? 'Firebase Storage' : 'this browser'}.</div>
+    <div class="drop" id="drop">Drop files here or <u>click to choose</u><input type="file" id="fileIn" multiple hidden accept=".pdf,image/*,.doc,.docx,.xls,.xlsx,.csv,.txt,.eml,.msg,.heic"></div>
+    <div class="toolbar" style="margin:10px 0 0">
+      <select id="newNoFile"><option value="">＋ New without a file…</option><option value="quote">Quote</option><option value="invoice">Invoice</option><option value="receipt">Receipt</option><option value="po">Purchase order (blank)</option></select>
+      <select id="fromQuote"><option value="">Generate PO from quote…</option>${quotes.map(q => `<option value="${q.id}">${esc(q.vendor)} · ${esc(q.number || '')} · ${money(q.amount)}</option>`).join('')}</select>
+      ${S.pos.length && !S.settings.company ? `<span class="small muted">Add your company name/address in <a href="#settings">Settings</a> so it prints on POs.</span>` : ''}
+    </div>
   </div>
+  ${pend.length ? `<div class="banner warn" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><span>⚑ <b>${pend.length} uploaded file${pend.length > 1 ? 's need' : ' needs'} details.</b> ${pend.length > 1 ? 'They are' : 'It is'} highlighted below — you can review them now or any time later.</span><span style="flex:1"></span><button class="b pri" id="rvGo">Review ${pend.length} pending</button></div>` : ''}
+  <div class="kpis">${sum.map(([t, l, n, sub]) => `<div class="kpi" data-type="${t}" style="cursor:pointer;${f.type === t ? 'outline:2px solid var(--accent)' : ''}"><div class="l">${l}</div><div class="v">${n}</div><div class="n">${sub}</div></div>`).join('')}</div>
   <div class="card">
     <div class="toolbar">
-      <select id="dType"><option value="">All types</option>${Object.entries(DOC_TYPES).map(([v, l]) => `<option value="${v}" ${f.type === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
-      <select id="dStatus"><option value="">Any status</option>${[...new Set(Object.values(DOC_STATUS).flat())].map(s => `<option ${f.status === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
+      <select id="dType"><option value="">All types</option>${Object.entries(VIEW_TYPES).map(([v, l]) => `<option value="${v}" ${f.type === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+      <select id="dStatus"><option value="">Any status</option>${allStatus.map(s => `<option ${f.status === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
       <select id="dTag"><option value="">Any tag</option>${allTags().map(t => `<option ${f.tag === t ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>
       <input id="dQ" class="grow" placeholder="Search vendor, number, description, file" value="${esc(f.q)}">
       <button class="b" onclick="location.hash='files'">Open file browser</button>
     </div>
-    <div class="small muted" style="margin-bottom:6px">${rows.length} documents · ${money(rows.reduce((s, d) => s + (+d.amount || 0), 0))}</div>
+    <div class="small muted" style="margin-bottom:6px">${rows.length} items · ${money(rows.reduce((s, r) => s + r.amount, 0))}</div>
     <div class="tw"><table><thead><tr><th>Type</th><th>Date</th><th>Vendor</th><th>No.</th><th class="r">Amount</th><th>Status</th><th>Tags</th><th>Links</th><th></th></tr></thead><tbody>
-    ${rows.map(d => { const tx = (d.linkedTxnIds || []).map(id => S.txns.find(t => t.id === id)).filter(Boolean); const po = d.poId && S.pos.find(p => p.id === d.poId); const pos = S.pos.filter(p => p.quoteId === d.id); return `<tr data-id="${d.id}">
-      <td><b>${DOC_TYPES[d.type]}</b></td><td style="white-space:nowrap">${fmtDate(d.date)}${d.dueDate ? `<div class="small muted">due ${fmtDate(d.dueDate)}</div>` : ''}</td>
-      <td>${esc(d.vendor)}${d.description ? `<div class="small muted">${esc(d.description).slice(0, 120)}</div>` : ''}</td><td>${esc(d.number || '')}</td>
-      <td class="r">${money(d.amount)}</td><td>${statusHTML(d)}</td><td>${(d.tags || []).map(g => `<span class="chip">${esc(g)}</span>`).join('')}</td>
-      <td class="small">${tx.map(t => `💳 ${fmtDate(t.date)} ${money(t.amount)}`).join('<br>')}${po ? `<br>📄 ${esc(po.number)}` : ''}${pos.map(p => `<br>📄 ${esc(p.number)}`).join('')}</td>
-      <td style="white-space:nowrap">${d.file ? '<button class="b sm view">View</button> ' : ''}<button class="b sm edit">Edit</button> ${d.type === 'quote' ? '<button class="b sm mkpo">→ PO</button>' : ''}</td></tr>`; }).join('')}
+    ${rows.map(r => {
+      const d = r.rec; const tx = (d.linkedTxnIds || []).map(id => S.txns.find(t => t.id === id)).filter(Boolean);
+      const txHTML = tx.map(t => `💳 ${fmtDate(t.date)} ${money(t.amount)}`).join('<br>');
+      if (r.kind === 'po') {
+        const q = S.docs.find(x => x.id === d.quoteId); const inv = S.docs.filter(x => x.type === 'invoice' && x.poId === d.id);
+        return `<tr data-id="${d.id}" data-kind="po" class="${d.needsReview ? 'pending' : ''}"><td><b>Purchase order</b>${d.imported ? '<div class="small muted">uploaded</div>' : ''}</td><td style="white-space:nowrap">${fmtDate(d.date)}</td>
+          <td>${d.needsReview && !d.vendor ? `<span class="muted">${esc(d.fileName || '')}</span>` : esc(d.vendor)}${d.notes ? `<div class="small muted">${esc(d.notes).slice(0, 120)}</div>` : ''}</td><td>${esc(d.number)}</td><td class="r">${money(r.amount)}</td>
+          <td>${d.needsReview ? '<span class="status warn">⚑ needs review</span>' : `<span class="status ${statusCls(d.status)}">${esc(d.status)}</span>`}</td><td>${(d.tags || []).map(g => `<span class="chip">${esc(g)}</span>`).join('')}</td>
+          <td class="small">${[q ? `📝 quote ${esc(q.number || q.vendor)}` : '', inv.length ? `🧾 ${inv.length} invoice${inv.length > 1 ? 's' : ''} · ${money(inv.reduce((s, x) => s + (+x.amount || 0), 0))}` : '', txHTML].filter(Boolean).join('<br>')}</td>
+          <td style="white-space:nowrap">${d.file ? '<button class="b sm view">View</button> ' : ''}<button class="b sm pdf" title="Generate a PDF from these details">PDF</button> <button class="b sm edit">Edit</button></td></tr>`;
+      }
+      const po = d.poId && S.pos.find(p => p.id === d.poId); const pos = S.pos.filter(p => p.quoteId === d.id);
+      return `<tr data-id="${d.id}" data-kind="doc" class="${d.needsReview ? 'pending' : ''}"><td><b>${DOC_TYPES[d.type]}</b>${d.needsReview ? '<div class="small muted">guessed</div>' : ''}</td><td style="white-space:nowrap">${fmtDate(d.date)}${d.dueDate && d.type !== 'receipt' ? `<div class="small muted">${d.type === 'quote' ? 'valid to' : 'due'} ${fmtDate(d.dueDate)}</div>` : ''}</td>
+        <td>${d.needsReview && !d.vendor ? `<span class="muted">${esc(d.fileName || '')}</span>` : esc(d.vendor)}${d.description ? `<div class="small muted">${esc(d.description).slice(0, 120)}</div>` : ''}</td><td>${esc(d.number || '')}</td>
+        <td class="r">${money(d.amount)}</td><td>${statusHTML(d)}</td><td>${(d.tags || []).map(g => `<span class="chip">${esc(g)}</span>`).join('')}</td>
+        <td class="small">${[txHTML, po ? `📄 ${esc(po.number)}` : '', ...pos.map(p => `📄 ${esc(p.number)}`)].filter(Boolean).join('<br>')}</td>
+        <td style="white-space:nowrap">${d.file ? '<button class="b sm view">View</button> ' : ''}<button class="b sm edit">Edit</button> ${d.type === 'quote' ? '<button class="b sm mkpo">→ PO</button>' : ''}</td></tr>`;
+    }).join('') || '<tr><td colspan="9" class="muted">Nothing here yet — drop files above.</td></tr>'}
     </tbody></table></div>
   </div>`;
   const drop = $('#drop'), inp = $('#fileIn');
   drop.onclick = e => { if (e.target !== inp) inp.click(); };
   drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); };
   drop.ondragleave = () => drop.classList.remove('over');
-  drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); queueFiles([...e.dataTransfer.files]); };
-  inp.onchange = () => queueFiles([...inp.files]);
-  $('#noFile').onclick = () => editDoc(null, null, []);
+  drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); uploadBatch([...e.dataTransfer.files]); };
+  inp.onchange = () => { const fs = [...inp.files]; inp.value = ''; uploadBatch(fs); };
+  $('#rvGo')?.addEventListener('click', () => { UI.skipped.clear(); reviewNext(); });
+  $('#newNoFile').onchange = e => { const t = e.target.value; e.target.value = ''; if (t === 'po') editPO(null, null); else if (t) editDoc(null, null, [], { type: t }); };
+  $('#fromQuote').onchange = e => { const q = S.docs.find(d => d.id === e.target.value); if (q) editPO(null, q); };
   const rf = () => render();
+  $$('.kpi[data-type]', root).forEach(k => k.onclick = () => { f.type = f.type === k.dataset.type ? '' : k.dataset.type; f.status = ''; rf(); });
   $('#dType').onchange = e => { f.type = e.target.value; rf(); };
   $('#dStatus').onchange = e => { f.status = e.target.value; rf(); };
   $('#dTag').onchange = e => { f.tag = e.target.value; rf(); };
   let qh; $('#dQ').oninput = e => { clearTimeout(qh); qh = setTimeout(() => { f.q = e.target.value; rf(); setTimeout(() => { const i = $('#dQ'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }); }, 300); };
   root.querySelector('tbody').addEventListener('click', e => {
-    const tr = e.target.closest('tr'); if (!tr) return; const d = S.docs.find(x => x.id === tr.dataset.id);
-    if (e.target.classList.contains('edit')) editDoc(d);
-    if (e.target.classList.contains('view')) openDocViewer(d.id);
-    if (e.target.classList.contains('mkpo')) editPO(null, d);
+    const tr = e.target.closest('tr[data-id]'); if (!tr) return;
+    const isPO = tr.dataset.kind === 'po'; const r = (isPO ? S.pos : S.docs).find(x => x.id === tr.dataset.id); if (!r) return;
+    if (e.target.classList.contains('edit')) { UI.skipped.clear(); isPO ? editPO(r) : editDoc(r); }
+    if (e.target.classList.contains('view')) openDocViewer(r.id);
+    if (e.target.classList.contains('pdf')) poPDF(r);
+    if (e.target.classList.contains('mkpo')) editPO(null, r);
   });
 }
-function queueFiles(files) { if (!files.length) return; const f = files.shift(); editDoc(null, f, files); }
+/* ---------- Upload inbox: save files first, review details later ---------- */
+const pendingList = () => [...S.docs.filter(d => d.needsReview).map(d => ({ kind: 'doc', rec: d })), ...S.pos.filter(p => p.needsReview).map(p => ({ kind: 'po', rec: p }))]
+  .sort((a, b) => (a.rec.createdAt || '').localeCompare(b.rec.createdAt || '') || (a.rec.fileName || '').localeCompare(b.rec.fileName || ''));
+function blankPO(extra = {}) { return { id: 'po_' + uid(), number: '', date: '', status: 'issued', vendor: '', vendorAddress: '', vendorContact: '', quoteId: '', quoteRef: '', items: [], taxRate: 0, shipping: 0, terms: '', deliveryDate: '', shipTo: '', notes: '', tags: [], linkedTxnIds: [], imported: true, createdAt: new Date().toISOString(), ...extra }; }
+async function uploadBatch(files) {
+  if (!files.length) return;
+  const failed = []; let ok = 0; const batch = new Date().toISOString();
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i]; toast(`Uploading ${i + 1} of ${files.length}: ${f.name}`, 120000);
+    const g = guessFromName(f.name); const createdAt = batch.slice(0, 19) + '.' + String(i).padStart(3, '0') + 'Z';
+    try {
+      if (g.type === 'po') {
+        const p = blankPO({ number: g.number, needsReview: true, createdAt, fileName: f.name });
+        const up = await store.upload(`accounting/pos/${p.id}/${safeId(f.name)}`, f);
+        p.file = { path: up.path, url: up.url, contentType: f.type || '', size: f.size };
+        await persist('pos', p);
+      } else {
+        const d = { id: 'd_' + uid(), type: g.type, number: g.number, vendor: '', date: '', amount: '', status: DOC_STATUS[g.type][0], tags: [], description: '', items: [], linkedTxnIds: [], needsReview: true, createdAt, fileName: f.name };
+        const up = await store.upload(`accounting/docs/${d.id}/${safeId(f.name)}`, f);
+        d.file = { path: up.path, url: up.url, contentType: f.type || '', size: f.size };
+        await persist('docs', d);
+      }
+      ok++;
+    } catch (e) { failed.push(f.name); DBG.err('upload failed: ' + f.name, e); }
+  }
+  toast(`${ok} file${ok === 1 ? '' : 's'} uploaded${failed.length ? ` · ${failed.length} failed: ${failed.join(', ')}` : ''} — review details now or later`, failed.length ? 9000 : 3500);
+  UI.skipped = new Set(); render(); if (ok) reviewNext();
+}
+function reviewNext() {
+  const next = pendingList().find(x => !UI.skipped.has(x.rec.id));
+  if (next) { next.kind === 'po' ? editPO(next.rec) : editDoc(next.rec); return; }
+  closeModal(); render();
+  const n = pendingList().length;
+  toast(n ? `${n} file${n > 1 ? 's' : ''} still need review — highlighted on the Documents tab` : 'All uploaded files reviewed ✓', 4000);
+}
+function reviewTitle(rec) { const L = pendingList(); const i = L.findIndex(x => x.rec.id === rec.id); return `Review ${i + 1} of ${L.length}${rec.fileName ? ' — ' + rec.fileName : ''}`; }
+function reviewFooter(body, delId, saveId) {
+  const left = pendingList().filter(x => !UI.skipped.has(x.rec.id)).length - 1;
+  $('.mfoot', body).innerHTML = `<button class="b danger" id="${delId}">Delete file</button><span style="flex:1"></span><button class="b" id="rvSkip" title="Leave it highlighted and go to the next file">Skip for now</button><button class="b" data-close title="Everything not yet reviewed stays highlighted">Stop reviewing</button><button class="b pri" id="${saveId}">${left > 0 ? `Save &amp; next (${left} left)` : 'Save'}</button>`;
+}
+/* Switch a pending (already uploaded) record between document and PO, keeping its file. */
+async function convertDocToPO(d, pre) {
+  const p = blankPO({ number: pre.number || '', date: pre.date || '', vendor: pre.vendor || '', items: pre.items || [], totalOverride: pre.items?.length ? 0 : (+pre.amount || 0), tags: pre.tags || [], notes: pre.notes || '', needsReview: !!d.needsReview, createdAt: d.createdAt, file: d.file, fileName: d.fileName, linkedTxnIds: d.linkedTxnIds || [] });
+  await persist('pos', p); await store.del('docs', d.id); S.docs = S.docs.filter(x => x.id !== d.id); derive(); editPO(p);
+}
+async function convertPOToDoc(p, pre) {
+  const d = { id: 'd_' + uid(), type: pre.type, number: pre.number || '', vendor: pre.vendor || '', date: pre.date || '', amount: pre.amount ?? '', status: DOC_STATUS[pre.type][0], tags: pre.tags || [], description: pre.description || '', items: pre.items || [], linkedTxnIds: p.linkedTxnIds || [], needsReview: !!p.needsReview, createdAt: p.createdAt, file: p.file, fileName: p.fileName };
+  await persist('docs', d); await store.del('pos', p.id); S.pos = S.pos.filter(x => x.id !== p.id); derive(); editDoc(d);
+}
+
+/* One upload queue for every document type: POs open the PO form, everything else the document form. */
+function queueAny(files) { if (!files.length) return; const f = files.shift(); guessFromName(f.name).type === 'po' ? editPO(null, null, f, files) : editDoc(null, f, files); }
+const queueFiles = queueAny, queuePOFiles = queueAny;
 function guessFromName(name) {
-  const n = name.toLowerCase(); const type = /quot|estimate|proposal/.test(n) ? 'quote' : /inv|bill/.test(n) ? 'invoice' : /receipt/.test(n) ? 'receipt' : 'quote';
-  const num = (name.match(/(?:inv(?:oice)?|quote|q|po|#)[\s_-]*([A-Z0-9-]{3,})/i) || [])[1] || '';
+  const n = name.toLowerCase();
+  const type = /(^|[^a-z])p\.?o([^a-z]|$)|purchase[\s_-]*order/.test(n) ? 'po' : /receipt|rcpt/.test(n) ? 'receipt' : /quot|estimate|proposal/.test(n) ? 'quote' : 'invoice';
+  // number = a filename token containing a digit (not a date), preferring ones like INV-55, Q-1001, PO-4512, #123
+  const toks = name.replace(/\.[a-z0-9]+$/i, '').split(/[\s_()]+/).filter(t => /\d/.test(t) && !/^\d{4}-?\d{2}-?\d{2}$|^\d{1,2}[-.]\d{1,2}[-.]\d{2,4}$/.test(t));
+  const num = (toks.find(t => /^(inv|q|qt|quote|po|rcpt|#)/i.test(t)) || toks[toks.length - 1] || '').replace(/^#/, '');
   return { type, number: num };
 }
 function itemsEditor(items) {
@@ -875,23 +1087,24 @@ function bindItems(root, onChange) {
   upd();
 }
 const readItems = root => $$('.items tbody tr', root).map(tr => ({ desc: $('.iDesc', tr).value.trim(), sku: $('.iSku', tr).value.trim(), qty: +$('.iQty', tr).value || 0, price: +$('.iPrice', tr).value || 0 })).filter(i => i.desc || i.price);
-function editDoc(d, file, rest = []) {
-  const isNew = !d; const g = file ? guessFromName(file.name) : { type: 'quote', number: '' };
+function editDoc(d, file, rest = [], prefill = null) {
+  const isNew = !d, reviewing = !!d?.needsReview; const g = file ? guessFromName(file.name) : { type: 'quote', number: '' }; if (g.type === 'po') g.type = 'invoice'; if (prefill?.type) g.type = prefill.type;
   d = d ? structuredClone(d) : { id: 'd_' + uid(), type: g.type, number: g.number, vendor: '', date: today(), amount: '', status: DOC_STATUS[g.type][0], tags: [], description: '', items: [], linkedTxnIds: [], createdAt: new Date().toISOString() };
+  if (isNew && prefill) { const { type, ...rest2 } = prefill; Object.keys(rest2).forEach(k => { if (rest2[k] !== undefined && rest2[k] !== '' && rest2[k] !== null) d[k] = rest2[k]; }); d.status = DOC_STATUS[d.type][0]; }
   const vendors = [...new Set([...S.docs.map(x => x.vendor), ...S.pos.map(p => p.vendor)].filter(Boolean))];
-  const body = modal((isNew ? 'New document' : 'Edit document') + (file ? ` — ${file.name}` : '') + (rest.length ? ` (${rest.length} more queued)` : ''), `
+  const body = modal(reviewing ? reviewTitle(d) : (isNew ? 'New document' : 'Edit document') + (file ? ` — ${file.name}` : '') + (rest.length ? ` (${rest.length} more queued)` : ''), `
     <div class="form">
-      <label>Type<select id="dT">${Object.entries(DOC_TYPES).map(([v, l]) => `<option value="${v}" ${d.type === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
+      <label>Type<select id="dT">${Object.entries(DOC_TYPES).map(([v, l]) => `<option value="${v}" ${d.type === v ? 'selected' : ''}>${l}</option>`).join('')}${isNew || reviewing ? '<option value="po">Purchase order →</option>' : ''}</select></label>
       <label>Vendor<input id="dV" value="${esc(d.vendor)}" list="vendList"></label>
       <label>Number<input id="dN" value="${esc(d.number || '')}"></label>
       <label>Date<input type="date" id="dD" value="${d.date || ''}"></label>
       <label>Total amount<input type="number" step="0.01" id="dA" value="${d.amount ?? ''}"></label>
-      <label><span id="dueLbl">${d.type === 'quote' ? 'Valid until' : 'Due date'}</span><input type="date" id="dDue" value="${d.dueDate || ''}"></label>
+      <label id="dueWrap"><span id="dueLbl">${d.type === 'quote' ? 'Valid until' : 'Due date'}</span><input type="date" id="dDue" value="${d.dueDate || ''}"></label>
       <label>Status<select id="dS"></select></label>
       <label>Related PO<select id="dPO"><option value="">—</option>${S.pos.map(p => `<option value="${p.id}" ${d.poId === p.id ? 'selected' : ''}>${esc(p.number)} · ${esc(p.vendor)}</option>`).join('')}</select></label>
       <label class="full">Tags (comma-separated)<input id="dTags" value="${esc((d.tags || []).join(', '))}" placeholder="e.g. reagents, grant-A, CRO"></label>
       <label class="full">Description<textarea id="dDesc">${esc(d.description || '')}</textarea></label>
-      <label class="full">Line items <span class="muted">(used to generate POs)</span>${itemsEditor(d.items)}</label>
+      <label class="full" id="itemsWrap">Line items <span class="muted">(used to generate POs)</span>${itemsEditor(d.items)}</label>
       <label class="full">${file || d.file ? 'File' : 'Attach file (optional)'}${d.file ? `<div class="small">${esc(d.fileName)} <button class="b sm" id="dView" type="button">View</button></div>` : ''}${!file ? `<input type="file" id="dFile">` : `<div class="small">${esc(file.name)} · ${(file.size / 1024).toFixed(0)} KB</div>`}</label>
       <label class="full">Link to bank transactions <span class="sugg" id="suggNote"></span>
         <input id="txSearch" placeholder="Search transactions by description or amount">
@@ -899,10 +1112,24 @@ function editDoc(d, file, rest = []) {
     </div>
     <datalist id="vendList">${vendors.map(v => `<option value="${esc(v)}">`).join('')}</datalist>
     <div class="mfoot">${!isNew ? '<button class="b danger" id="dDel">Delete</button>' : ''}<span style="flex:1"></span>${rest.length ? '<button class="b" id="dSkip">Skip file</button>' : ''}<button class="b" data-close>Cancel</button><button class="b pri" id="dSave">${rest.length ? 'Save & next' : 'Save'}</button></div>`, { wide: true });
+  if (reviewing) reviewFooter(body, 'dDel', 'dSave');
   attachPreview(body, file || (d.file ? d : null));
+  $('#rvSkip', body)?.addEventListener('click', () => { UI.skipped.add(d.id); reviewNext(); });
   const sel = new Set(d.linkedTxnIds || []);
-  const fillStatus = () => { const t = $('#dT', body).value; $('#dS', body).innerHTML = DOC_STATUS[t].map(s => `<option ${d.status === s ? 'selected' : ''}>${s}</option>`).join(''); $('#dueLbl', body).textContent = t === 'quote' ? 'Valid until' : 'Due date'; };
-  fillStatus(); $('#dT', body).onchange = fillStatus;
+  const fillStatus = () => {
+    const t = $('#dT', body).value; if (t === 'po') return;
+    $('#dS', body).innerHTML = DOC_STATUS[t].map(s => `<option ${d.status === s ? 'selected' : ''}>${s}</option>`).join('');
+    $('#dueLbl', body).textContent = t === 'quote' ? 'Valid until' : 'Due date';
+    $('#dueWrap', body).style.display = t === 'receipt' || t === 'other' ? 'none' : '';
+    $('#itemsWrap', body).style.display = t === 'receipt' ? 'none' : '';
+  };
+  fillStatus();
+  $('#dT', body).onchange = () => {
+    if ($('#dT', body).value !== 'po') return fillStatus();
+    const items = readItems(body);
+    if (reviewing) return convertDocToPO(S.docs.find(x => x.id === d.id) || d, { vendor: $('#dV', body).value.trim(), number: $('#dN', body).value.trim(), date: $('#dD', body).value, amount: +$('#dA', body).value || 0, tags: parseTags($('#dTags', body).value), notes: $('#dDesc', body).value.trim(), items });
+    editPO(null, null, file, rest, { vendor: $('#dV', body).value.trim(), number: $('#dN', body).value.trim(), date: $('#dD', body).value, amount: +$('#dA', body).value || 0, tags: parseTags($('#dTags', body).value), notes: $('#dDesc', body).value.trim(), items });
+  };
   const drawTx = () => {
     const amt = Math.abs(+$('#dA', body).value || 0), dt = $('#dD', body).value, q = $('#txSearch', body).value.toLowerCase();
     const isS = t => amt && Math.abs(Math.abs(t.amount) - amt) <= Math.max(1, amt * 0.02) && (!dt || Math.abs(ts(t.date) - ts(dt)) < 120 * 864e5);
@@ -919,13 +1146,17 @@ function editDoc(d, file, rest = []) {
   $('#dSkip', body)?.addEventListener('click', () => queueFiles(rest));
   $('#dDel', body)?.addEventListener('click', async () => {
     if (!confirm('Delete this document' + (d.file ? ' and its file' : '') + '?')) return;
-    if (d.file) await store.removeFile(d.file.path); await store.del('docs', d.id); S.docs = S.docs.filter(x => x.id !== d.id); closeModal(); render();
+    if (d.file) await store.removeFile(d.file.path); await store.del('docs', d.id); S.docs = S.docs.filter(x => x.id !== d.id); if (reviewing) return reviewNext(); closeModal(); render();
   });
   $('#dSave', body).onclick = async () => {
     const btn = $('#dSave', body); btn.disabled = true; btn.textContent = 'Saving…';
     try {
       const items = readItems(body); const sub = items.reduce((s, i) => s + i.qty * i.price, 0);
+      if ($('#dT', body).value === 'receipt' && sel.size && $('#dS', body).value === 'unreconciled') $('#dS', body).value = 'reconciled';
+      if ($('#dT', body).value === 'invoice' && sel.size && $('#dS', body).value === 'unpaid') $('#dS', body).value = 'paid';
       Object.assign(d, { type: $('#dT', body).value, vendor: $('#dV', body).value.trim(), number: $('#dN', body).value.trim(), date: $('#dD', body).value, amount: $('#dA', body).value === '' ? +sub.toFixed(2) : +$('#dA', body).value, dueDate: $('#dDue', body).value, status: $('#dS', body).value, poId: $('#dPO', body).value, tags: parseTags($('#dTags', body).value), description: $('#dDesc', body).value.trim(), items, linkedTxnIds: [...sel], updatedAt: new Date().toISOString() });
+      if (!d.date) d.date = today();
+      delete d.needsReview;
       const f = file || $('#dFile', body)?.files[0];
       if (f) {
         if (d.file) await store.removeFile(d.file.path);
@@ -934,9 +1165,10 @@ function editDoc(d, file, rest = []) {
         d.file = { path: up.path, url: up.url, contentType: f.type || '', size: f.size }; d.fileName = f.name;
       }
       await persist('docs', d); toast('Saved ' + (DOC_TYPES[d.type] || 'document'));
+      if (reviewing) return reviewNext();
       if (rest.length) queueFiles(rest); else { closeModal(); render(); }
       if (rest.length) render();
-    } catch (e) { btn.disabled = false; btn.textContent = 'Save'; toast('Save failed: ' + e.message, 6000); DBG.err('document save failed', e); }
+    } catch (e) { if (reviewing) d.needsReview = true; btn.disabled = false; btn.textContent = 'Save'; toast('Save failed: ' + e.message, 6000); DBG.err('document save failed', e); }
   };
 }
 
@@ -1009,43 +1241,25 @@ function nextPONumber() {
   const n = S.pos.map(p => p.number || '').filter(x => x.startsWith(pre)).map(x => parseInt(x.slice(pre.length)) || 0);
   return pre + String((n.length ? Math.max(...n) : 0) + 1).padStart(3, '0');
 }
-function vPOs(root) {
-  const rows = S.pos.slice().sort((a, b) => (b.date || '').localeCompare(a.date || ''));
-  const quotes = S.docs.filter(d => d.type === 'quote' && ['open', 'accepted'].includes(d.status));
-  root.innerHTML = `${banner()}
-  <div class="card"><div class="toolbar"><b style="font-size:15px">Purchase orders</b><span class="grow"></span>
-    <select id="fromQuote"><option value="">Generate from quote…</option>${quotes.map(q => `<option value="${q.id}">${esc(q.vendor)} · ${esc(q.number || '')} · ${money(q.amount)}</option>`).join('')}</select>
-    <button class="b pri" id="newPO">+ Blank PO</button></div>
-    <div class="drop" id="poDrop" style="margin-bottom:12px;padding:14px">Upload existing POs (PDF, image, Word…) — drop here or <u>click to choose</u>. You'll fill in the details for each one.<input type="file" id="poFileIn" multiple hidden accept=".pdf,image/*,.doc,.docx,.xls,.xlsx"></div>
-    ${!S.settings.company ? `<div class="banner">Add your company name and address in <a href="#settings">Settings</a> so they print on POs.</div>` : ''}
-    <div class="tw"><table><thead><tr><th>PO #</th><th>Date</th><th>Vendor</th><th>Quote</th><th class="r">Total</th><th class="r">Invoiced</th><th>Status</th><th></th></tr></thead><tbody>
-    ${rows.map(p => { const q = S.docs.find(d => d.id === p.quoteId); const inv = S.docs.filter(d => d.type === 'invoice' && d.poId === p.id); const invAmt = inv.reduce((s, d) => s + (+d.amount || 0), 0); return `<tr data-id="${p.id}"><td><b>${esc(p.number)}</b></td><td>${fmtDate(p.date)}</td><td>${esc(p.vendor)}</td><td class="small">${q ? esc((q.number || '') + ' ' + q.vendor) : '—'}</td><td class="r">${money(poTotals(p).total)}</td><td class="r small">${inv.length ? money(invAmt) + ` (${inv.length})` : '—'}</td><td><span class="status ${statusCls(p.status)}">${esc(p.status)}</span></td><td style="white-space:nowrap">${p.file ? '<button class="b sm view" title="View uploaded file">📎 File</button> ' : ''}<button class="b sm pdf" title="Generate a PDF from these details">PDF</button> <button class="b sm edit">Edit</button></td></tr>`; }).join('') || '<tr><td colspan="8" class="muted">No purchase orders yet.</td></tr>'}
-    </tbody></table></div></div>`;
-  $('#newPO').onclick = () => editPO(null, null);
-  const pd = $('#poDrop'), pin = $('#poFileIn');
-  pd.onclick = e => { if (e.target !== pin) pin.click(); };
-  pd.ondragover = e => { e.preventDefault(); pd.classList.add('over'); };
-  pd.ondragleave = () => pd.classList.remove('over');
-  pd.ondrop = e => { e.preventDefault(); pd.classList.remove('over'); queuePOFiles([...e.dataTransfer.files]); };
-  pin.onchange = () => queuePOFiles([...pin.files]);
-  $('#fromQuote').onchange = e => { const q = S.docs.find(d => d.id === e.target.value); if (q) editPO(null, q); };
-  root.querySelector('tbody').addEventListener('click', e => { const tr = e.target.closest('tr'); const p = S.pos.find(x => x.id === tr?.dataset.id); if (!p) return; if (e.target.classList.contains('edit')) editPO(p); if (e.target.classList.contains('pdf')) poPDF(p); if (e.target.classList.contains('view')) openDocViewer(p.id); });
-}
-function queuePOFiles(files) { if (!files.length) return; const f = files.shift(); editPO(null, null, f, files); }
-function editPO(p, quote, file = null, rest = []) {
-  const isNew = !p;
+function editPO(p, quote, file = null, rest = [], prefill = null) {
+  const isNew = !p, reviewing = !!p?.needsReview;
   if (!p) {
     p = { id: 'po_' + uid(), number: nextPONumber(), date: today(), status: 'draft', vendor: quote?.vendor || '', vendorAddress: '', vendorContact: '', quoteId: quote?.id || '', quoteRef: quote?.number || '', items: structuredClone(quote?.items?.length ? quote.items : quote ? [{ desc: quote.description || `Per quote ${quote.number || ''}`, qty: 1, price: +quote.amount || 0 }] : []), taxRate: +S.settings.taxRate || 0, shipping: 0, terms: S.settings.paymentTerms || 'Net 30', deliveryDate: '', shipTo: S.settings.address || '', notes: '', tags: quote?.tags || [] };
     if (file) {
       const m = file.name.match(/\bP\.?O\.?[\s_#-]*([A-Z0-9][A-Z0-9-]{2,})/i);
       Object.assign(p, { number: m ? 'PO-' + m[1].replace(/^-/, '') : '', status: 'issued', imported: true, shipTo: '', terms: '', taxRate: 0 });
     }
+    if (prefill) {
+      if (prefill.vendor) p.vendor = prefill.vendor; if (prefill.number) p.number = prefill.number;
+      if (prefill.date) p.date = prefill.date; if (prefill.items?.length) p.items = prefill.items; else if (prefill.amount) p.totalOverride = prefill.amount;
+      if (prefill.tags?.length) p.tags = prefill.tags; if (prefill.notes) p.notes = prefill.notes;
+    }
     const prev = S.pos.find(x => x.vendor && x.vendor === p.vendor); if (prev) { p.vendorAddress = prev.vendorAddress; p.vendorContact = prev.vendorContact; }
   } else p = structuredClone(p);
   const vendors = [...new Set([...S.docs.map(x => x.vendor), ...S.pos.map(x => x.vendor)].filter(Boolean))];
   const quotes = S.docs.filter(d => d.type === 'quote');
-  const body = modal((file ? 'Existing PO — ' + file.name : isNew ? 'New purchase order' : 'Edit ' + p.number) + (rest.length ? ` (${rest.length} more queued)` : ''), `
-    ${file ? '<div class="banner">Fill in the details from this PO. Line items are optional — if you skip them, enter the PO total.</div>' : ''}
+  const body = modal(reviewing ? reviewTitle(p) : (file ? 'Existing PO — ' + file.name : isNew ? 'New purchase order' : 'Edit ' + p.number) + (rest.length ? ` (${rest.length} more queued)` : ''), `
+    ${(file && isNew) || reviewing ? `<div class="toolbar" style="margin-bottom:8px"><label class="small" style="display:flex;gap:8px;align-items:center;color:var(--text-secondary)">Document type <select id="pType"><option value="po" selected>Purchase order</option><option value="quote">Quote</option><option value="invoice">Invoice</option><option value="receipt">Receipt</option><option value="other">Other</option></select></label><span class="small muted">Fill in the details from this PO. Line items are optional — if you skip them, enter the PO total.</span></div>` : ''}
     <div class="form">
       <label>PO number<input id="pN" value="${esc(p.number)}"></label>
       <label>Date<input type="date" id="pD" value="${p.date}"></label>
@@ -1068,7 +1282,14 @@ function editPO(p, quote, file = null, rest = []) {
     </div>
     <datalist id="poVendList">${vendors.map(v => `<option value="${esc(v)}">`).join('')}</datalist>
     <div class="mfoot">${!isNew ? '<button class="b danger" id="pDelBtn">Delete</button>' : ''}<span style="flex:1"></span>${rest.length ? '<button class="b" id="pSkip">Skip file</button>' : ''}<button class="b" data-close>Cancel</button>${file || p.imported ? `<button class="b pri" id="pSave">${rest.length ? 'Save &amp; next' : 'Save'}</button>` : '<button class="b" id="pSave">Save</button><button class="b pri" id="pSavePdf">Save &amp; download PDF</button>'}</div>`, { wide: true });
+  if (reviewing) reviewFooter(body, 'pDelBtn', 'pSave');
   attachPreview(body, file || (p.file ? p : null));
+  $('#rvSkip', body)?.addEventListener('click', () => { UI.skipped.add(p.id); reviewNext(); });
+  $('#pType', body)?.addEventListener('change', e => {
+    const items = readItems(body); const t = poTotals({ items, taxRate: $('#pTax', body).value, shipping: $('#pShip', body).value, totalOverride: $('#pOver', body).value }).total;
+    if (reviewing) return convertPOToDoc(S.pos.find(x => x.id === p.id) || p, { type: e.target.value, vendor: $('#pV', body).value.trim(), number: $('#pN', body).value.trim(), date: $('#pD', body).value, amount: t ? +t.toFixed(2) : '', tags: parseTags($('#pTags', body).value), description: $('#pNotes', body).value.trim(), items });
+    editDoc(null, file, rest, { type: e.target.value, vendor: $('#pV', body).value.trim(), number: $('#pN', body).value.trim(), date: $('#pD', body).value, amount: t ? +t.toFixed(2) : '', tags: parseTags($('#pTags', body).value), description: $('#pNotes', body).value.trim(), items });
+  });
   const tot = () => { const t = poTotals({ items: readItems(body), taxRate: $('#pTax', body).value, shipping: $('#pShip', body).value, totalOverride: $('#pOver', body).value }); $('#pTot', body).textContent = money(t.total); };
   bindItems(body, tot); body.addEventListener('input', tot); tot();
   const collect = () => Object.assign(p, { number: $('#pN', body).value.trim(), date: $('#pD', body).value, status: $('#pS', body).value, quoteId: $('#pQ', body).value, quoteRef: S.docs.find(d => d.id === $('#pQ', body).value)?.number || '', vendor: $('#pV', body).value.trim(), vendorContact: $('#pVC', body).value.trim(), terms: $('#pT', body).value.trim(), deliveryDate: $('#pDel', body).value, vendorAddress: $('#pVA', body).value.trim(), shipTo: $('#pST', body).value.trim(), items: readItems(body), taxRate: +$('#pTax', body).value || 0, shipping: +$('#pShip', body).value || 0, tags: parseTags($('#pTags', body).value), notes: $('#pNotes', body).value.trim(), totalOverride: +$('#pOver', body).value || 0, updatedAt: new Date().toISOString() });
@@ -1077,6 +1298,7 @@ function editPO(p, quote, file = null, rest = []) {
     if (!p.number) { toast('Enter the PO number'); return; }
     if (S.pos.some(x => x.number === p.number && x.id !== p.id)) { toast('That PO number is already used'); return; }
     const btn = $('#pSave', body); btn.disabled = true; btn.textContent = 'Saving…';
+    if (!p.date) p.date = today(); delete p.needsReview;
     try {
       const f = file || $('#pFile', body)?.files[0];
       if (f) {
@@ -1085,16 +1307,17 @@ function editPO(p, quote, file = null, rest = []) {
         p.file = { path: up.path, url: up.url, contentType: f.type || '', size: f.size }; p.fileName = f.name;
       }
       await persist('pos', p);
-    } catch (e) { btn.disabled = false; btn.textContent = 'Save'; DBG.err('PO save failed', e); toast('Save failed: ' + (e.code || e.message), 6000); return; }
+    } catch (e) { if (reviewing) p.needsReview = true; btn.disabled = false; btn.textContent = 'Save'; DBG.err('PO save failed', e); toast('Save failed: ' + (e.code || e.message), 6000); return; }
     const q = S.docs.find(d => d.id === p.quoteId); if (q && q.status === 'open' && p.status !== 'draft' && p.status !== 'cancelled') { q.status = 'accepted'; await persist('docs', q); }
     toast('Saved ' + p.number);
+    if (reviewing) return reviewNext();
     if (rest.length) { render(); queuePOFiles(rest); return; }
     closeModal(); render(); if (pdf) poPDF(p);
   };
   $('#pSave', body).onclick = () => save(false); $('#pSavePdf', body)?.addEventListener('click', () => save(true));
   $('#pSkip', body)?.addEventListener('click', () => queuePOFiles(rest));
   $('#pView', body)?.addEventListener('click', () => openFile(p));
-  $('#pDelBtn', body)?.addEventListener('click', async () => { if (!confirm('Delete ' + p.number + (p.file ? ' and its file' : '') + '?')) return; if (p.file) await store.removeFile(p.file.path); await store.del('pos', p.id); S.pos = S.pos.filter(x => x.id !== p.id); closeModal(); render(); });
+  $('#pDelBtn', body)?.addEventListener('click', async () => { if (!confirm('Delete ' + p.number + (p.file ? ' and its file' : '') + '?')) return; if (p.file) await store.removeFile(p.file.path); await store.del('pos', p.id); S.pos = S.pos.filter(x => x.id !== p.id); if (reviewing) return reviewNext(); closeModal(); render(); });
 }
 function poPDF(p) {
   if (!window.jspdf) { toast('PDF library did not load'); return; }
@@ -1123,14 +1346,14 @@ function poPDF(p) {
 /* ======================= TIMELINE ======================= */
 function events(from) {
   const lg = +S.settings.largeTxn || 5000; const ev = [];
-  S.txns.forEach(t => { if (t.date < from) return; if (t.cls === 'infusion') ev.push({ row: 0, d: t.date, amt: t.amount, label: t.description, kind: 'Capital infusion' }); else if (t.cls === 'withdrawal') ev.push({ row: 1, d: t.date, amt: t.amount, label: t.description, kind: 'Capital withdrawal' }); else if (t.cls !== 'transfer' && Math.abs(t.amount) >= lg) ev.push({ row: 5, d: t.date, amt: t.amount, label: t.description, kind: 'Large transaction' }); });
-  S.docs.forEach(d => { if (!d.date || d.date < from) return; if (d.type === 'quote') ev.push({ row: 2, d: d.date, amt: +d.amount || 0, label: `${d.vendor} ${d.number || ''} (${d.status})`, kind: 'Quote', id: d.id }); if (d.type === 'invoice') ev.push({ row: 3, d: d.date, amt: +d.amount || 0, label: `${d.vendor} ${d.number || ''} (${d.status})`, kind: 'Invoice', id: d.id }); });
-  S.pos.forEach(p => { if (p.date >= from) ev.push({ row: 4, d: p.date, amt: poTotals(p).total, label: `${p.number} · ${p.vendor} (${p.status})`, kind: 'Purchase order' }); });
+  S.txns.forEach(t => { if (t.date < from) return; if (t.cls === 'capital') ev.push({ row: 0, d: t.date, amt: t.amount, label: t.description, kind: capLabel(t) }); else if (t.cls !== 'transfer' && Math.abs(t.amount) >= lg) ev.push({ row: 4, d: t.date, amt: t.amount, label: t.description, kind: 'Large transaction' }); });
+  S.docs.forEach(d => { if (!d.date || d.date < from) return; if (d.type === 'quote') ev.push({ row: 1, d: d.date, amt: +d.amount || 0, label: `${d.vendor} ${d.number || ''} (${d.status})`, kind: 'Quote', id: d.id }); if (d.type === 'invoice') ev.push({ row: 2, d: d.date, amt: +d.amount || 0, label: `${d.vendor} ${d.number || ''} (${d.status})`, kind: 'Invoice', id: d.id }); });
+  S.pos.forEach(p => { if (p.date >= from) ev.push({ row: 3, d: p.date, amt: poTotals(p).total, label: `${p.number} · ${p.vendor} (${p.status})`, kind: 'Purchase order' }); });
   return ev.sort((a, b) => a.d.localeCompare(b.d));
 }
-const ROWS = ['Capital infusions', 'Capital withdrawals', 'Quotes', 'Invoices', 'Purchase orders', 'Large transactions'];
+const ROWS = ['Capital (±)', 'Quotes', 'Invoices', 'Purchase orders', 'Large transactions'];
 function vTimeline(root) {
-  const from = rangeStart(); const ev = events(from); const cols = ['--series-3', '--series-2', '--series-1', '--series-4', '--series-5', '--series-6'].map(cssVar);
+  const from = rangeStart(); const ev = events(from); const cols = ['--series-3', '--series-1', '--series-4', '--series-5', '--series-6'].map(cssVar);
   root.innerHTML = `${banner()}
   <div class="toolbar"><b style="font-size:16px">Activity timeline</b><span class="grow"></span>${rangeSeg()}</div>
   <div class="card"><h3>Activity by type</h3><div class="sub">Each mark is one event; size grows with amount. Large-transaction threshold: ${money(+S.settings.largeTxn || 5000)} (change in Settings).</div>
@@ -1267,7 +1490,9 @@ function bindImportPreview() {
       await persist('accounts', acct);
       const ids = importIds(pi, acct.id); const existing = new Set(S.txns.map(t => t.id)); const now = new Date().toISOString();
       const fresh = pi.txns.map((t, i) => ({ id: ids[i], accountId: acct.id, date: t.date, description: t.description, amount: +t.amount.toFixed(2), seq: t.seq, ref: t.ref || '', fitid: t.fitid || '', cls: TRANSFER_RE.test(t.description) ? 'transfer' : '', tags: [], category: '', importedAt: now, source: pi.fileName })).filter(t => !existing.has(t.id));
-      if (fresh.length) await persistMany('txns', fresh);
+      const rec = reconcileTransfers(fresh, acct.id);
+      if (fresh.length) await persistMany('txns', [...fresh, ...rec.upd]);
+      if (rec.del.length) { await store.delMany('txns', rec.del.map(x => x.id)); S.txns = S.txns.filter(x => !rec.del.includes(x)); DBG.info(`import: replaced ${rec.del.length} auto-created transfer entr${rec.del.length === 1 ? 'y' : 'ies'} with imported ones`); }
       UI.pendingImport = null; toast(`Imported ${fresh.length} new transactions into ${acct.name}`, 4000); render();
     } catch (e) { btn.disabled = false; btn.textContent = 'Import'; toast('Import failed: ' + e.message, 6000); console.error(e); }
   };
@@ -1373,6 +1598,8 @@ async function boot() {
     const d = await store.loadAll();
     S.accounts = d.accounts || []; S.txns = d.txns || []; S.docs = d.docs || []; S.pos = d.pos || [];
     S.settings = { ...DEFAULT_SETTINGS, ...((d.settings || []).find(x => x.id === 'main') || {}) };
+    const legacy = S.txns.filter(t => LEGACY_CAPITAL.has(t.cls));
+    if (legacy.length) { legacy.forEach(t => t.cls = 'capital'); DBG.info(`migrating ${legacy.length} capital infusion/withdrawal → capital`); persistMany('txns', legacy).catch(e => DBG.err('capital migration failed', e)); }
     setConn(store.kind === 'firebase' ? 'ok' : 'warn', store.kind === 'firebase' ? `Firebase · ${store.projectId}${store.auth.currentUser ? ' · ' + (store.auth.currentUser.email || 'anon') : ''}` : 'Local mode');
     DBG.info('boot: data loaded', { accounts: S.accounts.length, txns: S.txns.length, docs: S.docs.length, pos: S.pos.length });
   } catch (e) {
