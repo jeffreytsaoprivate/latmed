@@ -142,6 +142,17 @@ tr:hover td{background:color-mix(in srgb,var(--surface-2) 60%,transparent)}
 tr.pending td{background:color-mix(in srgb,var(--warn) 11%,transparent)}
 tr.pending td:first-child{box-shadow:inset 3px 0 0 var(--warn)}
 .pbadge{display:inline-block;min-width:18px;padding:0 6px;margin-left:4px;border-radius:99px;background:var(--warn);color:#fff;font-size:11px;font-weight:700;line-height:18px;text-align:center}
+/* PDF pages: canvas + transparent selectable text layer (pdf.js) */
+.pdfPage{position:relative;margin:12px auto;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.2)}
+.pdfPage canvas{position:absolute;inset:0;width:100%;height:100%}
+.textLayer{position:absolute;inset:0;overflow:hidden;line-height:1;text-align:initial;-webkit-text-size-adjust:none;text-size-adjust:none;forced-color-adjust:none;transform-origin:0 0;z-index:2;opacity:1}
+.textLayer :is(span,br){color:transparent;position:absolute;white-space:pre;cursor:text;transform-origin:0% 0%}
+.textLayer span.markedContent{top:0;height:0}
+.textLayer ::selection{background:rgba(42,120,214,.35)}
+.textLayer br::selection{background:transparent}
+.textLayer .endOfContent{display:block;position:absolute;inset:100% 0 0;z-index:-1;cursor:default;user-select:none}
+.textLayer.selecting .endOfContent{top:0}
+.pdfNoText{font-size:12px;color:var(--text-muted);text-align:center;padding:6px}
 @media (max-width:1000px){.split{grid-template-columns:1fr}.splitR{position:static;height:70vh}}
 @media (max-width:760px){.g2{grid-template-columns:1fr}.viewer{grid-template-columns:1fr;height:auto}.vlist{max-height:200px}.vframe{height:60vh}}
 </style>
@@ -420,20 +431,44 @@ function loadPdfJs() {
   if (window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
   return pdfjsP ||= new Promise((res, rej) => { const sc = document.createElement('script'); sc.src = PDFJS + 'pdf.min.js'; sc.onload = () => { window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDFJS + 'pdf.worker.min.js'; res(window.pdfjsLib); }; sc.onerror = () => { pdfjsP = null; rej(new Error('pdf.js failed to load')); }; document.head.appendChild(sc); });
 }
-/* Render every page of a PDF (ArrayBuffer or URL) as canvases into el. Throws on failure so callers can fall back. */
+/* Render every page of a PDF (ArrayBuffer or URL) into el: canvas for the picture plus pdf.js's transparent
+   text layer on top, so text can be selected and copied. Returns the document's text (for "Copy text").
+   Throws on failure so callers can fall back. */
 async function renderPdf(el, data) {
   const lib = await loadPdfJs();
   const pdf = await lib.getDocument(typeof data === 'string' ? { url: data } : { data }).promise;
   el.innerHTML = ''; el.style.alignItems = 'flex-start'; el.style.display = 'block';
-  const w = Math.max(300, el.clientWidth - 24);
-  for (let n = 1; n <= Math.min(pdf.numPages, 30); n++) {
-    if (!el.isConnected) return;
+  const w = Math.max(300, el.clientWidth - 24); const texts = [];
+  const N = Math.min(pdf.numPages, 30);
+  for (let n = 1; n <= N; n++) {
+    if (!el.isConnected) return texts.join('\n\n');
     const page = await pdf.getPage(n); const v1 = page.getViewport({ scale: 1 }); const scale = w / v1.width; const dpr = window.devicePixelRatio || 1;
-    const vp = page.getViewport({ scale: scale * dpr }); const c = document.createElement('canvas');
-    c.width = vp.width; c.height = vp.height; c.style.cssText = `width:${w}px;display:block;margin:12px auto;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.2)`;
-    el.appendChild(c); await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
+    const vpCss = page.getViewport({ scale }), vp = page.getViewport({ scale: scale * dpr });
+    const wrap = document.createElement('div'); wrap.className = 'pdfPage';
+    wrap.style.cssText = `width:${Math.floor(vpCss.width)}px;height:${Math.floor(vpCss.height)}px`; wrap.style.setProperty('--scale-factor', vpCss.scale);
+    const c = document.createElement('canvas'); c.width = vp.width; c.height = vp.height;
+    const tl = document.createElement('div'); tl.className = 'textLayer';
+    wrap.append(c, tl); el.appendChild(wrap);
+    await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
+    try {
+      const tc = await page.getTextContent();
+      texts.push(tc.items.map(i => i.str + (i.hasEOL ? '\n' : ' ')).join('').replace(/[ \t]+\n/g, '\n').trim());
+      await lib.renderTextLayer({ textContentSource: tc, container: tl, viewport: vpCss, textDivs: [] }).promise;
+      const end = document.createElement('div'); end.className = 'endOfContent'; tl.appendChild(end);
+      // pdf.js selection helper: stops the highlight jumping when dragging past the text
+      tl.addEventListener('mousedown', () => tl.classList.add('selecting'));
+      document.addEventListener('mouseup', () => tl.classList.remove('selecting'));
+    } catch (e) { DBG.warn(`pdf text layer failed on page ${n}`, e); }
   }
+  const text = texts.join('\n\n').trim();
+  if (!text) el.insertAdjacentHTML('afterbegin', '<div class="pdfNoText">This PDF has no text layer (likely a scan or photo), so text can\'t be selected.</div>');
   if (pdf.numPages > 30) el.insertAdjacentHTML('beforeend', `<div class="muted small" style="text-align:center;padding:10px">Showing 30 of ${pdf.numPages} pages — use Open ↗ for the rest.</div>`);
+  return text;
+}
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); }
+  catch { const ta = document.createElement('textarea'); ta.value = text; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); }
+  toast(`Copied ${text.length.toLocaleString()} characters`);
 }
 function closeModal() { $('#modal').hidden = true; $('#modal .mbody').innerHTML = ''; if (previewBlobUrl) { URL.revokeObjectURL(previewBlobUrl); previewBlobUrl = null; } }
 async function fillPreview(right, src) {
@@ -450,7 +485,8 @@ async function fillPreview(right, src) {
   if (type.startsWith('image/') || /\.(png|jpe?g|gif|webp|bmp)$/.test(nm)) pv.innerHTML = `<img src="${esc(url)}" alt="">`;
   else if (type === 'application/pdf' || nm.endsWith('.pdf')) {
     pv.innerHTML = '<span class="muted">Rendering PDF…</span>';
-    try { await renderPdf(pv, src instanceof File ? await src.arrayBuffer() : url); }
+    const cb = $('[data-pvcopy]', right); if (cb) cb.hidden = true;
+    try { const txt = await renderPdf(pv, src instanceof File ? await src.arrayBuffer() : url); if (cb && txt) { cb.hidden = false; cb.onclick = () => copyText(txt); } }
     catch (e) { DBG.warn('preview: pdf.js render failed, using browser viewer', e); if (pv.isConnected) { pv.style.display = ''; pv.innerHTML = `<iframe src="${esc(url)}#view=FitH"></iframe>`; } }
   }
   else if (type.startsWith('text/') || /\.(txt|csv)$/.test(nm)) pv.innerHTML = `<iframe src="${esc(url)}"></iframe>`;
@@ -464,7 +500,7 @@ async function attachPreview(body, src) {
   while (body.firstChild) left.appendChild(body.firstChild);
   const name = src instanceof File ? src.name : (src.fileName || '');
   const right = document.createElement('div'); right.className = 'splitR';
-  right.innerHTML = `<div class="pvbar"><span title="${esc(name)}">📄 ${esc(name)}</span><button class="b sm" type="button" data-pvopen>Open ↗</button></div><div class="pv"><span class="muted">Loading preview…</span></div>`;
+  right.innerHTML = `<div class="pvbar"><span title="${esc(name)}">📄 ${esc(name)}</span><button class="b sm" type="button" data-pvcopy hidden title="Copy all text in this PDF">Copy text</button><button class="b sm" type="button" data-pvopen>Open ↗</button></div><div class="pv"><span class="muted">Loading preview…</span></div>`;
   const wrap = document.createElement('div'); wrap.className = 'split'; wrap.append(left, right); body.appendChild(wrap);
   await fillPreview(right, src);
 }
@@ -663,7 +699,7 @@ function linkPicker(t, onDone) {
       <div class="small muted" style="margin-top:6px">Ticking a box saves immediately. Click a row to preview its file. Linking an unpaid invoice marks it paid.</div>
       <div class="mfoot"><button class="b pri" id="lkDone">Done</button></div>
     </div>
-    <div class="splitR"><div class="pvbar"><span id="lkPvName">Select a row to preview</span><button class="b sm" type="button" data-pvopen>Open ↗</button></div><div class="pv"><span class="muted">No file selected</span></div></div></div>`, { wide: true });
+    <div class="splitR"><div class="pvbar"><span id="lkPvName">Select a row to preview</span><button class="b sm" type="button" data-pvcopy hidden title="Copy all text in this PDF">Copy text</button><button class="b sm" type="button" data-pvopen>Open ↗</button></div><div class="pv"><span class="muted">No file selected</span></div></div></div>`, { wide: true });
   $('#modal .mbox').classList.add('xwide');
   const draw = () => {
     const q = st.q.toLowerCase();
@@ -1214,17 +1250,22 @@ async function showFile(i) {
   $('#vbar').innerHTML = `<button class="b sm" id="vPrev" ${i === 0 ? 'disabled' : ''}>‹ Prev</button><button class="b sm" id="vNext" ${i === list.length - 1 ? 'disabled' : ''}>Next ›</button><span class="small muted">${i + 1} / ${list.length}</span>
     <b>${VIEW_TYPES[d.type]} ${esc(d.number || '')}</b><span>${esc(d.vendor || '')}</span><span>${money(d.amount)}</span>${statusHTML(d)}${(d.tags || []).map(g => `<span class="chip">${esc(g)}</span>`).join('')}
     <span class="small muted">${d.kind === 'po' ? (S.docs.filter(x => x.poId === d.id).map(x => '🧾 ' + (x.number || x.vendor)).join(', ') || 'no invoices linked') : tx.length ? '💳 ' + tx.map(t => fmtDate(t.date) + ' ' + money(t.amount)).join(', ') : 'not linked to a transaction'}</span>
-    <span style="flex:1"></span><button class="b sm" id="vEdit">Edit details</button><button class="b sm" id="vOpen">Open ↗</button>${d.type === 'quote' ? '<button class="b sm" id="vPO">→ PO</button>' : ''}`;
+    <span style="flex:1"></span><button class="b sm" id="vCopy" hidden title="Copy all text in this PDF">Copy text</button><button class="b sm" id="vEdit">Edit details</button><button class="b sm" id="vOpen">Open ↗</button>${d.type === 'quote' ? '<button class="b sm" id="vPO">→ PO</button>' : ''}`;
   $('#vPrev').onclick = () => showFile(i - 1); $('#vNext').onclick = () => showFile(i + 1);
   $('#vEdit').onclick = () => d.kind === 'po' ? editPO(S.pos.find(x => x.id === d.id)) : editDoc(S.docs.find(x => x.id === d.id)); $('#vOpen').onclick = () => openFile(d);
   $('#vPO')?.addEventListener('click', () => editPO(null, d));
-  const fr = $('#vframe'); fr.innerHTML = '<span class="muted">Loading…</span>';
+  const fr = $('#vframe'); fr.style.display = ''; fr.style.alignItems = ''; fr.innerHTML = '<span class="muted">Loading…</span>';
   const url = await store.fileUrl(d.file); if (lastBlobUrl && lastBlobUrl !== url && lastBlobUrl.startsWith('blob:')) URL.revokeObjectURL(lastBlobUrl); lastBlobUrl = url;
   if (UI.viewIdx !== i) return;
   if (!url) { fr.innerHTML = '<span class="muted">File missing.</span>'; return; }
   const ct = d.file.contentType || '', nm = (d.fileName || '').toLowerCase();
   if (ct.startsWith('image/') || /\.(png|jpe?g|gif|webp|bmp)$/.test(nm)) fr.innerHTML = `<img src="${esc(url)}" alt="">`;
-  else if (ct === 'application/pdf' || nm.endsWith('.pdf') || ct.startsWith('text/')) fr.innerHTML = `<iframe src="${esc(url)}"></iframe>`;
+  else if (ct === 'application/pdf' || nm.endsWith('.pdf')) {
+    fr.innerHTML = '<span class="muted">Rendering PDF…</span>';
+    try { let data = url; if (url.startsWith('blob:')) data = await (await fetch(url)).arrayBuffer(); const txt = await renderPdf(fr, data); if (UI.viewIdx === i && txt) { const b = $('#vCopy'); if (b) { b.hidden = false; b.onclick = () => copyText(txt); } } }
+    catch (e) { DBG.warn('file browser: pdf.js failed, using browser viewer', e); if (UI.viewIdx === i) { fr.style.display = ''; fr.innerHTML = `<iframe src="${esc(url)}"></iframe>`; } }
+  }
+  else if (ct.startsWith('text/')) fr.innerHTML = `<iframe src="${esc(url)}"></iframe>`;
   else fr.innerHTML = `<div style="text-align:center"><div class="muted" style="margin-bottom:8px">No inline preview for this file type.</div><button class="b pri" id="vDl">Open / download ${esc(d.fileName)}</button></div>`, $('#vDl').onclick = () => openFile(d);
 }
 document.addEventListener('keydown', e => {
