@@ -1002,6 +1002,7 @@ function vDocs(root) {
       <select id="dStatus"><option value="">Any status</option>${allStatus.map(s => `<option ${f.status === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
       <select id="dTag"><option value="">Any tag</option>${allTags().map(t => `<option ${f.tag === t ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>
       <input id="dQ" class="grow" placeholder="Search vendor, number, description, file" value="${esc(f.q)}">
+      <button class="b" id="findDups" title="Find files stored more than once">Find duplicates</button>
       <button class="b" onclick="location.hash='files'">Open file browser</button>
     </div>
     <div class="small muted" style="margin-bottom:6px">${rows.length} items · ${money(rows.reduce((s, r) => s + r.amount, 0))}</div>
@@ -1033,6 +1034,7 @@ function vDocs(root) {
   drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); uploadBatch([...e.dataTransfer.files]); };
   inp.onchange = () => { const fs = [...inp.files]; inp.value = ''; uploadBatch(fs); };
   $('#rvGo')?.addEventListener('click', () => { UI.skipped.clear(); reviewNext(); });
+  $('#findDups').onclick = () => duplicateFinder();
   $('#newNoFile').onchange = e => { const t = e.target.value; e.target.value = ''; if (t === 'po') editPO(null, null); else if (t) editDoc(null, null, [], { type: t }); };
   $('#fromQuote').onchange = e => { const q = S.docs.find(d => d.id === e.target.value); if (q) editPO(null, q); };
   const rf = () => render();
@@ -1050,12 +1052,89 @@ function vDocs(root) {
     if (e.target.classList.contains('mkpo')) editPO(null, r);
   });
 }
+/* ---------- Attached files: fingerprints, duplicate detection, removal ---------- */
+async function fileHash(f) {
+  try { const h = await crypto.subtle.digest('SHA-256', await f.arrayBuffer()); return [...new Uint8Array(h)].map(b => b.toString(16).padStart(2, '0')).join(''); }
+  catch (e) { DBG.warn('SHA-256 unavailable — duplicate check falls back to name+size', e); return null; }
+}
+const fileRecs = () => [...S.docs.filter(d => d.file).map(d => ({ kind: 'doc', rec: d })), ...S.pos.filter(p => p.file).map(p => ({ kind: 'po', rec: p }))];
+/* Existing record holding the same file: same SHA-256, or (for files uploaded before fingerprints) same name + size. */
+function findDupFile(name, size, hash, exceptId) {
+  return fileRecs().find(x => x.rec.id !== exceptId && ((hash && x.rec.file.sha256 === hash) || (!x.rec.file.sha256 || !hash) && x.rec.fileName === name && x.rec.file.size === size));
+}
+function recLabel(x) { const r = x.rec; return `${x.kind === 'po' ? 'Purchase order' : DOC_TYPES[r.type]} ${r.number || ''}${r.vendor ? ' · ' + r.vendor : ''}${r.needsReview ? ' (needs review)' : ''}`.replace(/\s+/g, ' ').trim(); }
+/* Delete a record's stored file and clear it from the record (the record itself is kept). */
+async function removeAttachment(kind, id) {
+  const r = (kind === 'po' ? S.pos : S.docs).find(x => x.id === id); if (!r?.file) return;
+  await store.removeFile(r.file.path);
+  delete r.file; delete r.fileName;
+  await persist(kind === 'po' ? 'pos' : 'docs', r);
+  DBG.info(`removed attached file from ${kind} ${id}`); toast('File removed');
+}
+/* Before a batch upload: fingerprint every file, flag ones already uploaded (or repeated in the batch), let the user decide. */
+async function screenDuplicates(files) {
+  const out = []; const seen = new Map();
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i]; toast(`Checking for duplicates ${i + 1} of ${files.length}…`, 60000);
+    const hash = await fileHash(f);
+    const key = hash || `${f.name}|${f.size}`;
+    const ex = findDupFile(f.name, f.size, hash);
+    out.push({ f, hash, dupOf: ex ? recLabel(ex) : seen.has(key) ? `“${seen.get(key)}” earlier in this batch` : null });
+    if (!seen.has(key)) seen.set(key, f.name);
+  }
+  const dups = out.filter(x => x.dupOf);
+  if (!dups.length) return out;
+  return new Promise(res => {
+    const body = modal(`${dups.length} duplicate file${dups.length > 1 ? 's' : ''} found`, `
+      <div class="small muted" style="margin-bottom:8px">These files are identical to ones already in Ledger (same content${out.some(x => !x.hash) ? ', or same name and size' : ''}). They'll be skipped unless you tick <b>Upload anyway</b>.</div>
+      <div class="linklist" style="max-height:50vh">${dups.map((x, i) => `<label><input type="checkbox" data-i="${i}"> <span><b>${esc(x.f.name)}</b> <span class="muted small">· ${(x.f.size / 1024).toFixed(0)} KB</span><br><span class="small muted">already uploaded as ${esc(x.dupOf)}</span></span><span class="amt small">Upload anyway</span></label>`).join('')}</div>
+      <div class="mfoot"><button class="b" id="dupCancel">Cancel all</button><button class="b pri" id="dupGo">Continue (${out.length - dups.length} new)</button></div>`);
+    $('#modal .mbox').classList.remove('wide', 'xwide');
+    const upd = () => { const n = out.length - dups.length + $$('input[data-i]:checked', body).length; $('#dupGo', body).textContent = `Continue (${n} to upload)`; };
+    body.addEventListener('change', upd); upd();
+    $('#dupCancel', body).onclick = () => { closeModal(); toast('Upload cancelled'); res([]); };
+    $('#dupGo', body).onclick = () => { const keep = new Set($$('input[data-i]:checked', body).map(i => dups[+i.dataset.i])); closeModal(); res(out.filter(x => !x.dupOf || keep.has(x))); };
+  });
+}
+/* Tool: list records that share the same file and let the user delete extras. */
+function duplicateFinder() {
+  const draw = () => {
+    const groups = new Map();
+    fileRecs().forEach(x => { const k = x.rec.file.sha256 || `${x.rec.fileName}|${x.rec.file.size}`; (groups.get(k) || groups.set(k, []).get(k)).push(x); });
+    const dg = [...groups.values()].filter(g => g.length > 1);
+    $('#modal .mbody').innerHTML = dg.length ? `<div class="small muted" style="margin-bottom:8px">${dg.length} file${dg.length > 1 ? 's are' : ' is'} stored more than once. Keep one in each group; for the others, delete the whole entry or just its file copy.</div>
+      ${dg.map(g => `<div class="card" style="padding:10px;margin-bottom:10px"><b>${esc(g[0].rec.fileName || '')}</b> <span class="muted small">· ${((g[0].rec.file.size || 0) / 1024).toFixed(0)} KB · ${g.length} copies</span>
+        <table style="margin-top:6px"><tbody>${g.map(x => `<tr data-id="${x.rec.id}" data-kind="${x.kind}"><td>${esc(recLabel(x))}</td><td class="small muted">${fmtDate(x.rec.date)}</td><td class="r small">${money(x.kind === 'po' ? poTotals(x.rec).total : x.rec.amount)}</td>
+          <td style="white-space:nowrap;text-align:right"><button class="b sm dfView">View</button> <button class="b sm dfRm" title="Delete this stored copy, keep the entry">Remove file</button> <button class="b sm danger dfDel" title="Delete the entry and its file">Delete entry</button></td></tr>`).join('')}</tbody></table></div>`).join('')}
+      <div class="mfoot"><button class="b pri" data-close>Done</button></div>`
+      : `<div class="muted"><span class="status good">✓</span> No duplicate files stored.</div><div class="mfoot"><button class="b pri" data-close>Close</button></div>`;
+  };
+  const body = modal('Duplicate files', '', { wide: true }); draw();
+  body.addEventListener('click', async e => {
+    const tr = e.target.closest('tr[data-id]'); if (!tr) return; const kind = tr.dataset.kind, id = tr.dataset.id;
+    const r = (kind === 'po' ? S.pos : S.docs).find(x => x.id === id); if (!r) return;
+    if (e.target.classList.contains('dfView')) return openFile(r);
+    if (e.target.classList.contains('dfRm')) { if (!confirm('Remove this copy of the file? The entry stays.')) return; await removeAttachment(kind, id); }
+    if (e.target.classList.contains('dfDel')) {
+      if (!confirm(`Delete ${recLabel({ kind, rec: r })} and its file?`)) return;
+      await store.removeFile(r.file.path); await store.del(kind === 'po' ? 'pos' : 'docs', id);
+      if (kind === 'po') S.pos = S.pos.filter(x => x.id !== id); else S.docs = S.docs.filter(x => x.id !== id);
+      toast('Entry deleted');
+    }
+    derive(); draw(); render();
+  });
+}
+
 /* ---------- Upload inbox: save files first, review details later ---------- */
 const pendingList = () => [...S.docs.filter(d => d.needsReview).map(d => ({ kind: 'doc', rec: d })), ...S.pos.filter(p => p.needsReview).map(p => ({ kind: 'po', rec: p }))]
   .sort((a, b) => (a.rec.createdAt || '').localeCompare(b.rec.createdAt || '') || (a.rec.fileName || '').localeCompare(b.rec.fileName || ''));
 function blankPO(extra = {}) { return { id: 'po_' + uid(), number: '', date: '', status: 'issued', vendor: '', vendorAddress: '', vendorContact: '', quoteId: '', quoteRef: '', items: [], taxRate: 0, shipping: 0, terms: '', deliveryDate: '', shipTo: '', notes: '', tags: [], linkedTxnIds: [], imported: true, createdAt: new Date().toISOString(), ...extra }; }
 async function uploadBatch(files) {
   if (!files.length) return;
+  const screened = await screenDuplicates(files);
+  const skipped = files.length - screened.length;
+  if (!screened.length) { toast(skipped ? `Nothing uploaded — ${skipped} duplicate${skipped > 1 ? 's' : ''} skipped` : 'Nothing to upload'); render(); return; }
+  files = screened.map(x => x.f); const hashes = screened.map(x => x.hash);
   const failed = []; let ok = 0; const batch = new Date().toISOString();
   for (let i = 0; i < files.length; i++) {
     const f = files[i]; toast(`Uploading ${i + 1} of ${files.length}: ${f.name}`, 120000);
@@ -1064,18 +1143,18 @@ async function uploadBatch(files) {
       if (g.type === 'po') {
         const p = blankPO({ number: g.number, needsReview: true, createdAt, fileName: f.name });
         const up = await store.upload(`accounting/pos/${p.id}/${safeId(f.name)}`, f);
-        p.file = { path: up.path, url: up.url, contentType: f.type || '', size: f.size };
+        p.file = { path: up.path, url: up.url, contentType: f.type || '', size: f.size, ...(hashes[i] ? { sha256: hashes[i] } : {}) };
         await persist('pos', p);
       } else {
         const d = { id: 'd_' + uid(), type: g.type, number: g.number, vendor: '', date: '', amount: '', status: DOC_STATUS[g.type][0], tags: [], description: '', items: [], linkedTxnIds: [], needsReview: true, createdAt, fileName: f.name };
         const up = await store.upload(`accounting/docs/${d.id}/${safeId(f.name)}`, f);
-        d.file = { path: up.path, url: up.url, contentType: f.type || '', size: f.size };
+        d.file = { path: up.path, url: up.url, contentType: f.type || '', size: f.size, ...(hashes[i] ? { sha256: hashes[i] } : {}) };
         await persist('docs', d);
       }
       ok++;
     } catch (e) { failed.push(f.name); DBG.err('upload failed: ' + f.name, e); }
   }
-  toast(`${ok} file${ok === 1 ? '' : 's'} uploaded${failed.length ? ` · ${failed.length} failed: ${failed.join(', ')}` : ''} — review details now or later`, failed.length ? 9000 : 3500);
+  toast(`${ok} file${ok === 1 ? '' : 's'} uploaded${skipped ? ` · ${skipped} duplicate${skipped > 1 ? 's' : ''} skipped` : ''}${failed.length ? ` · ${failed.length} failed: ${failed.join(', ')}` : ''} — review details now or later`, failed.length ? 9000 : 3500);
   UI.skipped = new Set(); render(); if (ok) reviewNext();
 }
 function reviewNext() {
@@ -1141,7 +1220,7 @@ function editDoc(d, file, rest = [], prefill = null) {
       <label class="full">Tags (comma-separated)<input id="dTags" value="${esc((d.tags || []).join(', '))}" placeholder="e.g. reagents, grant-A, CRO"></label>
       <label class="full">Description<textarea id="dDesc">${esc(d.description || '')}</textarea></label>
       <label class="full" id="itemsWrap">Line items <span class="muted">(used to generate POs)</span>${itemsEditor(d.items)}</label>
-      <label class="full">${file || d.file ? 'File' : 'Attach file (optional)'}${d.file ? `<div class="small">${esc(d.fileName)} <button class="b sm" id="dView" type="button">View</button></div>` : ''}${!file ? `<input type="file" id="dFile">` : `<div class="small">${esc(file.name)} · ${(file.size / 1024).toFixed(0)} KB</div>`}</label>
+      <label class="full">${file || d.file ? 'File' : 'Attach file (optional)'}${d.file ? `<div class="small">${esc(d.fileName)} <button class="b sm" id="dView" type="button">View</button> <button class="b sm danger" id="dRmFile" type="button">Remove file</button> <span class="muted">— or choose a file below to replace it</span></div>` : ''}${!file ? `<input type="file" id="dFile"><div class="small" id="dDupWarn" style="color:var(--warn)"></div>` : `<div class="small">${esc(file.name)} · ${(file.size / 1024).toFixed(0)} KB</div>`}</label>
       <label class="full">Link to bank transactions <span class="sugg" id="suggNote"></span>
         <input id="txSearch" placeholder="Search transactions by description or amount">
         <div class="linklist" id="txList"></div></label>
@@ -1180,6 +1259,15 @@ function editDoc(d, file, rest = [], prefill = null) {
   drawTx();
   $('#dView', body)?.addEventListener('click', () => openFile(d));
   $('#dSkip', body)?.addEventListener('click', () => queueFiles(rest));
+  $('#dRmFile', body)?.addEventListener('click', async () => {
+    if (!confirm(`Remove ${d.fileName || 'the file'} from this ${DOC_TYPES[d.type].toLowerCase()}? The file is deleted from storage; the entry and its details stay.`)) return;
+    await removeAttachment('doc', d.id); const r = S.docs.find(x => x.id === d.id); render(); if (r) editDoc(r);
+  });
+  $('#dFile', body)?.addEventListener('change', async e => {
+    const f = e.target.files[0]; const w = $('#dDupWarn', body); w.textContent = ''; if (!f) return;
+    const ex = findDupFile(f.name, f.size, await fileHash(f), d.id);
+    if (ex) w.textContent = `⚠ This file is already attached to ${recLabel(ex)}. Saving will store a second copy.`;
+  });
   $('#dDel', body)?.addEventListener('click', async () => {
     if (!confirm('Delete this document' + (d.file ? ' and its file' : '') + '?')) return;
     if (d.file) await store.removeFile(d.file.path); await store.del('docs', d.id); S.docs = S.docs.filter(x => x.id !== d.id); if (reviewing) return reviewNext(); closeModal(); render();
@@ -1195,10 +1283,11 @@ function editDoc(d, file, rest = [], prefill = null) {
       delete d.needsReview;
       const f = file || $('#dFile', body)?.files[0];
       if (f) {
+        const h = await fileHash(f);
         if (d.file) await store.removeFile(d.file.path);
         const path = `accounting/docs/${d.id}/${safeId(f.name)}`;
         const up = await store.upload(path, f);
-        d.file = { path: up.path, url: up.url, contentType: f.type || '', size: f.size }; d.fileName = f.name;
+        d.file = { path: up.path, url: up.url, contentType: f.type || '', size: f.size, ...(h ? { sha256: h } : {}) }; d.fileName = f.name;
       }
       await persist('docs', d); toast('Saved ' + (DOC_TYPES[d.type] || 'document'));
       if (reviewing) return reviewNext();
@@ -1250,10 +1339,11 @@ async function showFile(i) {
   $('#vbar').innerHTML = `<button class="b sm" id="vPrev" ${i === 0 ? 'disabled' : ''}>‹ Prev</button><button class="b sm" id="vNext" ${i === list.length - 1 ? 'disabled' : ''}>Next ›</button><span class="small muted">${i + 1} / ${list.length}</span>
     <b>${VIEW_TYPES[d.type]} ${esc(d.number || '')}</b><span>${esc(d.vendor || '')}</span><span>${money(d.amount)}</span>${statusHTML(d)}${(d.tags || []).map(g => `<span class="chip">${esc(g)}</span>`).join('')}
     <span class="small muted">${d.kind === 'po' ? (S.docs.filter(x => x.poId === d.id).map(x => '🧾 ' + (x.number || x.vendor)).join(', ') || 'no invoices linked') : tx.length ? '💳 ' + tx.map(t => fmtDate(t.date) + ' ' + money(t.amount)).join(', ') : 'not linked to a transaction'}</span>
-    <span style="flex:1"></span><button class="b sm" id="vCopy" hidden title="Copy all text in this PDF">Copy text</button><button class="b sm" id="vEdit">Edit details</button><button class="b sm" id="vOpen">Open ↗</button>${d.type === 'quote' ? '<button class="b sm" id="vPO">→ PO</button>' : ''}`;
+    <span style="flex:1"></span><button class="b sm" id="vCopy" hidden title="Copy all text in this PDF">Copy text</button><button class="b sm" id="vEdit">Edit details</button><button class="b sm" id="vOpen">Open ↗</button><button class="b sm danger" id="vRm" title="Delete this file from storage; keep the entry">Remove file</button>${d.type === 'quote' ? '<button class="b sm" id="vPO">→ PO</button>' : ''}`;
   $('#vPrev').onclick = () => showFile(i - 1); $('#vNext').onclick = () => showFile(i + 1);
   $('#vEdit').onclick = () => d.kind === 'po' ? editPO(S.pos.find(x => x.id === d.id)) : editDoc(S.docs.find(x => x.id === d.id)); $('#vOpen').onclick = () => openFile(d);
   $('#vPO')?.addEventListener('click', () => editPO(null, d));
+  $('#vRm').onclick = async () => { if (!confirm(`Remove ${d.fileName || 'this file'} from ${recLabel({ kind: d.kind, rec: d })}? The entry and its details stay.`)) return; await removeAttachment(d.kind, d.id); render(); };
   const fr = $('#vframe'); fr.style.display = ''; fr.style.alignItems = ''; fr.innerHTML = '<span class="muted">Loading…</span>';
   const url = await store.fileUrl(d.file); if (lastBlobUrl && lastBlobUrl !== url && lastBlobUrl.startsWith('blob:')) URL.revokeObjectURL(lastBlobUrl); lastBlobUrl = url;
   if (UI.viewIdx !== i) return;
@@ -1319,7 +1409,7 @@ function editPO(p, quote, file = null, rest = [], prefill = null) {
       <label>PO total (used when there are no line items)<input type="number" step="0.01" id="pOver" value="${p.totalOverride || ''}"></label>
       <label><span>Total</span><div id="pTot" style="font-size:18px;font-weight:650;padding-top:4px"></div></label>
       <label class="full">Notes / special instructions<textarea id="pNotes">${esc(p.notes || '')}</textarea></label>
-      <label class="full">PO document ${p.file ? `<div class="small">${esc(p.fileName)} <button class="b sm" id="pView" type="button">View</button> — choose a file below to replace it</div>` : ''}${file ? `<div class="small">${esc(file.name)} · ${(file.size / 1024).toFixed(0)} KB</div>` : `<input type="file" id="pFile" accept=".pdf,image/*,.doc,.docx,.xls,.xlsx">`}</label>
+      <label class="full">PO document ${p.file ? `<div class="small">${esc(p.fileName)} <button class="b sm" id="pView" type="button">View</button> <button class="b sm danger" id="pRmFile" type="button">Remove file</button> <span class="muted">— or choose a file below to replace it</span></div>` : ''}${file ? `<div class="small">${esc(file.name)} · ${(file.size / 1024).toFixed(0)} KB</div>` : `<input type="file" id="pFile" accept=".pdf,image/*,.doc,.docx,.xls,.xlsx"><div class="small" id="pDupWarn" style="color:var(--warn)"></div>`}</label>
     </div>
     <datalist id="poVendList">${vendors.map(v => `<option value="${esc(v)}">`).join('')}</datalist>
     <div class="mfoot">${!isNew ? '<button class="b danger" id="pDelBtn">Delete</button>' : ''}<span style="flex:1"></span>${rest.length ? '<button class="b" id="pSkip">Skip file</button>' : ''}<button class="b" data-close>Cancel</button>${file || p.imported ? `<button class="b pri" id="pSave">${rest.length ? 'Save &amp; next' : 'Save'}</button>` : '<button class="b" id="pSave">Save</button><button class="b pri" id="pSavePdf">Save &amp; download PDF</button>'}</div>`, { wide: true });
@@ -1343,9 +1433,10 @@ function editPO(p, quote, file = null, rest = [], prefill = null) {
     try {
       const f = file || $('#pFile', body)?.files[0];
       if (f) {
+        const h = await fileHash(f);
         if (p.file) await store.removeFile(p.file.path);
         const up = await store.upload(`accounting/pos/${p.id}/${safeId(f.name)}`, f);
-        p.file = { path: up.path, url: up.url, contentType: f.type || '', size: f.size }; p.fileName = f.name;
+        p.file = { path: up.path, url: up.url, contentType: f.type || '', size: f.size, ...(h ? { sha256: h } : {}) }; p.fileName = f.name;
       }
       await persist('pos', p);
     } catch (e) { if (reviewing) p.needsReview = true; btn.disabled = false; btn.textContent = 'Save'; DBG.err('PO save failed', e); toast('Save failed: ' + (e.code || e.message), 6000); return; }
@@ -1358,6 +1449,15 @@ function editPO(p, quote, file = null, rest = [], prefill = null) {
   $('#pSave', body).onclick = () => save(false); $('#pSavePdf', body)?.addEventListener('click', () => save(true));
   $('#pSkip', body)?.addEventListener('click', () => queuePOFiles(rest));
   $('#pView', body)?.addEventListener('click', () => openFile(p));
+  $('#pRmFile', body)?.addEventListener('click', async () => {
+    if (!confirm(`Remove ${p.fileName || 'the file'} from ${p.number || 'this PO'}? The file is deleted from storage; the PO and its details stay.`)) return;
+    await removeAttachment('po', p.id); const r = S.pos.find(x => x.id === p.id); render(); if (r) editPO(r);
+  });
+  $('#pFile', body)?.addEventListener('change', async e => {
+    const f = e.target.files[0]; const w = $('#pDupWarn', body); w.textContent = ''; if (!f) return;
+    const ex = findDupFile(f.name, f.size, await fileHash(f), p.id);
+    if (ex) w.textContent = `⚠ This file is already attached to ${recLabel(ex)}. Saving will store a second copy.`;
+  });
   $('#pDelBtn', body)?.addEventListener('click', async () => { if (!confirm('Delete ' + p.number + (p.file ? ' and its file' : '') + '?')) return; if (p.file) await store.removeFile(p.file.path); await store.del('pos', p.id); S.pos = S.pos.filter(x => x.id !== p.id); if (reviewing) return reviewNext(); closeModal(); render(); });
 }
 function poPDF(p) {
