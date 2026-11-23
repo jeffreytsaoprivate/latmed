@@ -153,6 +153,15 @@ tr.pending td:first-child{box-shadow:inset 3px 0 0 var(--warn)}
 .textLayer .endOfContent{display:block;position:absolute;inset:100% 0 0;z-index:-1;cursor:default;user-select:none}
 .textLayer.selecting .endOfContent{top:0}
 .pdfNoText{font-size:12px;color:var(--text-muted);text-align:center;padding:6px}
+/* document chain pills */
+.chain{display:flex;align-items:center;flex-wrap:nowrap;gap:2px;white-space:nowrap}
+.ch{font:inherit;font-size:11.5px;padding:2px 7px;border-radius:99px;border:1px solid var(--border);background:var(--surface-1);color:var(--text-secondary);cursor:pointer;line-height:1.4}
+.ch.ok{border-color:color-mix(in srgb,var(--good) 55%,transparent);color:var(--good);background:color-mix(in srgb,var(--good) 8%,transparent)}
+.ch.self{font-weight:700;color:var(--text-primary);cursor:default}
+.ch.miss{border:1px dashed var(--warn);color:var(--warn);font-weight:600;background:color-mix(in srgb,var(--warn) 8%,transparent)}
+.ch.miss:hover{background:color-mix(in srgb,var(--warn) 18%,transparent)}
+.ch.na{opacity:.5;cursor:default}
+.chsep{color:var(--text-muted);font-size:11px}
 @media (max-width:1000px){.split{grid-template-columns:1fr}.splitR{position:static;height:70vh}}
 @media (max-width:760px){.g2{grid-template-columns:1fr}.viewer{grid-template-columns:1fr;height:auto}.vlist{max-height:200px}.vframe{height:60vh}}
 </style>
@@ -354,7 +363,7 @@ async function makeLocal() {
 /* ---------------- state ---------------- */
 let store = null;
 const S = { accounts: [], txns: [], docs: [], pos: [], settings: {...DEFAULT_SETTINGS} };
-const UI = { tab: location.hash.slice(1) || 'overview', range: LS.get('ledger.range', '12m'), tx: { acct:'', cls:'all', q:'', tag:'', from:'', to:'', link:'' }, sel: new Set(), docF: { type:'', status:'', q:'', tag:'' }, skipped: new Set(), viewIdx: 0, pendingImport: null };
+const UI = { tab: location.hash.slice(1) || 'overview', range: LS.get('ledger.range', '12m'), tx: { acct:'', cls:'all', q:'', tag:'', from:'', to:'', link:'' }, sel: new Set(), docF: { type:'', status:'', q:'', tag:'', chain:'' }, skipped: new Set(), viewIdx: 0, pendingImport: null };
 let docsByTxn = {};
 const charts = {};
 
@@ -373,6 +382,7 @@ function derive() {
     const pre = a.anchorDate ? list.filter(t => t.date <= a.anchorDate).reduce((s, t) => s + t.amount, 0) : 0;
     a._opening = (a.anchorBalance || 0) - pre;
     a._balance = a._opening + list.reduce((s, t) => s + t.amount, 0);
+    { let run = a._opening; for (const t of list) { run += t.amount; t._bal = run; } }
     a._count = list.length;
     a._last = list.length ? list[list.length - 1].date : null;
   }
@@ -596,12 +606,14 @@ function attention() {
   S.docs.filter(d => d.type === 'invoice' && d.status === 'paid' && !(d.linkedTxnIds || []).length).forEach(d => out.push(`<span class="status warn">● Unlinked</span> paid invoice ${esc(d.number || '')} · ${esc(d.vendor)} · ${money(d.amount)}`));
   const lg = +S.settings.largeTxn || 5000;
   S.txns.filter(t => Math.abs(t.amount) >= lg && !t.cls && !(t.tags || []).length && !t.category && !docsByTxn[t.id]).slice(-15).reverse().forEach(t => out.push(`<span class="status warn">● Untagged</span> ${fmtDate(t.date)} · ${esc(t.description)} · ${money(t.amount)}`));
+  const stn = S.txns.filter(isStale).length;
+  if (stn) out.unshift(`<span class="status crit">⚑ Not in statement</span> ${stn} transaction${stn > 1 ? 's' : ''} fall${stn > 1 ? '' : 's'} inside an imported statement period but ${stn > 1 ? 'are' : 'is'} not in the statement — Transactions → filter "Not in bank statement"`);
   const pn = pendingList().length;
   if (pn) out.unshift(`<span class="status warn">⚑ To review</span> ${pn} uploaded file${pn > 1 ? 's need' : ' needs'} details — <a href="#docs">Documents</a>`);
   const ur = S.docs.filter(d => d.type === 'receipt' && d.status !== 'reconciled' && !d.needsReview);
   if (ur.length) out.push(`<span class="status warn">● Receipts</span> ${ur.length} receipt${ur.length > 1 ? 's are' : ' is'} not linked to a bank/card transaction`);
-  const unp = S.txns.filter(t => t.cls === 'transfer' && !t.transferPairId && t.transferAcct !== '');
-  if (unp.length) out.push(`<span class="status warn">● Transfers</span> ${unp.length} internal transfer${unp.length > 1 ? 's have' : ' has'} no balancing account yet — filter Transactions by "Internal transfer" and click "⇄ choose other account…"`);
+  const unp = S.txns.filter(isUnmatchedTransfer);
+  if (unp.length) out.push(`<span class="status warn">● Transfers</span> ${unp.length} internal transfer${unp.length > 1 ? 's have' : ' has'} no balancing entry yet — Transactions → filter "Unmatched transfers"`);
   if (!out.length) return `<div class="muted small"><span class="status good">✓</span> Nothing needs attention.</div>`;
   return `<div class="feed" style="max-height:300px">${out.map(o => `<div class="ev">${o}</div>`).join('')}</div>`;
 }
@@ -752,63 +764,78 @@ function autoLinkReview() {
 }
 
 /* ======================= INTERNAL TRANSFERS ======================= */
+/* A transfer is never balanced by an invented entry: it is paired with the real opposite transaction in the
+   other account, or flagged until that transaction is imported. */
 const acctName = id => acctById(id)?.name || 'unknown account';
-/* Remove t's pairing; auto-created balancing entries are deleted, real ones are just unpaired. */
+const isUntracked = t => t.transferAcct === 'untracked' || (t.transferAcct === '' && t.transferPairId === '');
 async function clearTransferPair(t) {
   const pid = t.transferPairId; if (!pid) return;
   const other = S.txns.find(x => x.id === pid);
   t.transferPairId = '';
   if (other) {
-    if (other.autoTransfer) { await store.del('txns', other.id); S.txns = S.txns.filter(x => x.id !== other.id); DBG.info('transfer: removed balancing entry ' + other.id); }
+    if (other.autoTransfer) { await store.del('txns', other.id); S.txns = S.txns.filter(x => x.id !== other.id); DBG.info('transfer: removed legacy auto-created entry ' + other.id); }
     else { other.transferPairId = ''; await persist('txns', other); }
   }
 }
-/* Ask which account the money went to / came from; pair with an existing opposite entry or create a balancing one. */
+/* Candidate balancing entries for t: opposite amount, another account, within 10 days, not already paired. */
+function transferMatches(t, acctId) {
+  return S.txns.filter(x => x.id !== t.id && x.accountId !== t.accountId && (!acctId || x.accountId === acctId) && !x.autoTransfer
+      && (!x.transferPairId || x.transferPairId === t.id) && Math.abs(x.amount + t.amount) < 0.01
+      && Math.abs(ts(x.date) - ts(t.date)) <= 10 * 864e5 && (!x.cls || x.cls === 'transfer'))
+    .sort((a, b) => ((b.id === t.transferPairId) - (a.id === t.transferPairId)) || ((b.cls === 'transfer') - (a.cls === 'transfer'))
+      || (TRANSFER_RE.test(b.description) - TRANSFER_RE.test(a.description)) || Math.abs(ts(a.date) - ts(t.date)) - Math.abs(ts(b.date) - ts(t.date)));
+}
+/* Pair every unmatched transfer that has one clear balancing entry. Returns the number of pairs made. */
+async function autoPairTransfers() {
+  const changed = []; let n = 0;
+  for (const t of S.txns) {
+    if (t.cls !== 'transfer' || t.transferPairId || isUntracked(t)) continue;
+    const c = transferMatches(t, t.transferAcct && t.transferAcct !== 'untracked' ? t.transferAcct : null).filter(x => !x.transferPairId);
+    if (!c.length || (c.length > 1 && !(c[0].cls === 'transfer' && c[1].cls !== 'transfer'))) continue;
+    const m = c[0];
+    Object.assign(t, { transferPairId: m.id, transferAcct: m.accountId });
+    Object.assign(m, { cls: 'transfer', transferPairId: t.id, transferAcct: t.accountId });
+    changed.push(t, m); n++;
+  }
+  if (changed.length) { await persistMany('txns', changed); DBG.info(`transfers: auto-paired ${n}`); }
+  return n;
+}
 function transferDialog(t, onDone) {
   const others = S.accounts.filter(a => a.id !== t.accountId);
   const cur = t.transferPairId ? S.txns.find(x => x.id === t.transferPairId) : null;
   const dir = t.amount < 0 ? 'to' : 'from';
+  const guess = cur?.accountId || (t.transferAcct && t.transferAcct !== 'untracked' ? t.transferAcct : '') || transferMatches(t)[0]?.accountId || others[0]?.id || 'untracked';
   const body = modal('Internal transfer', `
     <div class="banner"><b>${esc(t.description)}</b><br><span class="small">${fmtDate(t.date)} · ${esc(acctName(t.accountId))} · <b>${money(t.amount)}</b></span></div>
     <div class="form" style="margin-top:12px">
       <label class="full">Money moved ${dir} which account?
-        <select id="xAcct">${others.map(a => `<option value="${a.id}" ${(cur?.accountId || t.transferAcct) === a.id ? 'selected' : ''}>${esc(a.name)}${a.last4 ? ' ··' + esc(a.last4) : ''} (${esc(a.type)})</option>`).join('')}<option value="">Not tracked in Ledger — no balancing entry</option></select></label>
+        <select id="xAcct">${others.map(a => `<option value="${a.id}" ${guess === a.id ? 'selected' : ''}>${esc(a.name)}${a.last4 ? ' ··' + esc(a.last4) : ''} (${esc(a.type)})</option>`).join('')}<option value="untracked" ${guess === 'untracked' ? 'selected' : ''}>An account not tracked in Ledger</option></select></label>
       <div class="full" id="xOpts"></div>
     </div>
-    ${!others.length ? '<div class="small muted">Tip: add the other account on Accounts &amp; import to keep both sides balanced.</div>' : ''}
-    <div class="mfoot"><button class="b" data-close id="xCancel">Cancel</button><button class="b pri" id="xGo">Save transfer</button></div>`);
+    <div class="mfoot"><button class="b" id="xCancel">Cancel</button><button class="b pri" id="xGo">Save transfer</button></div>`);
   const draw = () => {
     const aid = $('#xAcct', body).value;
-    if (!aid) { $('#xOpts', body).innerHTML = '<div class="small muted">The transaction is marked as an internal transfer (excluded from income/spending) with no entry in another account.</div>'; return; }
-    const cands = S.txns.filter(x => x.accountId === aid && x.id !== t.id && Math.abs(x.amount + t.amount) < 0.01 && Math.abs(ts(x.date) - ts(t.date)) <= 10 * 864e5 && (!x.transferPairId || x.transferPairId === t.id))
-      .sort((a, b) => Math.abs(ts(a.date) - ts(t.date)) - Math.abs(ts(b.date) - ts(t.date)));
-    const pre = cands.find(x => x.id === t.transferPairId) || cands.find(x => !x.autoTransfer) || null;
-    $('#xOpts', body).innerHTML = `<div class="small" style="color:var(--text-secondary);margin-bottom:6px">Balancing entry in <b>${esc(acctName(aid))}</b> (${money(-t.amount)}):</div>
-      <div class="linklist">${cands.map(x => `<label><input type="radio" name="xPick" value="${x.id}" ${pre?.id === x.id ? 'checked' : ''}> ${x.autoTransfer ? '<span class="chip">auto-created</span>' : '<span class="sugg">EXISTING</span>'} ${fmtDate(x.date)} · ${esc(x.description)}<span class="amt">${money(x.amount)}</span></label>`).join('')}
-      <label><input type="radio" name="xPick" value="__new" ${pre ? '' : 'checked'}> <b>Create</b> a balancing entry on ${fmtDate(t.date)}<span class="amt">${money(-t.amount)}</span></label></div>
-      <div class="small muted" style="margin-top:6px">If you later import a statement for that account, Ledger swaps an auto-created entry for the real one.</div>`;
+    if (aid === 'untracked') { $('#xOpts', body).innerHTML = '<div class="small muted">Marked as an internal transfer (left out of income and spending). The other side isn\'t in Ledger, so nothing is flagged.</div>'; return; }
+    const cands = transferMatches(t, aid);
+    $('#xOpts', body).innerHTML = cands.length ? `<div class="small" style="color:var(--text-secondary);margin-bottom:6px">Balancing entry in <b>${esc(acctName(aid))}</b> (${money(-t.amount)}, within 10 days):</div>
+      <div class="linklist">${cands.map((x, i) => `<label><input type="radio" name="xPick" value="${x.id}" ${i === 0 ? 'checked' : ''}> ${x.id === t.transferPairId ? '<span class="sugg">CURRENT</span>' : '<span class="sugg">MATCH</span>'} ${fmtDate(x.date)} · ${esc(x.description)}<span class="amt">${money(x.amount)}</span></label>`).join('')}</div>`
+      : `<div class="banner warn small">⚑ No matching entry in <b>${esc(acctName(aid))}</b> — looking for ${money(-t.amount)} within 10 days of ${fmtDate(t.date)}.<br>The transfer will be saved and <b>flagged</b>; Ledger pairs it automatically when you import that account's statement.</div>`;
   };
-  if (others.length) draw(); else $('#xAcct', body).value = '';
-  draw();
-  $('#xAcct', body).onchange = draw;
+  draw(); $('#xAcct', body).onchange = draw;
   $('#xCancel', body).onclick = () => { closeModal(); onDone?.(false); };
   $('#xGo', body).onclick = async () => {
     const btn = $('#xGo', body); btn.disabled = true;
     try {
       const aid = $('#xAcct', body).value; const pick = $('input[name=xPick]:checked', body)?.value;
-      const keep = pick && pick !== '__new' && pick === t.transferPairId;
-      if (!keep) await clearTransferPair(t);
+      if (pick !== t.transferPairId) await clearTransferPair(t);
       t.cls = 'transfer'; t.transferAcct = aid;
       const changed = [t];
-      if (aid && pick === '__new') {
-        const nb = { id: 'xfer_' + uid(), accountId: aid, date: t.date, amount: +(-t.amount).toFixed(2), description: `Transfer ${t.amount < 0 ? 'from' : 'to'} ${acctName(t.accountId)} — ${t.description}`, cls: 'transfer', transferAcct: t.accountId, transferPairId: t.id, manual: true, autoTransfer: true, tags: [], category: '', createdAt: new Date().toISOString() };
-        t.transferPairId = nb.id; changed.push(nb);
-      } else if (aid && pick) {
-        const o = S.txns.find(x => x.id === pick); if (o.transferPairId && o.transferPairId !== t.id) { const prev = S.txns.find(x => x.id === o.transferPairId); if (prev) { prev.transferPairId = ''; changed.push(prev); } }
+      if (pick && pick !== t.transferPairId) {
+        const o = S.txns.find(x => x.id === pick);
         Object.assign(o, { cls: 'transfer', transferPairId: t.id, transferAcct: t.accountId }); t.transferPairId = o.id; changed.push(o);
       }
       await persistMany('txns', changed);
-      closeModal(); toast(aid ? `Transfer balanced against ${acctName(aid)}` : 'Marked as internal transfer'); onDone?.(true); render();
+      closeModal(); toast(aid === 'untracked' ? 'Marked as internal transfer' : t.transferPairId ? `Transfer paired with ${acctName(aid)}` : `Saved — flagged until a matching entry appears in ${acctName(aid)}`, 4000); onDone?.(true); render();
     } catch (e) { btn.disabled = false; DBG.err('transfer save failed', e); toast('Save failed: ' + (e.code || e.message), 6000); }
   };
 }
@@ -818,40 +845,24 @@ async function changeType(t, cls) {
   if (t.cls === 'transfer') await clearTransferPair(t);
   t.cls = cls; t.transferAcct = ''; await persist('txns', t); toast('Saved'); render();
 }
+const isUnmatchedTransfer = t => t.cls === 'transfer' && !t.transferPairId && !isUntracked(t);
 function transferBadge(t) {
   if (t.cls !== 'transfer') return '';
   const o = t.transferPairId && S.txns.find(x => x.id === t.transferPairId);
-  if (o) return `<a href="#" class="xfer" title="Balanced by: ${esc(o.description)} (${money(o.amount)})">⇄ ${esc(acctName(o.accountId))}${o.autoTransfer ? ' (auto)' : ''}</a>`;
-  if (t.transferAcct === '' && t.transferPairId === '') return `<a href="#" class="xfer" title="Other account not tracked">⇄ untracked account</a>`;
-  return `<a href="#" class="xfer need">⇄ choose other account…</a>`;
-}
-/* On import: replace auto-created balancing entries with the real ones, and auto-pair obvious transfers. */
-function reconcileTransfers(fresh, acctId) {
-  const del = [], upd = [];
-  for (const f of fresh) {
-    const ph = S.txns.find(x => x.autoTransfer && x.accountId === acctId && !del.includes(x) && Math.abs(x.amount - f.amount) < 0.01 && Math.abs(ts(x.date) - ts(f.date)) <= 7 * 864e5);
-    if (ph) {
-      const origin = S.txns.find(x => x.id === ph.transferPairId);
-      Object.assign(f, { cls: 'transfer', transferPairId: origin?.id || '', transferAcct: origin?.accountId || '' });
-      if (origin) { origin.transferPairId = f.id; upd.push(origin); }
-      del.push(ph); continue;
-    }
-    if (f.cls === 'transfer') {
-      const o = S.txns.find(x => x.accountId !== acctId && !x.transferPairId && x.cls === 'transfer' && Math.abs(x.amount + f.amount) < 0.01 && Math.abs(ts(x.date) - ts(f.date)) <= 7 * 864e5 && !upd.includes(x));
-      if (o) { f.transferPairId = o.id; f.transferAcct = o.accountId; Object.assign(o, { transferPairId: f.id, transferAcct: acctId }); upd.push(o); }
-    }
-  }
-  return { del, upd };
+  if (o) return `<a href="#" class="xfer" title="Balanced by: ${esc(o.description)} (${money(o.amount)}, ${fmtDate(o.date)})">⇄ ${esc(acctName(o.accountId))}</a>`;
+  if (isUntracked(t)) return `<a href="#" class="xfer" title="Other account not tracked in Ledger">⇄ untracked account</a>`;
+  return `<a href="#" class="xfer need" title="No balancing entry found yet — click to choose the account or pick a match">⚑ no balancing entry${t.transferAcct && t.transferAcct !== 'untracked' ? ' in ' + esc(acctName(t.transferAcct)) : ''}</a>`;
 }
 
 /* ======================= TRANSACTIONS ======================= */
 function filteredTxns() {
   const f = UI.tx, q = f.q.toLowerCase();
   const cands = f.link === 'suggested' ? linkCandidates() : null;
-  return S.txns.filter(t => (!f.link || (f.link === 'linked' ? (docsByTxn[t.id] || []).length : f.link === 'unlinked' ? !(docsByTxn[t.id] || []).length : !(docsByTxn[t.id] || []).length && suggestionsFor(t, cands).length)) && (!f.acct || t.accountId === f.acct) && (f.cls === 'all' || (f.cls === 'untagged' ? (!t.cls && !(t.tags || []).length && !t.category) : (t.cls || '') === f.cls)) && (!f.tag || (t.tags || []).includes(f.tag)) && (!f.from || t.date >= f.from) && (!f.to || t.date <= f.to) && (!q || (t.description + ' ' + (t.notes || '') + ' ' + (t.category || '') + ' ' + t.amount).toLowerCase().includes(q)));
+  return S.txns.filter(t => (!f.link || (f.link === 'stale' ? isStale(t) : f.link === 'xfer' ? isUnmatchedTransfer(t) : f.link === 'linked' ? (docsByTxn[t.id] || []).length : f.link === 'unlinked' ? !(docsByTxn[t.id] || []).length : !(docsByTxn[t.id] || []).length && suggestionsFor(t, cands).length)) && (!f.acct || t.accountId === f.acct) && (f.cls === 'all' || (f.cls === 'untagged' ? (!t.cls && !(t.tags || []).length && !t.category) : (t.cls || '') === f.cls)) && (!f.tag || (t.tags || []).includes(f.tag)) && (!f.from || t.date >= f.from) && (!f.to || t.date <= f.to) && (!q || (t.description + ' ' + (t.notes || '') + ' ' + (t.category || '') + ' ' + t.amount).toLowerCase().includes(q)));
 }
 function vTxns(root) {
-  const f = UI.tx; const rows = filteredTxns().slice().reverse(); const shown = rows.slice(0, 600);
+  const f = UI.tx; if (f.link === 'stale' && !S.txns.some(isStale)) { f.link = ''; f.acct = ''; }
+  const rows = filteredTxns().slice().reverse(); const shown = rows.slice(0, 600);
   const total = rows.reduce((s, t) => s + t.amount, 0);
   root.innerHTML = `${banner()}
   <div class="card">
@@ -859,7 +870,7 @@ function vTxns(root) {
       <select id="fAcct"><option value="">All accounts</option>${S.accounts.map(a => `<option value="${a.id}" ${f.acct === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select>
       <select id="fCls">${[['all','All types'],['','Operating'],['capital','Capital (±)'],['transfer','Internal transfer'],['untagged','Untagged']].map(([v, l]) => `<option value="${v}" ${f.cls === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
       <select id="fTag"><option value="">Any tag</option>${allTags().map(t => `<option ${f.tag === t ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>
-      <select id="fLink">${[['', 'Linked or not'], ['linked', 'Linked to docs'], ['unlinked', 'Not linked'], ['suggested', 'Has suggested match']].map(([v, l]) => `<option value="${v}" ${f.link === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+      <select id="fLink">${[['', 'Linked or not'], ['linked', 'Linked to docs'], ['unlinked', 'Not linked'], ['suggested', 'Has suggested match'], ['xfer', '⚑ Unmatched transfers'], ['stale', '⚑ Not in bank statement']].map(([v, l]) => `<option value="${v}" ${f.link === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
       <input type="date" id="fFrom" value="${f.from}" title="From"><input type="date" id="fTo" value="${f.to}" title="To">
       <input id="fQ" placeholder="Search description, notes, amount" value="${esc(f.q)}" class="grow">
       <button class="b" id="autoLink" title="Find transactions that clearly match a quote, invoice or PO">🔗 Auto-link matches</button>
@@ -872,14 +883,16 @@ function vTxns(root) {
       <input id="bCat" placeholder="category" style="width:140px"><button class="b sm" id="bCatGo">Set category</button>
       <button class="b sm" id="bClear">Clear selection</button>
     </div>
+    ${(() => { const st = S.txns.filter(isStale); return st.length ? `<div class="banner warn" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span>⚑ <b>${st.length} entr${st.length > 1 ? 'ies are' : 'y is'} not in the bank statement</b> covering ${st.length > 1 ? 'their' : 'its'} dates.</span><span style="flex:1"></span>${f.link === 'stale' ? `<button class="b danger" id="stDelAll">Delete all ${st.length}</button>` : '<button class="b" id="stShow">Show them</button>'}</div>` : ''; })()}
     <div class="small muted" style="margin-bottom:6px">${rows.length} transactions · net ${money(total)}${rows.length > shown.length ? ` · showing latest ${shown.length}` : ''}</div>
-    <div class="tw"><table><thead><tr><th><input type="checkbox" id="selAll"></th><th>Date</th><th>Account</th><th>Description</th><th class="r">Amount</th><th>Type</th><th>Tags / category</th><th>Quotes · invoices · POs</th><th></th></tr></thead><tbody>
+    <div class="tw"><table><thead><tr><th><input type="checkbox" id="selAll"></th><th>Date</th><th>Account</th><th>Description</th><th class="r">Amount</th><th class="r" title="Running balance of this transaction's account, after the transaction">Balance</th><th>Type</th><th>Tags / category</th><th>Quotes · invoices · POs</th><th></th></tr></thead><tbody>
     ${(() => { const cands = linkCandidates(); return shown.map(t => { const ds = docsByTxn[t.id] || []; const sg = ds.length ? [] : suggestionsFor(t, cands); return `<tr data-id="${t.id}">
       <td><input type="checkbox" class="sel" ${UI.sel.has(t.id) ? 'checked' : ''}></td>
       <td style="white-space:nowrap">${fmtDate(t.date)}</td>
       <td class="small muted">${esc(acctById(t.accountId)?.name || '?')}</td>
-      <td>${esc(t.description)}${t.notes ? `<div class="small muted">${esc(t.notes)}</div>` : ''}</td>
+      <td>${esc(t.description)}${t.notes ? `<div class="small muted">${esc(t.notes)}</div>` : ''}${isStale(t) ? `<div class="small" style="color:var(--crit);font-weight:600">⚑ Not in bank statement ${esc(t.notInStatement.file || '')} (${fmtDate(t.notInStatement.from)} – ${fmtDate(t.notInStatement.to)}) <button class="b sm danger stDel">Delete</button> <button class="b sm stKeep" title="Keep it and stop flagging it">Keep</button></div><div class="small muted">${staleNote(t)}</div>` : ''}</td>
       <td class="r" style="white-space:nowrap">${money(t.amount)}</td>
+      <td class="r small" style="white-space:nowrap;color:var(--text-secondary)" title="${esc(acctById(t.accountId)?.name || '')} balance after this transaction">${t._bal != null ? money(t._bal) : ''}</td>
       <td><select class="clsSel" style="padding:2px 4px;font-size:12px">${Object.entries(CLASSES).map(([v, l]) => `<option value="${v}" ${(t.cls || '') === v ? 'selected' : ''}>${v === 'capital' ? (t.cls === 'capital' ? capLabel(t) : 'Capital') : l}</option>`).join('')}</select>${transferBadge(t)}</td>
       <td>${t.category ? `<span class="chip" style="font-weight:600">${esc(t.category)}</span>` : ''}${(t.tags || []).map(g => `<span class="chip">${esc(g)}</span>`).join('')}</td>
       <td class="small" style="min-width:150px">${linkChips(t)}${sg.length ? `<button class="b sm linkTx" style="border-color:var(--accent);color:var(--accent);font-weight:600" title="${esc(sg.slice(0, 3).map(x => x.c.typeLabel + ' ' + x.c.number + ' · ' + x.c.vendor + ' (' + x.why.join(', ') + ')').join('\n'))}">🔗 ${sg.length} match${sg.length > 1 ? 'es' : ''}</button>` : `<button class="b sm linkTx" title="Link to quotes, invoices or POs">🔗${ds.length ? '' : ' Link'}</button>`}</td>
@@ -893,6 +906,8 @@ function vTxns(root) {
   $('#fTag').onchange = e => { f.tag = e.target.value; rf(); };
   $('#fLink').onchange = e => { f.link = e.target.value; rf(); };
   $('#autoLink').onclick = () => autoLinkReview();
+  $('#stShow')?.addEventListener('click', () => { f.link = 'stale'; rf(); });
+  $('#stDelAll')?.addEventListener('click', async () => { const st = S.txns.filter(isStale); if (!confirm(`Delete all ${st.length} entries that aren't in their bank statements? Type, tags and document links move to the matching statement entry where there is one.`)) return; const r = await deleteStale(st); f.link = ''; toast(`Deleted ${r.deleted}${r.moved ? ` · details moved to ${r.moved} statement entr${r.moved > 1 ? 'ies' : 'y'}` : ''}`, 5000); rf(); });
   $('#fFrom').onchange = e => { f.from = e.target.value; rf(); };
   $('#fTo').onchange = e => { f.to = e.target.value; rf(); };
   let qh; $('#fQ').oninput = e => { clearTimeout(qh); qh = setTimeout(() => { f.q = e.target.value; rf(); setTimeout(() => { const i = $('#fQ'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }); }, 300); };
@@ -907,6 +922,8 @@ function vTxns(root) {
     const tr = e.target.closest('tr'); if (e.target.classList.contains('editTx')) editTxn(S.txns.find(x => x.id === tr.dataset.id));
     if (e.target.closest('.linkTx')) linkPicker(S.txns.find(x => x.id === tr.dataset.id));
     if (e.target.closest('.xfer')) { e.preventDefault(); transferDialog(S.txns.find(x => x.id === tr.dataset.id)); }
+    if (e.target.classList.contains('stDel')) { const t = S.txns.find(x => x.id === tr.dataset.id); if (confirm(`Delete "${t.description}" (${money(t.amount)}, ${fmtDate(t.date)})? It isn't in the bank statement for that period.`)) deleteStale([t]).then(r => { toast(r.moved ? 'Deleted — details moved to the statement entry' : 'Deleted'); render(); }); }
+    if (e.target.classList.contains('stKeep')) { const t = S.txns.find(x => x.id === tr.dataset.id); delete t.notInStatement; t.keepDespiteStatement = true; persist('txns', t).then(() => { toast('Kept — won\'t be flagged again'); render(); }); }
     const ol = e.target.closest('.openLink'); if (ol) { e.preventDefault(); const it = linkCandidates().find(c => c.id === ol.dataset.id); if (it?.file) openDocViewer(it.id); else if (it) it.kind === 'po' ? editPO(it.rec) : editDoc(it.rec); }
   });
   const bulk = async fn => { const list = S.txns.filter(t => UI.sel.has(t.id)); list.forEach(fn); await persistMany('txns', list); toast(`Updated ${list.length}`); rf(); };
@@ -914,7 +931,7 @@ function vTxns(root) {
     const v = $('#bCls').value; const list = S.txns.filter(t => UI.sel.has(t.id));
     for (const t of list) if (t.cls === 'transfer' && v !== 'transfer') await clearTransferPair(t);
     await bulk(t => { t.cls = v; if (v !== 'transfer') t.transferAcct = ''; });
-    if (v === 'transfer') toast(`Marked ${list.length} as transfers — use "⇄ choose other account…" on each row to add the balancing side`, 5000);
+    if (v === 'transfer') { const n = await autoPairTransfers(); render(); const u = list.filter(isUnmatchedTransfer).length; toast(`Marked ${list.length} as transfers${n ? ` · ${n} paired automatically` : ''}${u ? ` · ${u} flagged (no balancing entry found)` : ''}`, 5000); }
   };
   $('#bTagGo').onclick = () => { const g = $('#bTag').value.trim(); if (g) bulk(t => t.tags = [...new Set([...(t.tags || []), g])]); };
   $('#bCatGo').onclick = () => bulk(t => t.category = $('#bCat').value.trim());
@@ -967,12 +984,108 @@ function filteredDocs() {
 }
 function statusCls(s) { return { reconciled: 'good', unreconciled: 'warn', paid: 'good', accepted: 'good', received: 'good', closed: 'good', unpaid: 'warn', open: 'warn', issued: 'warn', 'partially received': 'warn', rejected: 'crit', void: 'crit', expired: 'crit', cancelled: 'crit' }[s] || ''; }
 function statusHTML(d) { if (d.needsReview) return '<span class="status warn">⚑ needs review</span>'; const od = d.type === 'invoice' && d.status === 'unpaid' && d.dueDate && d.dueDate < today(); return `<span class="status ${od ? 'crit' : statusCls(d.status)}">${od ? '⚠ overdue' : esc(d.status || '')}</span>`; }
+/* ---------- Document chain: Quote › PO › Invoice › Paid (bank/card transaction) ---------- */
+function chainOf(kind, r) {
+  let quotes = [], pos = [], invs = [];
+  if (kind === 'po') pos = [r];
+  else if (r.type === 'quote') { quotes = [r]; pos = S.pos.filter(p => p.quoteId === r.id); }
+  else if (r.type === 'invoice') { invs = [r]; const p = r.poId && S.pos.find(x => x.id === r.poId); if (p) pos = [p]; }
+  if (!quotes.length) quotes = [...new Set(pos.map(p => p.quoteId).filter(Boolean))].map(id => S.docs.find(d => d.id === id)).filter(Boolean);
+  if (kind === 'po' || r.type === 'quote') invs = S.docs.filter(d => d.type === 'invoice' && pos.some(p => p.id === d.poId));
+  const txIds = new Set([...quotes, ...pos, ...invs, ...(r.type === 'receipt' ? [r] : [])].flatMap(x => x.linkedTxnIds || []));
+  const txns = [...txIds].map(id => S.txns.find(t => t.id === id)).filter(Boolean);
+  const closed = (r.type === 'invoice' && r.status === 'void') || (kind === 'po' && r.status === 'cancelled') || (r.type === 'quote' && ['rejected', 'expired'].includes(r.status) && !pos.length);
+  const steps = r.type === 'receipt' ? [['self', 'Receipt', [r]], ['paid', 'Paid', txns]]
+    : r.type === 'other' ? []
+    : [['quote', 'Quote', quotes], ['po', 'PO', pos], ['invoice', 'Invoice', invs], ['paid', 'Paid', txns]].map(st => (st[0] === (kind === 'po' ? 'po' : r.type)) ? ['self', st[1], [r]] : st);
+  const missing = closed || r.needsReview ? [] : steps.filter(st => !st[2].length).map(st => st[0]);
+  return { quotes, pos, invs, txns, steps, closed, missing };
+}
+function chainHTML(kind, r) {
+  const c = chainOf(kind, r);
+  if (!c.steps.length) return '<span class="muted small">—</span>';
+  if (r.needsReview) return '<span class="muted small">review first</span>';
+  return `<div class="chain">${c.steps.map(([k, label, items]) => {
+    const ok = items.length > 0, cls = k === 'self' ? 'self' : ok ? 'ok' : c.closed ? 'na' : 'miss';
+    const title = k === 'self' ? 'This document' : ok ? items.map(x => x.date ? `${fmtDate(x.date)} · ${x.description || x.vendor || ''} ${money(x.amount ?? poTotals(x).total)}`.trim() : x.number || '').join('\n') : c.closed ? 'Closed — not expected' : `Not linked yet — click to link a ${label.toLowerCase()}`;
+    return `<button type="button" class="ch ${cls}" data-step="${k}" title="${esc(title)}">${ok ? '✓' : c.closed ? '–' : '○'} ${label}${ok && items.length > 1 ? ' ×' + items.length : ''}</button>`;
+  }).join('<span class="chsep">›</span>')}${c.closed ? '<span class="small muted"> closed</span>' : ''}</div>`;
+}
+/* Generic picker: click a row to choose it. */
+function pickDialog(title, intro, items, onPick, extraHTML = '') {
+  const body = modal(title, `<div class="small muted" style="margin-bottom:8px">${intro}</div>${extraHTML}
+    <input id="pkQ" placeholder="Search" style="width:100%;margin-bottom:8px">
+    <div class="linklist" id="pkList" style="max-height:55vh"></div>
+    <div class="mfoot"><button class="b" data-close>Cancel</button></div>`, { wide: true });
+  const draw = () => { const q = $('#pkQ', body).value.toLowerCase();
+    const L = items.filter(i => !q || i.search.toLowerCase().includes(q)).slice(0, 150);
+    $('#pkList', body).innerHTML = L.length ? L.map(i => `<label data-id="${i.id}" style="cursor:pointer">${i.score >= 50 ? '<span class="sugg">MATCH</span>' : ''} <span>${i.label}</span><span class="amt">${i.amount != null ? money(i.amount) : ''}</span></label>`).join('') : '<div class="muted small" style="padding:10px">Nothing to choose from.</div>'; };
+  draw(); $('#pkQ', body).oninput = draw;
+  $('#pkList', body).onclick = async e => { const row = e.target.closest('label[data-id]'); if (!row) return; e.preventDefault(); const it = items.find(i => i.id === row.dataset.id); await onPick(it); closeModal(); render(); };
+  return body;
+}
+function relScore(a, b) {
+  let s = 0; const va = tokens(a.vendor), vb = tokens(b.vendor);
+  if (va.length && va.some(w => vb.includes(w))) s += 45;
+  const x = Math.abs(+a.amount || (a.items ? poTotals(a).total : 0)), y = Math.abs(+b.amount || (b.items ? poTotals(b).total : 0));
+  if (x && y && Math.abs(x - y) <= Math.max(1, y * 0.02)) s += 40;
+  if (a.date && b.date && Math.abs(ts(a.date) - ts(b.date)) < 90 * 864e5) s += 10;
+  return s;
+}
+const docItem = (d, ref) => ({ id: d.id, rec: d, score: relScore(ref, d), amount: +d.amount || 0, label: `<b>${DOC_TYPES[d.type]}</b> ${esc(d.number || '')} · ${esc(d.vendor || d.fileName || '')} <span class="muted small">${fmtDate(d.date)} · ${esc(d.status || '')}</span>`, search: [d.vendor, d.number, d.amount, d.fileName].join(' ') });
+const poItem = (p, ref) => ({ id: p.id, rec: p, score: relScore(ref, p), amount: poTotals(p).total, label: `<b>PO</b> ${esc(p.number || '')} · ${esc(p.vendor || p.fileName || '')} <span class="muted small">${fmtDate(p.date)} · ${esc(p.status || '')}</span>`, search: [p.vendor, p.number, poTotals(p).total, p.fileName].join(' ') });
+const byScore = L => L.sort((a, b) => b.score - a.score || (b.rec.date || '').localeCompare(a.rec.date || ''));
+/* Fill one missing link in a document's chain. */
+function linkStep(kind, r, step) {
+  const c = chainOf(kind, r);
+  const setPOQuote = async (po, q) => { po.quoteId = q.id; po.quoteRef = q.number || ''; await persist('pos', po); if (q.status === 'open') { q.status = 'accepted'; await persist('docs', q); } toast(`Linked ${q.number || 'quote'} → ${po.number}`); };
+  const setInvPO = async (inv, po) => { inv.poId = po.id; await persist('docs', inv); toast(`Linked ${po.number} → ${inv.number || 'invoice'}`); };
+  if (step === 'quote') {
+    const po = c.pos[0];
+    if (!po) return toast('Link this invoice to its PO first — the quote attaches to the PO', 4500);
+    return pickDialog(`Quote for ${po.number}`, `Choose the quote that ${esc(po.number)} was issued against.`, byScore(S.docs.filter(d => d.type === 'quote').map(d => docItem(d, po))), it => setPOQuote(po, it.rec));
+  }
+  if (step === 'po') {
+    if (r.type === 'quote') {
+      const body = pickDialog(`PO for quote ${r.number || ''}`, 'Choose an existing PO that was issued for this quote, or create one from it.', byScore(S.pos.filter(p => !p.quoteId).map(p => poItem(p, r))), it => setPOQuote(it.rec, r), '<button class="b pri" id="pkNewPO" style="margin-bottom:8px">＋ Create a PO from this quote</button>');
+      $('#pkNewPO', body).onclick = () => editPO(null, r); return;
+    }
+    return pickDialog(`PO for invoice ${r.number || ''}`, 'Choose the PO this invoice bills against.', byScore(S.pos.filter(p => p.status !== 'cancelled').map(p => poItem(p, r))), it => setInvPO(r, it.rec));
+  }
+  if (step === 'invoice') {
+    const po = c.pos[0];
+    if (!po) return toast('Create or link a PO first — invoices attach to the PO', 4500);
+    return pickDialog(`Invoice for ${po.number}`, `Choose the invoice billed against ${esc(po.number)}.`, byScore(S.docs.filter(d => d.type === 'invoice' && !d.poId).map(d => docItem(d, po))), it => setInvPO(it.rec, po));
+  }
+  if (step === 'paid') {
+    const target = c.invs[0] ? ['doc', c.invs[0]] : c.pos[0] ? ['po', c.pos[0]] : ['doc', r];
+    return txnPicker(target[0], target[1]);
+  }
+}
+/* Link bank/card transactions to one document (ranked by amount, date, vendor). */
+function txnPicker(kind, rec) {
+  const item = () => linkItem(kind, (kind === 'po' ? S.pos : S.docs).find(x => x.id === rec.id) || rec);
+  const body = modal(`Payment for ${item().typeLabel} ${rec.number || ''}`, `
+    <div class="small muted" style="margin-bottom:8px">Tick the bank or card transaction(s) that paid ${esc(item().typeLabel.toLowerCase())} ${esc(rec.number || '')} · ${esc(rec.vendor || '')} · <b>${money(item().amount)}</b>. Saves immediately.</div>
+    <input id="tpQ" placeholder="Search description or amount" style="width:100%;margin-bottom:8px">
+    <div class="linklist" id="tpList" style="max-height:55vh"></div>
+    <div class="mfoot"><button class="b pri" id="tpDone">Done</button></div>`, { wide: true });
+  const draw = () => { const q = $('#tpQ', body).value.toLowerCase(); const it = item();
+    const L = S.txns.filter(t => t.cls !== 'transfer').map(t => ({ t, ...matchScore(t, it), on: it.linked.includes(t.id) }))
+      .filter(x => !q || (x.t.description + ' ' + x.t.amount).toLowerCase().includes(q)).sort((a, b) => (b.on - a.on) || (b.score - a.score) || b.t.date.localeCompare(a.t.date)).slice(0, 120);
+    $('#tpList', body).innerHTML = L.map(x => `<label><input type="checkbox" value="${x.t.id}" ${x.on ? 'checked' : ''}> ${x.score >= 50 && !x.on ? '<span class="sugg">MATCH</span>' : ''} ${fmtDate(x.t.date)} · ${esc(x.t.description)} <span class="muted small">${esc(acctName(x.t.accountId))}${x.score >= 50 ? ' · ' + x.why.join(', ') : ''}</span><span class="amt">${money(x.t.amount)}</span></label>`).join('') || '<div class="muted small" style="padding:10px">No transactions.</div>'; };
+  draw(); $('#tpQ', body).oninput = draw;
+  $('#tpList', body).onchange = async e => { const cb = e.target; cb.disabled = true; try { const note = await setLink(item(), cb.value, cb.checked); toast((cb.checked ? 'Linked' : 'Unlinked') + (note || '')); } catch { cb.checked = !cb.checked; } cb.disabled = false; draw(); };
+  $('#tpDone', body).onclick = () => { closeModal(); render(); };
+}
+
 function filteredAll() {
   const f = UI.docF, q = f.q.toLowerCase();
   const docs = f.type === 'po' ? [] : filteredDocs().map(d => ({ kind: 'doc', rec: d, type: d.type, date: d.date || '', amount: +d.amount || 0 }));
   const pos = f.type && f.type !== 'po' ? [] : S.pos.filter(p => (!f.status || (f.status === 'needs review' ? p.needsReview : p.status === f.status)) && (!f.tag || (p.tags || []).includes(f.tag)) && (!q || [p.vendor, p.number, p.notes, p.quoteRef, p.fileName, poTotals(p).total, (p.tags || []).join(' ')].join(' ').toLowerCase().includes(q)))
     .map(p => ({ kind: 'po', rec: p, type: 'po', date: p.date || '', amount: poTotals(p).total }));
-  return [...docs, ...pos].sort((a, b) => (!!b.rec.needsReview - !!a.rec.needsReview) || b.date.localeCompare(a.date));
+  const all = [...docs, ...pos].filter(x => !f.chain || (f.chain === 'gaps' ? chainOf(x.kind, x.rec).missing.length : !chainOf(x.kind, x.rec).missing.length && !x.rec.needsReview));
+  return all.sort((a, b) => (!!b.rec.needsReview - !!a.rec.needsReview) || b.date.localeCompare(a.date));
 }
 function vDocs(root) {
   const f = UI.docF; const rows = filteredAll();
@@ -995,18 +1108,20 @@ function vDocs(root) {
     </div>
   </div>
   ${pend.length ? `<div class="banner warn" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><span>⚑ <b>${pend.length} uploaded file${pend.length > 1 ? 's need' : ' needs'} details.</b> ${pend.length > 1 ? 'They are' : 'It is'} highlighted below — you can review them now or any time later.</span><span style="flex:1"></span><button class="b pri" id="rvGo">Review ${pend.length} pending</button></div>` : ''}
+  ${(() => { const g = [...S.docs.map(d => chainOf('doc', d)), ...S.pos.map(p => chainOf('po', p))].filter(c => c.missing.length).length; return g && f.chain !== 'gaps' ? `<div class="banner" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><span><b>${g} document${g > 1 ? 's have' : ' has'} missing links</b> in the Quote › PO › Invoice › Paid chain — shown as dashed orange steps. Click a step to link it.</span><span style="flex:1"></span><button class="b" id="gapGo">Show only these</button></div>` : ''; })()}
   <div class="kpis">${sum.map(([t, l, n, sub]) => `<div class="kpi" data-type="${t}" style="cursor:pointer;${f.type === t ? 'outline:2px solid var(--accent)' : ''}"><div class="l">${l}</div><div class="v">${n}</div><div class="n">${sub}</div></div>`).join('')}</div>
   <div class="card">
     <div class="toolbar">
       <select id="dType"><option value="">All types</option>${Object.entries(VIEW_TYPES).map(([v, l]) => `<option value="${v}" ${f.type === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
       <select id="dStatus"><option value="">Any status</option>${allStatus.map(s => `<option ${f.status === s ? 'selected' : ''}>${s}</option>`).join('')}</select>
       <select id="dTag"><option value="">Any tag</option>${allTags().map(t => `<option ${f.tag === t ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>
+      <select id="dChain">${[['', 'Any link status'], ['gaps', '○ Missing links'], ['complete', '✓ Fully linked']].map(([v, l]) => `<option value="${v}" ${f.chain === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
       <input id="dQ" class="grow" placeholder="Search vendor, number, description, file" value="${esc(f.q)}">
       <button class="b" id="findDups" title="Find files stored more than once">Find duplicates</button>
       <button class="b" onclick="location.hash='files'">Open file browser</button>
     </div>
     <div class="small muted" style="margin-bottom:6px">${rows.length} items · ${money(rows.reduce((s, r) => s + r.amount, 0))}</div>
-    <div class="tw"><table><thead><tr><th>Type</th><th>Date</th><th>Vendor</th><th>No.</th><th class="r">Amount</th><th>Status</th><th>Tags</th><th>Links</th><th></th></tr></thead><tbody>
+    <div class="tw"><table><thead><tr><th>Type</th><th>Date</th><th>Vendor</th><th>No.</th><th class="r">Amount</th><th>Status</th><th>Tags</th><th title="Quote › PO › Invoice › Paid (bank/card transaction). Dashed orange = not linked yet — click to link.">Quote › PO › Invoice › Paid</th><th></th></tr></thead><tbody>
     ${rows.map(r => {
       const d = r.rec; const tx = (d.linkedTxnIds || []).map(id => S.txns.find(t => t.id === id)).filter(Boolean);
       const txHTML = tx.map(t => `💳 ${fmtDate(t.date)} ${money(t.amount)}`).join('<br>');
@@ -1015,14 +1130,14 @@ function vDocs(root) {
         return `<tr data-id="${d.id}" data-kind="po" class="${d.needsReview ? 'pending' : ''}"><td><b>Purchase order</b>${d.imported ? '<div class="small muted">uploaded</div>' : ''}</td><td style="white-space:nowrap">${fmtDate(d.date)}</td>
           <td>${d.needsReview && !d.vendor ? `<span class="muted">${esc(d.fileName || '')}</span>` : esc(d.vendor)}${d.notes ? `<div class="small muted">${esc(d.notes).slice(0, 120)}</div>` : ''}</td><td>${esc(d.number)}</td><td class="r">${money(r.amount)}</td>
           <td>${d.needsReview ? '<span class="status warn">⚑ needs review</span>' : `<span class="status ${statusCls(d.status)}">${esc(d.status)}</span>`}</td><td>${(d.tags || []).map(g => `<span class="chip">${esc(g)}</span>`).join('')}</td>
-          <td class="small">${[q ? `📝 quote ${esc(q.number || q.vendor)}` : '', inv.length ? `🧾 ${inv.length} invoice${inv.length > 1 ? 's' : ''} · ${money(inv.reduce((s, x) => s + (+x.amount || 0), 0))}` : '', txHTML].filter(Boolean).join('<br>')}</td>
+          <td>${chainHTML('po', d)}${inv.length ? `<div class="small muted">${inv.length} invoice${inv.length > 1 ? 's' : ''} · ${money(inv.reduce((s, x) => s + (+x.amount || 0), 0))}</div>` : ''}</td>
           <td style="white-space:nowrap">${d.file ? '<button class="b sm view">View</button> ' : ''}<button class="b sm pdf" title="Generate a PDF from these details">PDF</button> <button class="b sm edit">Edit</button></td></tr>`;
       }
       const po = d.poId && S.pos.find(p => p.id === d.poId); const pos = S.pos.filter(p => p.quoteId === d.id);
       return `<tr data-id="${d.id}" data-kind="doc" class="${d.needsReview ? 'pending' : ''}"><td><b>${DOC_TYPES[d.type]}</b>${d.needsReview ? '<div class="small muted">guessed</div>' : ''}</td><td style="white-space:nowrap">${fmtDate(d.date)}${d.dueDate && d.type !== 'receipt' ? `<div class="small muted">${d.type === 'quote' ? 'valid to' : 'due'} ${fmtDate(d.dueDate)}</div>` : ''}</td>
         <td>${d.needsReview && !d.vendor ? `<span class="muted">${esc(d.fileName || '')}</span>` : esc(d.vendor)}${d.description ? `<div class="small muted">${esc(d.description).slice(0, 120)}</div>` : ''}</td><td>${esc(d.number || '')}</td>
         <td class="r">${money(d.amount)}</td><td>${statusHTML(d)}</td><td>${(d.tags || []).map(g => `<span class="chip">${esc(g)}</span>`).join('')}</td>
-        <td class="small">${[txHTML, po ? `📄 ${esc(po.number)}` : '', ...pos.map(p => `📄 ${esc(p.number)}`)].filter(Boolean).join('<br>')}</td>
+        <td>${chainHTML('doc', d)}</td>
         <td style="white-space:nowrap">${d.file ? '<button class="b sm view">View</button> ' : ''}<button class="b sm edit">Edit</button> ${d.type === 'quote' ? '<button class="b sm mkpo">→ PO</button>' : ''}</td></tr>`;
     }).join('') || '<tr><td colspan="9" class="muted">Nothing here yet — drop files above.</td></tr>'}
     </tbody></table></div>
@@ -1042,6 +1157,8 @@ function vDocs(root) {
   $('#dType').onchange = e => { f.type = e.target.value; rf(); };
   $('#dStatus').onchange = e => { f.status = e.target.value; rf(); };
   $('#dTag').onchange = e => { f.tag = e.target.value; rf(); };
+  $('#dChain').onchange = e => { f.chain = e.target.value; rf(); };
+  $('#gapGo')?.addEventListener('click', () => { f.chain = 'gaps'; rf(); });
   let qh; $('#dQ').oninput = e => { clearTimeout(qh); qh = setTimeout(() => { f.q = e.target.value; rf(); setTimeout(() => { const i = $('#dQ'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }); }, 300); };
   root.querySelector('tbody').addEventListener('click', e => {
     const tr = e.target.closest('tr[data-id]'); if (!tr) return;
@@ -1050,6 +1167,14 @@ function vDocs(root) {
     if (e.target.classList.contains('view')) openDocViewer(r.id);
     if (e.target.classList.contains('pdf')) poPDF(r);
     if (e.target.classList.contains('mkpo')) editPO(null, r);
+    const ch = e.target.closest('.ch');
+    if (ch) {
+      const k = isPO ? 'po' : 'doc', step = ch.dataset.step;
+      if (ch.classList.contains('miss')) return linkStep(k, r, step);
+      if (ch.classList.contains('ok')) { const c = chainOf(k, r);
+        if (step === 'quote') editDoc(c.quotes[0]); else if (step === 'po') editPO(c.pos[0]); else if (step === 'invoice') editDoc(c.invs[0]);
+        else if (step === 'paid') { const tgt = c.invs[0] ? ['doc', c.invs[0]] : c.pos[0] ? ['po', c.pos[0]] : [k, r]; txnPicker(tgt[0], tgt[1]); } }
+    }
   });
 }
 /* ---------- Attached files: fingerprints, duplicate detection, removal ---------- */
@@ -1577,7 +1702,8 @@ function parseBankCSV(text) {
   });
   const sm = text.match(/Ending balance as of (\d{1,2}\/\d{1,2}\/\d{4})[",\s]*\$?"?(-?[\d,]+\.\d{2})/i);
   if (sm) anchor = { date: parseDate(sm[1]), balance: num(sm[2]) };
-  return { txns: out, anchor };
+  const rb = text.match(/Beginning balance as of (\d{1,2}\/\d{1,2}\/\d{4})/i), re = text.match(/Ending balance as of (\d{1,2}\/\d{1,2}\/\d{4})/i);
+  return { txns: out, anchor, range: rb && re ? { from: parseDate(rb[1]), to: parseDate(re[1]) } : null };
 }
 function parseOFX(text) {
   const tag = (blk, t) => { const m = blk.match(new RegExp('<' + t + '>([^<\\r\\n]*)', 'i')); return m ? m[1].trim() : ''; };
@@ -1586,7 +1712,8 @@ function parseOFX(text) {
   const lb = text.match(/<LEDGERBAL>([\s\S]*?)(<\/LEDGERBAL>|<AVAILBAL>|$)/i); let anchor = null;
   if (lb) { const bal = num(tag(lb[1], 'BALAMT')), d = parseDate(tag(lb[1], 'DTASOF')); if (bal != null && d) anchor = { date: d, balance: bal }; }
   const acct = tag(text, 'ACCTID'); const type = /<CCACCTFROM>/i.test(text) ? 'credit' : (tag(text, 'ACCTTYPE') || 'checking').toLowerCase();
-  return { txns, anchor, last4: acct.slice(-4), type };
+  const ds = parseDate(tag(text, 'DTSTART')), de = parseDate(tag(text, 'DTEND'));
+  return { txns, anchor, last4: acct.slice(-4), type, range: ds && de ? { from: ds, to: de } : null };
 }
 async function readImport(file) {
   try {
@@ -1604,16 +1731,65 @@ function importIds(pi, acctId) {
   const occ = {};
   return pi.txns.map(t => { if (t.fitid) return acctId + '_' + safeId(t.fitid); const key = `${t.date}|${t.amount.toFixed(2)}|${t.description}`; occ[key] = (occ[key] || 0) + 1; return acctId + '_' + hash(key + '|' + occ[key]); });
 }
+/* ---------- Statement check: nothing else may exist in an account within an imported statement's date range ---------- */
+function statementRange(pi) { const d = pi.txns.map(t => t.date).sort(); return { from: pi.range?.from || d[0], to: pi.range?.to || d[d.length - 1] }; }
+/* Existing entries in acctId, inside the file's range, that the file doesn't contain. */
+function staleForImport(pi, acctId) {
+  if (!acctId) return [];
+  const ids = new Set(importIds(pi, acctId)); const r = statementRange(pi);
+  return S.txns.filter(t => t.accountId === acctId && t.date >= r.from && t.date <= r.to && !ids.has(t.id) && !t.keepDespiteStatement);
+}
+/* A newer entry that is evidently the same transaction (same amount, ±3 days, not itself flagged). */
+function counterpartOf(t, taken = new Set()) {
+  return S.txns.filter(x => x.id !== t.id && x.accountId === t.accountId && !x.notInStatement && !taken.has(x.id) && Math.abs(x.amount - t.amount) < 0.005 && Math.abs(ts(x.date) - ts(t.date)) <= 3 * 864e5)
+    .sort((a, b) => Math.abs(ts(a.date) - ts(t.date)) - Math.abs(ts(b.date) - ts(t.date)))[0] || null;
+}
+/* Delete flagged entries; carry type/tags/notes/document links/transfer pairing over to the same transaction from the statement. */
+async function deleteStale(list) {
+  const taken = new Set(), txChanged = new Map(), docChanged = new Map(); let moved = 0;
+  for (const t of list) {
+    const cp = counterpartOf(t, taken);
+    if (cp) {
+      taken.add(cp.id);
+      if (!cp.cls && t.cls) cp.cls = t.cls;
+      if (!cp.category && t.category) cp.category = t.category;
+      cp.tags = [...new Set([...(cp.tags || []), ...(t.tags || [])])];
+      if (t.notes && !(cp.notes || '').includes(t.notes)) cp.notes = [cp.notes, t.notes].filter(Boolean).join(' · ');
+      if (t.transferPairId && !cp.transferPairId) { const o = S.txns.find(x => x.id === t.transferPairId); if (o) { o.transferPairId = cp.id; txChanged.set(o.id, o); } Object.assign(cp, { transferPairId: t.transferPairId, transferAcct: t.transferAcct }); }
+      txChanged.set(cp.id, cp); moved++;
+    } else if (t.transferPairId) { const o = S.txns.find(x => x.id === t.transferPairId); if (o) { o.transferPairId = ''; txChanged.set(o.id, o); } }
+    for (const [n, arr] of [['docs', S.docs], ['pos', S.pos]]) arr.forEach(r => {
+      if (!(r.linkedTxnIds || []).includes(t.id)) return;
+      r.linkedTxnIds = [...new Set(r.linkedTxnIds.map(id => id === t.id ? cp?.id : id).filter(Boolean))]; docChanged.set(n + ':' + r.id, [n, r]);
+    });
+  }
+  const ids = new Set(list.map(t => t.id)); [...txChanged.keys()].forEach(k => ids.has(k) && txChanged.delete(k));
+  if (txChanged.size) await persistMany('txns', [...txChanged.values()]);
+  for (const [n, r] of docChanged.values()) await persist(n, r);
+  await store.delMany('txns', [...ids]); S.txns = S.txns.filter(t => !ids.has(t.id));
+  DBG.info(`statement check: deleted ${ids.size}, carried details to ${moved} statement entries`);
+  return { deleted: ids.size, moved };
+}
+function staleNote(t, fileTxns) {
+  const bits = [t.cls ? CLASSES[t.cls].split(' (')[0] : '', (t.tags || []).length ? 'tags' : '', t.category ? 'category' : '', (docsByTxn[t.id] || []).length ? 'linked docs' : '', t.manual ? 'manual entry' : ''].filter(Boolean);
+  const cp = fileTxns ? fileTxns.filter(x => Math.abs(x.amount - t.amount) < 0.005 && Math.abs(ts(x.date) - ts(t.date)) <= 3 * 864e5).sort((a, b) => Math.abs(ts(a.date) - ts(t.date)) - Math.abs(ts(b.date) - ts(t.date)))[0] : counterpartOf(t);
+  return `${bits.length ? bits.join(', ') : ''}${cp ? `${bits.length ? ' — ' : ''}<span class="sugg">same as ${fmtDate(cp.date)} entry</span>${bits.length ? ' (details carried over on delete)' : ''}` : ''}`;
+}
+const isStale = t => !!t.notInStatement;
+
 function importPreviewHTML(pi) {
   const acctId = pi.acctId === '__new' ? null : pi.acctId; const ids = acctId ? importIds(pi, acctId) : [];
   const existing = new Set(S.txns.map(t => t.id)); const dup = ids.filter(i => existing.has(i)).length;
-  const dates = pi.txns.map(t => t.date).sort();
-  return `<div class="banner"><b>${esc(pi.fileName)}</b> (${pi.format}) · ${pi.txns.length} transactions, ${fmtDate(dates[0])} – ${fmtDate(dates[dates.length - 1])}${pi.anchor ? ` · balance ${money(pi.anchor.balance)} on ${fmtDate(pi.anchor.date)}` : ''}</div>
+  const rg = statementRange(pi); const stale = staleForImport(pi, acctId);
+  return `<div class="banner"><b>${esc(pi.fileName)}</b> (${pi.format}) · ${pi.txns.length} transactions · statement period ${fmtDate(rg.from)} – ${fmtDate(rg.to)}${pi.anchor ? ` · balance ${money(pi.anchor.balance)} on ${fmtDate(pi.anchor.date)}` : ''}</div>
   <div class="toolbar">Import into
     <select id="impAcct">${S.accounts.map(a => `<option value="${a.id}" ${pi.acctId === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}<option value="__new" ${pi.acctId === '__new' ? 'selected' : ''}>+ New account…</option></select>
     ${pi.acctId === '__new' ? `<input id="impNewName" placeholder="Account name" value="BofA ${pi.guessType === 'credit' ? 'Credit Card' : 'Checking'}${pi.last4 ? ' ' + pi.last4 : ''}"><select id="impNewType">${['checking', 'savings', 'credit'].map(t => `<option ${pi.guessType === t ? 'selected' : ''}>${t}</option>`).join('')}</select>` : `<span class="small muted">${pi.txns.length - dup} new · ${dup} already imported</span>`}
     <label class="small" style="display:inline-flex;gap:5px;align-items:center"><input type="checkbox" id="impAnchor" ${pi.anchor ? 'checked' : 'disabled'}> update balance from file</label>
     <span class="grow"></span><button class="b" id="impCancel">Cancel</button><button class="b pri" id="impGo">Import</button></div>
+  ${stale.length ? `<div class="banner warn"><b>⚑ ${stale.length} existing entr${stale.length > 1 ? 'ies' : 'y'} in ${esc(acctName(acctId))} between ${fmtDate(rg.from)} and ${fmtDate(rg.to)} ${stale.length > 1 ? 'are' : 'is'} not in this statement.</b> Nothing else should exist in that period — these will be flagged for deletion after import.
+    <label class="small" style="display:flex;gap:6px;align-items:center;margin-top:6px"><input type="checkbox" id="impDelStale"> Delete them now (type, tags and document links move to the matching statement entry where there is one)</label>
+    <div class="tw" style="max-height:200px;margin-top:6px"><table><tbody>${stale.map(t => `<tr><td style="white-space:nowrap">${fmtDate(t.date)}</td><td>${esc(t.description)}</td><td class="r">${money(t.amount)}</td><td class="small muted">${staleNote(t, pi.txns)}</td></tr>`).join('')}</tbody></table></div></div>` : acctId ? `<div class="small" style="margin:-4px 0 8px;color:var(--good)">✓ No other entries in ${esc(acctName(acctId))} during the statement period.</div>` : ''}
   <div class="tw" style="max-height:280px"><table><thead><tr><th>Date</th><th>Description</th><th class="r">Amount</th><th>Auto type</th>${acctId ? '<th></th>' : ''}</tr></thead><tbody>${pi.txns.slice(0, 200).map((t, i) => `<tr><td>${fmtDate(t.date)}</td><td>${esc(t.description)}</td><td class="r">${money(t.amount)}</td><td class="small muted">${TRANSFER_RE.test(t.description) ? 'Internal transfer' : ''}</td>${acctId ? `<td class="small muted">${existing.has(ids[i]) ? 'duplicate' : ''}</td>` : ''}</tr>`).join('')}</tbody></table></div>`;
 }
 function bindImportPreview() {
@@ -1631,10 +1807,18 @@ function bindImportPreview() {
       await persist('accounts', acct);
       const ids = importIds(pi, acct.id); const existing = new Set(S.txns.map(t => t.id)); const now = new Date().toISOString();
       const fresh = pi.txns.map((t, i) => ({ id: ids[i], accountId: acct.id, date: t.date, description: t.description, amount: +t.amount.toFixed(2), seq: t.seq, ref: t.ref || '', fitid: t.fitid || '', cls: TRANSFER_RE.test(t.description) ? 'transfer' : '', tags: [], category: '', importedAt: now, source: pi.fileName })).filter(t => !existing.has(t.id));
-      const rec = reconcileTransfers(fresh, acct.id);
-      if (fresh.length) await persistMany('txns', [...fresh, ...rec.upd]);
-      if (rec.del.length) { await store.delMany('txns', rec.del.map(x => x.id)); S.txns = S.txns.filter(x => !rec.del.includes(x)); DBG.info(`import: replaced ${rec.del.length} auto-created transfer entr${rec.del.length === 1 ? 'y' : 'ies'} with imported ones`); }
-      UI.pendingImport = null; toast(`Imported ${fresh.length} new transactions into ${acct.name}`, 4000); render();
+      if (fresh.length) await persistMany('txns', fresh);
+      const fileIds = new Set(ids); const rg = statementRange(pi);
+      const cleared = S.txns.filter(t => t.accountId === acct.id && t.notInStatement && fileIds.has(t.id)).map(t => { delete t.notInStatement; return t; });
+      if (cleared.length) await persistMany('txns', cleared);
+      const stale = staleForImport(pi, acct.id); let staleMsg = '';
+      if (stale.length) {
+        if ($('#impDelStale')?.checked) { const r = await deleteStale(stale); staleMsg = ` · ${r.deleted} entr${r.deleted > 1 ? 'ies' : 'y'} not in the statement deleted`; }
+        else { stale.forEach(t => t.notInStatement = { file: pi.fileName, from: rg.from, to: rg.to, at: now }); await persistMany('txns', stale); staleMsg = ` · ⚑ ${stale.length} entr${stale.length > 1 ? 'ies' : 'y'} not in the statement flagged`; }
+      }
+      const paired = await autoPairTransfers();
+      const unm = S.txns.filter(isUnmatchedTransfer).length;
+      UI.pendingImport = null; toast(`Imported ${fresh.length} new transactions into ${acct.name}${paired ? ` · ${paired} transfer${paired > 1 ? 's' : ''} paired` : ''}${unm ? ` · ${unm} transfer${unm > 1 ? 's' : ''} still unmatched` : ''}${staleMsg}`, 7000); if (staleMsg.includes('flagged')) { UI.tx.link = 'stale'; UI.tx.acct = acct.id; go('txns'); } else render();
     } catch (e) { btn.disabled = false; btn.textContent = 'Import'; toast('Import failed: ' + e.message, 6000); console.error(e); }
   };
 }
@@ -1739,6 +1923,13 @@ async function boot() {
     const d = await store.loadAll();
     S.accounts = d.accounts || []; S.txns = d.txns || []; S.docs = d.docs || []; S.pos = d.pos || [];
     S.settings = { ...DEFAULT_SETTINGS, ...((d.settings || []).find(x => x.id === 'main') || {}) };
+    const ph = S.txns.filter(t => t.autoTransfer);
+    if (ph.length) {
+      const origins = ph.map(x => S.txns.find(o => o.id === x.transferPairId)).filter(Boolean); origins.forEach(o => o.transferPairId = '');
+      S.txns = S.txns.filter(t => !t.autoTransfer);
+      try { await store.delMany('txns', ph.map(x => x.id)); if (origins.length) await persistMany('txns', origins); await autoPairTransfers(); DBG.info(`removed ${ph.length} auto-created transfer entries`); toast(`Removed ${ph.length} auto-created transfer entr${ph.length > 1 ? 'ies' : 'y'} — transfers now pair only with real transactions`, 6000); }
+      catch (e) { DBG.err('transfer placeholder cleanup failed', e); }
+    }
     const legacy = S.txns.filter(t => LEGACY_CAPITAL.has(t.cls));
     if (legacy.length) { legacy.forEach(t => t.cls = 'capital'); DBG.info(`migrating ${legacy.length} capital infusion/withdrawal → capital`); persistMany('txns', legacy).catch(e => DBG.err('capital migration failed', e)); }
     setConn(store.kind === 'firebase' ? 'ok' : 'warn', store.kind === 'firebase' ? `Firebase · ${store.projectId}${store.auth.currentUser ? ' · ' + (store.auth.currentUser.email || 'anon') : ''}` : 'Local mode');
