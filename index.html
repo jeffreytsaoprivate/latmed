@@ -182,6 +182,15 @@ th.sortable{cursor:pointer;user-select:none;white-space:nowrap}
 th.sortable:hover{color:var(--text-primary)}
 th.sortable .arr{font-size:10px;margin-left:3px;color:var(--accent)}
 tr.rowlink{cursor:pointer}
+/* picker tables */
+.ptable .sugg{white-space:nowrap}
+.ptable td.nw,.ptable th{white-space:nowrap}
+.ptable tr.taken td{opacity:.5}
+.ptable tr.taken:hover td{opacity:.85}
+.ptable tr.on td{background:color-mix(in srgb,var(--good) 9%,transparent)}
+.ptable tr.sel td{background:color-mix(in srgb,var(--accent) 10%,transparent)}
+.ptable tr.pgroup td{font-size:11.5px;color:var(--text-muted);background:var(--surface-2);font-weight:600;opacity:1}
+.ptable tbody tr[data-id]{cursor:pointer}
 @media (max-width:1000px){.split{grid-template-columns:1fr}.splitR{position:static;height:70vh}}
 @media (max-width:760px){.g2{grid-template-columns:1fr}.viewer{grid-template-columns:1fr;height:auto}.vlist{max-height:200px}.vframe{height:60vh}}
 </style>
@@ -382,7 +391,7 @@ async function makeLocal() {
 /* ---------------- state ---------------- */
 let store = null;
 const S = { accounts: [], txns: [], docs: [], pos: [], settings: {...DEFAULT_SETTINGS} };
-const UI = { tab: location.hash.slice(1) || 'overview', range: LS.get('ledger.range', '12m'), tx: { acct:'', cls:'all', q:'', tag:'', from:'', to:'', link:'' }, sel: new Set(), docF: { type:'', status:'', q:'', tag:'', chain:'' }, docSort: LS.get('ledger.docSort', { key: 'date', dir: 'desc' }), skipped: new Set(), viewIdx: 0, pendingImport: null };
+const UI = { tab: location.hash.slice(1) || 'overview', range: LS.get('ledger.range', '12m'), tx: { acct:'', cls:'all', q:'', tag:'', from:'', to:'', link:'' }, txSort: LS.get('ledger.txSort', { key: 'date', dir: 'desc' }), sel: new Set(), docF: { type:'', status:'', q:'', tag:'', chain:'' }, docSort: LS.get('ledger.docSort', { key: 'date', dir: 'desc' }), skipped: new Set(), viewIdx: 0, pendingImport: null };
 let docsByTxn = {};
 const charts = {};
 
@@ -717,54 +726,132 @@ async function setLink(item, txnId, on) {
 function linkChips(t) {
   return (docsByTxn[t.id] || []).map(l => `<a href="#" class="chip openLink" data-id="${l.id}" title="${esc(l.typeLabel + ' ' + l.number + ' · ' + l.vendor + ' · ' + money(l.amount))}" style="text-decoration:none;color:var(--text-primary)"><b>${l.short}</b> ${esc(l.number || l.vendor || '')}</a>`).join('');
 }
-/* Picker: list candidates (linked first, then best matches), toggle links instantly, preview on the right. */
+/* ---------- Sortable picker table (used by every "choose a document / transaction" dialog) ----------
+   cfg: { cols:[{k,label,cls,val(row),html(row)}], rows():[{id, on, taken, ...}], sort:{k,dir}, search(row), check:true, actions(row) }
+   Available rows first, then grayed rows already linked elsewhere; each group sorted by the chosen column. */
+function renderPickTable(host, cfg) {
+  const q = (cfg.q || '').toLowerCase();
+  const col = cfg.cols.find(c => c.k === cfg.sort.k) || cfg.cols[0]; const dir = cfg.sort.dir === 'asc' ? 1 : -1;
+  const grp = r => r.on ? 0 : r.taken ? 2 : 1;
+  const L = cfg.rows().filter(r => !q || cfg.search(r).toLowerCase().includes(q))
+    .sort((a, b) => grp(a) - grp(b) || ((x, y) => (x < y ? -1 : x > y ? 1 : 0))(col.val(a), col.val(b)) * dir || (b.date || '').localeCompare(a.date || '')).slice(0, 300);
+  const nTaken = L.filter(r => r.taken).length;
+  host.innerHTML = `<table class="ptable"><thead><tr>${cfg.check ? '<th style="width:28px"></th>' : ''}${cfg.cols.map(c => `<th class="sortable ${c.cls || ''}" data-k="${c.k}">${c.label}${cfg.sort.k === c.k ? `<span class="arr">${cfg.sort.dir === 'asc' ? '▲' : '▼'}</span>` : ''}</th>`).join('')}${cfg.actions ? '<th></th>' : ''}</tr></thead><tbody>
+    ${L.map((r, i) => `${r.taken && (i === 0 || !L[i - 1].taken) ? `<tr class="pgroup"><td colspan="${cfg.cols.length + (cfg.check ? 1 : 0) + (cfg.actions ? 1 : 0)}">Linked elsewhere (${nTaken}) — selecting one moves it here and breaks its previous link</td></tr>` : ''}
+      <tr data-id="${r.id}" class="${r.on ? 'on' : ''} ${r.taken ? 'taken' : ''}">${cfg.check ? `<td><input type="${cfg.check === 'radio' ? 'radio' : 'checkbox'}" name="pt" ${r.on ? 'checked' : ''}></td>` : ''}${cfg.cols.map(c => `<td class="${c.cls || ''}">${c.html(r)}</td>`).join('')}${cfg.actions ? `<td style="white-space:nowrap;text-align:right">${cfg.actions(r)}</td>` : ''}</tr>`).join('')
+      || `<tr><td colspan="${cfg.cols.length + 2}" class="muted small">Nothing to choose from.</td></tr>`}</tbody></table>`;
+  $$('th[data-k]', host).forEach(th => th.onclick = () => { const k = th.dataset.k; cfg.sort = cfg.sort.k === k ? { k, dir: cfg.sort.dir === 'asc' ? 'desc' : 'asc' } : { k, dir: ['score', 'date', 'amount'].includes(k) ? 'desc' : 'asc' }; renderPickTable(host, cfg); });
+}
+const scoreBadge = s => s >= 90 ? '<span class="sugg">★ BEST</span>' : s >= 50 ? '<span class="sugg">★ MATCH</span>' : '';
+const txnShort = id => { const t = S.txns.find(x => x.id === id); return t ? `${fmtDate(t.date)} · ${t.description.slice(0, 28)} · ${money(t.amount)}` : 'a deleted transaction'; };
+/* Columns shared by document pickers */
+const DOC_COLS = [
+  { k: 'score', label: 'Match', cls: 'nw', val: r => r.score, html: r => scoreBadge(r.score) },
+  { k: 'type', label: 'Type', val: r => r.c.typeLabel, html: r => `<b>${esc(r.c.short)}</b>` },
+  { k: 'number', label: 'No.', cls: 'nw', val: r => (r.c.number || '').toLowerCase(), html: r => esc(r.c.number || '—') },
+  { k: 'vendor', label: 'Vendor', val: r => (r.c.vendor || r.c.fileName || '').toLowerCase(), html: r => esc(r.c.vendor || r.c.fileName || '') + (r.c.file ? ' <span class="muted small">📎</span>' : '') },
+  { k: 'date', label: 'Date', val: r => r.c.date || '', html: r => `<span style="white-space:nowrap">${fmtDate(r.c.date)}</span>` },
+  { k: 'amount', label: 'Amount', cls: 'r', val: r => Math.abs(r.c.amount), html: r => `<span style="white-space:nowrap">${money(r.c.amount)}</span>` },
+  { k: 'status', label: 'Status', val: r => r.c.status || '', html: r => `<span class="small">${esc(r.c.status || '')}</span>` },
+  { k: 'linked', label: 'Linked to', val: r => r.taken || (r.on ? '0' : '1'), html: r => r.on ? '<span class="small" style="color:var(--good)">✓ this one</span>' : r.taken ? `<span class="small">${esc(r.taken)}</span>` : '<span class="small muted">— available</span>' }];
+
+/* Transaction → documents (multi). Selecting a grayed document moves it here; "＋ also" keeps both links (split payments). */
 function linkPicker(t, onDone) {
-  const st = { type: '', q: '', show: 'best' };
+  const st = { type: '' };
   const body = modal(`Link: ${fmtDate(t.date)} · ${money(t.amount)}`, `
     <div class="banner" style="margin-bottom:10px"><b>${esc(t.description)}</b> <span class="muted small">· ${esc(acctById(t.accountId)?.name || '')}${t.cls ? ' · ' + CLASSES[t.cls] : ''}</span></div>
-    <div class="split" style="grid-template-columns:minmax(0,1.1fr) minmax(0,1fr)"><div>
+    <div class="split" style="grid-template-columns:minmax(0,1.35fr) minmax(0,1fr)"><div>
       <div class="toolbar">
         <div class="seg" id="lkType">${[['', 'All'], ['quote', 'Quotes'], ['invoice', 'Invoices'], ['po', 'POs'], ['receipt', 'Receipts']].map(([v, l]) => `<button data-v="${v}" class="${v === '' ? 'on' : ''}">${l}</button>`).join('')}</div>
         <input id="lkQ" class="grow" placeholder="Search vendor, number, amount">
       </div>
-      <div class="linklist" id="lkList" style="max-height:58vh"></div>
-      <div class="small muted" style="margin-top:6px">Ticking a box saves immediately. Click a row to preview its file. Linking an unpaid invoice marks it paid.</div>
+      <div class="tw" id="lkList" style="max-height:58vh"></div>
+      <div class="small muted" style="margin-top:6px">Tick to link (saves immediately). Click a row to preview its file. Linking an unpaid invoice marks it paid.</div>
       <div class="mfoot"><button class="b pri" id="lkDone">Done</button></div>
     </div>
-    <div class="splitR"><div class="pvbar"><span id="lkPvName">Select a row to preview</span><button class="b sm" type="button" data-pvcopy hidden title="Copy all text in this PDF">Copy text</button><button class="b sm" type="button" data-pvopen>Open ↗</button></div><div class="pv"><span class="muted">No file selected</span></div></div></div>`, { wide: true });
+    <div class="splitR"><div class="pvbar"><span id="lkPvName">Click a row to preview</span><button class="b sm" type="button" data-pvcopy hidden>Copy text</button><button class="b sm" type="button" data-pvopen>Open ↗</button></div><div class="pv"><span class="muted">No file selected</span></div></div></div>`, { wide: true });
   $('#modal .mbox').classList.add('xwide');
-  const draw = () => {
-    const q = st.q.toLowerCase();
-    const all = linkCandidates().map(c => ({ c, ...matchScore(t, c), on: c.linked.includes(t.id) }))
-      .filter(x => (!st.type || x.c.type === st.type) && (!q || [x.c.vendor, x.c.number, x.c.amount, x.c.typeLabel, x.c.rec.description, x.c.rec.notes].join(' ').toLowerCase().includes(q)));
-    all.sort((a, b) => (b.on - a.on) || (b.score - a.score) || b.c.date.localeCompare(a.c.date));
-    const list = all.slice(0, 150);
-    $('#lkList', body).innerHTML = list.length ? list.map(x => `<label data-id="${x.c.id}" data-kind="${x.c.kind}">
-      <input type="checkbox" ${x.on ? 'checked' : ''}>
-      ${x.score >= 90 && !x.on ? '<span class="sugg">BEST MATCH</span>' : x.score >= 50 && !x.on ? '<span class="sugg">MATCH</span>' : ''}
-      <span><b>${x.c.short}</b> ${esc(x.c.number)} · ${esc(x.c.vendor)} <span class="muted small">${fmtDate(x.c.date)}${x.c.status ? ' · ' + esc(x.c.status) : ''}${x.c.file ? ' · 📎' : ''}${x.score >= 50 ? ' · ' + x.why.join(', ') : ''}${x.c.linked.length && !x.on ? ` · already linked to ${x.c.linked.length} txn` : ''}</span></span>
-      <span class="amt">${money(x.c.amount)}</span></label>`).join('') : '<div class="muted small" style="padding:10px">Nothing matches. Upload quotes, invoices, receipts or POs on the Documents tab.</div>';
-  };
-  draw();
+  const cfg = { cols: DOC_COLS, sort: { k: 'score', dir: 'desc' }, check: true,
+    rows: () => linkCandidates().filter(c => !st.type || c.type === st.type).map(c => { const on = c.linked.includes(t.id); return { id: c.id, c, date: c.date, ...matchScore(t, c), on, taken: !on && c.linked.length ? 'paid by ' + c.linked.map(txnShort).join('; ') : '' }; }),
+    search: r => [r.c.vendor, r.c.number, r.c.amount, r.c.typeLabel, r.c.rec.description, r.c.fileName].join(' '),
+    actions: r => r.taken ? '<button class="b sm ptAlso" title="Link here too, keeping the existing link (e.g. a split payment)">＋ also</button>' : '' };
+  const draw = () => renderPickTable($('#lkList', body), cfg); draw();
   $('#lkType', body).onclick = e => { const b = e.target.closest('button'); if (!b) return; st.type = b.dataset.v; $$('#lkType button', body).forEach(x => x.classList.toggle('on', x === b)); draw(); };
-  $('#lkQ', body).oninput = e => { st.q = e.target.value; draw(); };
-  $('#lkList', body).addEventListener('change', async e => {
-    if (e.target.type !== 'checkbox') return; const row = e.target.closest('label');
-    const item = linkCandidates().find(c => c.id === row.dataset.id); if (!item) return;
-    e.target.disabled = true;
-    try { const note = await setLink(item, t.id, e.target.checked); toast((e.target.checked ? 'Linked ' : 'Unlinked ') + item.typeLabel.toLowerCase() + ' ' + (item.number || item.vendor) + (note || '')); }
-    catch { e.target.checked = !e.target.checked; }
-    e.target.disabled = false; draw();
-  });
-  $('#lkList', body).addEventListener('click', e => {
-    if (e.target.type === 'checkbox') return; const row = e.target.closest('label'); if (!row) return; e.preventDefault();
-    const item = linkCandidates().find(c => c.id === row.dataset.id); if (!item) return;
-    $$('#lkList label', body).forEach(l => l.style.background = l === row ? 'color-mix(in srgb,var(--accent) 10%,transparent)' : '');
+  $('#lkQ', body).oninput = e => { cfg.q = e.target.value; draw(); };
+  $('#lkList', body).addEventListener('click', async e => {
+    const tr = e.target.closest('tr[data-id]'); if (!tr) return; const item = linkCandidates().find(c => c.id === tr.dataset.id); if (!item) return;
+    const also = e.target.closest('.ptAlso'), cb = e.target.closest('input');
+    if (also || cb) {
+      if (cb) cb.disabled = true;
+      try {
+        const on = item.linked.includes(t.id);
+        if (on && cb) { const note = await setLink(item, t.id, false); toast('Unlinked ' + item.typeLabel.toLowerCase() + ' ' + (item.number || item.vendor) + (note || '')); }
+        else {
+          const moved = !also && item.linked.length ? item.linked.slice() : [];
+          for (const oid of moved) await setLink(linkItem(item.kind, item.rec), oid, false);
+          const note = await setLink(linkItem(item.kind, recOf(item.kind, item.id)), t.id, true);
+          toast((moved.length ? `Moved ${item.typeLabel.toLowerCase()} ${item.number || item.vendor} here (unlinked from ${moved.map(txnShort).join('; ')})` : `Linked ${item.typeLabel.toLowerCase()} ${item.number || item.vendor}`) + (note || ''), moved.length ? 6000 : 2600);
+        }
+      } catch (err) { DBG.err('link failed', err); }
+      return draw();
+    }
+    $$('tr[data-id]', $('#lkList', body)).forEach(x => x.classList.toggle('sel', x === tr));
     const right = $('.splitR', body); $('#lkPvName', body).textContent = `${item.typeLabel} ${item.number} · ${item.vendor}`;
-    if (item.file) fillPreview(right, item.rec); else { $('.pv', right).innerHTML = '<span class="muted">No file attached to this record.</span>'; }
+    if (item.file) fillPreview(right, item.rec); else $('.pv', right).innerHTML = '<span class="muted">No file attached to this record.</span>';
   });
   $('#lkDone', body).onclick = () => { closeModal(); onDone ? onDone() : render(); };
 }
+
+/* Document → bank/card transactions (multi). Grayed = already paying another document; selecting moves it. */
+function txnPicker(kind, rec, onDone) {
+  const item = () => linkItem(kind, recOf(kind, rec.id) || rec);
+  const body = modal(`Payment for ${item().typeLabel} ${rec.number || ''}`, `
+    <div class="small muted" style="margin-bottom:8px">Tick the bank or card transaction(s) that paid ${esc(item().typeLabel.toLowerCase())} ${esc(rec.number || '')} · ${esc(rec.vendor || '')} · <b>${money(item().amount)}</b>. Saves immediately.</div>
+    <input id="tpQ" placeholder="Search description or amount" style="width:100%;margin-bottom:8px">
+    <div class="tw" id="tpList" style="max-height:58vh"></div>
+    <div class="mfoot"><button class="b pri" id="tpDone">Done</button></div>`, { wide: true });
+  const cfg = { check: true, sort: { k: 'score', dir: 'desc' },
+    cols: [{ k: 'score', label: 'Match', val: r => r.score, html: r => scoreBadge(r.score) },
+      { k: 'date', label: 'Date', val: r => r.t.date, html: r => `<span style="white-space:nowrap">${fmtDate(r.t.date)}</span>` },
+      { k: 'acct', label: 'Account', val: r => acctName(r.t.accountId), html: r => `<span class="small">${esc(acctName(r.t.accountId))}</span>` },
+      { k: 'desc', label: 'Description', val: r => r.t.description.toLowerCase(), html: r => esc(r.t.description) + (isStale(r.t) ? ' <span class="small" style="color:var(--crit)">⚑ not in statement</span>' : '') },
+      { k: 'amount', label: 'Amount', cls: 'r', val: r => Math.abs(r.t.amount), html: r => `<span style="white-space:nowrap">${money(r.t.amount)}</span>` },
+      { k: 'linked', label: 'Linked to', val: r => r.taken || (r.on ? '0' : '1'), html: r => r.on ? '<span class="small" style="color:var(--good)">✓ this one</span>' : r.taken ? `<span class="small">${esc(r.taken)}</span>` : '<span class="small muted">— available</span>' }],
+    rows: () => { const it = item(); return S.txns.filter(t => t.cls !== 'transfer').map(t => { const on = it.linked.includes(t.id); const others = (docsByTxn[t.id] || []).filter(l => l.id !== it.id); return { id: t.id, t, date: t.date, ...matchScore(t, it), on, taken: !on && others.length ? 'pays ' + others.map(l => `${l.short} ${l.number || l.vendor}`).join(', ') : '' }; }); },
+    search: r => r.t.description + ' ' + r.t.amount + ' ' + acctName(r.t.accountId),
+    actions: r => r.taken ? '<button class="b sm ptAlso" title="Link here too, keeping its other links (one payment covering several documents)">＋ also</button>' : '' };
+  const draw = () => renderPickTable($('#tpList', body), cfg); draw();
+  $('#tpQ', body).oninput = e => { cfg.q = e.target.value; draw(); };
+  $('#tpList', body).addEventListener('click', async e => {
+    const tr = e.target.closest('tr[data-id]'); if (!tr) return; const also = e.target.closest('.ptAlso'), cb = e.target.closest('input'); if (!also && !cb) return;
+    const tid = tr.dataset.id; const it = item(); const on = it.linked.includes(tid);
+    try {
+      if (on && cb) { const note = await setLink(it, tid, false); toast('Unlinked' + (note || '')); }
+      else {
+        const others = also ? [] : (docsByTxn[tid] || []).filter(l => l.id !== it.id);
+        for (const l of others) await setLink(linkItem(l.kind, recOf(l.kind, l.id)), tid, false);
+        const note = await setLink(item(), tid, true);
+        toast((others.length ? `Moved here (unlinked from ${others.map(l => l.short + ' ' + (l.number || l.vendor)).join(', ')})` : 'Linked') + (note || ''), others.length ? 6000 : 2600);
+      }
+    } catch (err) { DBG.err('txn link failed', err); }
+    draw();
+  });
+  $('#tpDone', body).onclick = () => { closeModal(); onDone ? onDone() : render(); };
+}
+
+/* Document → document (single pick). Grayed rows are attached elsewhere; picking one moves it. */
+function pickDialog(title, intro, rows, onPick, extraHTML = '') {
+  const body = modal(title, `<div class="small muted" style="margin-bottom:8px">${intro}</div>${extraHTML}
+    <input id="pkQ" placeholder="Search" style="width:100%;margin-bottom:8px">
+    <div class="tw" id="pkList" style="max-height:58vh"></div>
+    <div class="mfoot"><button class="b" data-close>Cancel</button></div>`, { wide: true });
+  const cfg = { cols: DOC_COLS, rows: () => rows, sort: { k: 'score', dir: 'desc' }, check: 'radio', search: r => [r.c.vendor, r.c.number, r.c.amount, r.c.fileName].join(' ') };
+  const draw = () => renderPickTable($('#pkList', body), cfg); draw();
+  $('#pkQ', body).oninput = e => { cfg.q = e.target.value; draw(); };
+  $('#pkList', body).addEventListener('click', async e => { const tr = e.target.closest('tr[data-id]'); if (!tr || e.target.closest('th')) return; const r = rows.find(x => x.id === tr.dataset.id); await onPick(r); closeModal(); render(); });
+  return body;
+}
+
 /* Review & apply strong, unambiguous matches across all unlinked transactions */
 function autoLinkReview() {
   const cands = linkCandidates(); const used = new Set(); const props = [];
@@ -882,7 +969,12 @@ function filteredTxns() {
 }
 function vTxns(root) {
   const f = UI.tx; if (f.link === 'stale' && !S.txns.some(isStale)) { f.link = ''; f.acct = ''; }
-  const rows = filteredTxns().slice().reverse(); const shown = rows.slice(0, 600);
+  const ts0 = UI.txSort, dir = ts0.dir === 'asc' ? 1 : -1;
+  const tval = t => ({ date: 0, acct: acctName(t.accountId).toLowerCase(), desc: t.description.toLowerCase(), amount: t.amount, bal: t._bal ?? 0, type: t.cls === 'capital' ? capLabel(t) : CLASSES[t.cls || ''], tags: [t.category, ...(t.tags || [])].filter(Boolean).join(',').toLowerCase() || '~', docs: (docsByTxn[t.id] || []).length })[ts0.key];
+  const base = filteredTxns();   // chronological (date, then statement order)
+  const rows = ts0.key === 'date' ? (ts0.dir === 'asc' ? base.slice() : base.slice().reverse())
+    : base.map((t, i) => [t, i]).sort((a, b) => { const A = tval(a[0]), B = tval(b[0]); return (A < B ? -1 : A > B ? 1 : 0) * dir || b[1] - a[1]; }).map(x => x[0]);
+  const shown = rows.slice(0, 600);
   const total = rows.reduce((s, t) => s + t.amount, 0);
   root.innerHTML = `${banner()}
   <div class="card">
@@ -904,8 +996,8 @@ function vTxns(root) {
       <button class="b sm" id="bClear">Clear selection</button>
     </div>
     ${(() => { const st = S.txns.filter(isStale); return st.length ? `<div class="banner warn" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span>⚑ <b>${st.length} entr${st.length > 1 ? 'ies are' : 'y is'} not in the bank statement</b> covering ${st.length > 1 ? 'their' : 'its'} dates.</span><span style="flex:1"></span>${f.link === 'stale' ? `<button class="b danger" id="stDelAll">Delete all ${st.length}</button>` : '<button class="b" id="stShow">Show them</button>'}</div>` : ''; })()}
-    <div class="small muted" style="margin-bottom:6px">${rows.length} transactions · net ${money(total)}${rows.length > shown.length ? ` · showing latest ${shown.length}` : ''}</div>
-    <div class="tw"><table><thead><tr><th><input type="checkbox" id="selAll"></th><th>Date</th><th>Account</th><th>Description</th><th class="r">Amount</th><th class="r" title="Running balance of this transaction's account, after the transaction">Balance</th><th>Type</th><th>Tags / category</th><th>Quotes · invoices · POs</th><th></th></tr></thead><tbody>
+    <div class="small muted" style="margin-bottom:6px">${rows.length} transactions · net ${money(total)}${rows.length > shown.length ? ` · showing first ${shown.length} in this order` : ''}</div>
+    <div class="tw"><table><thead><tr><th><input type="checkbox" id="selAll"></th>${[['date', 'Date'], ['acct', 'Account'], ['desc', 'Description'], ['amount', 'Amount', 'r'], ['bal', 'Balance', 'r', "Running balance of this transaction's account, after the transaction"], ['type', 'Type'], ['tags', 'Tags / category'], ['docs', 'Quotes · invoices · POs']].map(([k, l, c, tt]) => `<th class="sortable ${c || ''}" data-tsort="${k}" ${tt ? `title="${tt}"` : ''}>${l}${UI.txSort.key === k ? `<span class="arr">${UI.txSort.dir === 'asc' ? '▲' : '▼'}</span>` : ''}</th>`).join('')}<th></th></tr></thead><tbody>
     ${(() => { const cands = linkCandidates(); return shown.map(t => { const ds = docsByTxn[t.id] || []; const sg = ds.length ? [] : suggestionsFor(t, cands); return `<tr data-id="${t.id}">
       <td><input type="checkbox" class="sel" ${UI.sel.has(t.id) ? 'checked' : ''}></td>
       <td style="white-space:nowrap">${fmtDate(t.date)}</td>
@@ -926,6 +1018,7 @@ function vTxns(root) {
   $('#fTag').onchange = e => { f.tag = e.target.value; rf(); };
   $('#fLink').onchange = e => { f.link = e.target.value; rf(); };
   $('#autoLink').onclick = () => autoLinkReview();
+  $$('th[data-tsort]', root).forEach(th => th.onclick = () => { const k = th.dataset.tsort; UI.txSort = UI.txSort.key === k ? { key: k, dir: UI.txSort.dir === 'asc' ? 'desc' : 'asc' } : { key: k, dir: ['date', 'amount', 'bal', 'docs'].includes(k) ? 'desc' : 'asc' }; LS.set('ledger.txSort', UI.txSort); rf(); });
   $('#stShow')?.addEventListener('click', () => { f.link = 'stale'; rf(); });
   $('#stDelAll')?.addEventListener('click', async () => { const st = S.txns.filter(isStale); if (!confirm(`Delete all ${st.length} entries that aren't in their bank statements? Type, tags and document links move to the matching statement entry where there is one.`)) return; const r = await deleteStale(st); f.link = ''; toast(`Deleted ${r.deleted}${r.moved ? ` · details moved to ${r.moved} statement entr${r.moved > 1 ? 'ies' : 'y'}` : ''}`, 5000); rf(); });
   $('#fFrom').onchange = e => { f.from = e.target.value; rf(); };
@@ -1005,6 +1098,14 @@ function filteredDocs() {
 function statusCls(s) { return { reconciled: 'good', unreconciled: 'warn', paid: 'good', accepted: 'good', received: 'good', closed: 'good', unpaid: 'warn', open: 'warn', issued: 'warn', 'partially received': 'warn', rejected: 'crit', void: 'crit', expired: 'crit', cancelled: 'crit' }[s] || ''; }
 function statusHTML(d) { if (d.needsReview) return '<span class="status warn">⚑ needs review</span>'; const od = d.type === 'invoice' && d.status === 'unpaid' && d.dueDate && d.dueDate < today(); return `<span class="status ${od ? 'crit' : statusCls(d.status)}">${od ? '⚠ overdue' : esc(d.status || '')}</span>`; }
 /* ---------- Document chain: Quote › PO › Invoice › Paid (bank/card transaction) ---------- */
+/* Payment check for a chain: net total paid vs billed. Flag only if clearly over, and not marked OK for these exact amounts. */
+function payCheck(recs, txns, billed) {
+  const paid = Math.abs(txns.reduce((s, t) => s + t.amount, 0));            // net: a refund cancels the charge it reverses
+  const over = billed > 0 && txns.length > 1 && paid > billed * 1.01 + 0.5;
+  const ack = over ? recs.find(x => x?.payAck && Math.abs(x.payAck.paid - paid) < 0.01 && Math.abs(x.payAck.billed - billed) < 0.01 && x.payAck.n === txns.length) : null;
+  const matches = txns.length > 1 && billed > 0 && Math.abs(paid - billed) <= Math.max(0.5, billed * 0.01);
+  return { paid, over, ack, flagged: over && !ack, matches };
+}
 function chainOf(kind, r) {
   let quotes = [], pos = [], invs = [];
   if (kind === 'po') pos = [r];
@@ -1020,7 +1121,7 @@ function chainOf(kind, r) {
     : [['quote', 'Quote', quotes], ['po', 'PO', pos], ['invoice', 'Invoice', invs], ['paid', 'Paid', txns]].map(st => (st[0] === (kind === 'po' ? 'po' : r.type)) ? ['self', st[1], [r]] : st);
   const missing = closed || r.needsReview ? [] : steps.filter(st => !st[2].length).map(st => st[0]);
   const billed0 = invs.length ? invs.reduce((s, i) => s + (+i.amount || 0), 0) : pos.length ? pos.reduce((s, p) => s + poTotals(p).total, 0) : +r.amount || 0;
-  if (!closed && !r.needsReview && txns.length > 1 && billed0 > 0 && txns.reduce((s, t) => s + Math.abs(t.amount), 0) > billed0 * 1.01) missing.push('overpaid');
+  if (!closed && !r.needsReview && payCheck([...invs, ...pos, ...quotes, r], txns, billed0).flagged) missing.push('overpaid');
   return { quotes, pos, invs, txns, steps, closed, missing };
 }
 function chainHTML(kind, r) {
@@ -1029,7 +1130,7 @@ function chainHTML(kind, r) {
   if (r.needsReview) return '<span class="muted small">review first</span>';
   return `<div class="chain">${c.steps.map(([k, label, items]) => {
     const ok = items.length > 0; let cls = k === 'self' ? 'self' : ok ? 'ok' : c.closed ? 'na' : 'miss';
-    const overpaid = k === 'paid' && items.length > 1 && chainPayments(kind, r).over; if (overpaid) cls = 'miss';
+    const overpaid = k === 'paid' && items.length > 1 && !c.closed && chainPayments(kind, r).over; if (overpaid) cls = 'miss';
     const title = k === 'self' ? 'This document' : ok ? items.map(x => x.date ? `${fmtDate(x.date)} · ${x.description || x.vendor || ''} ${money(x.amount ?? poTotals(x).total)}`.trim() : x.number || '').join('\n') : c.closed ? 'Closed — not expected' : `Not linked yet — click to link a ${label.toLowerCase()}`;
     return `<button type="button" class="ch ${cls}${overpaid ? ' over' : ''}" data-step="${k}" title="${esc(overpaid ? 'Payments add up to more than the bill — click to review\n' + title : title)}">${overpaid ? '⚠' : ok ? '✓' : c.closed ? '–' : '○'} ${label}${ok && items.length > 1 ? ' ×' + items.length : ''}</button>`;
   }).join('<span class="chsep">›</span>')}${c.closed ? '<span class="small muted"> closed</span>' : ''}</div>`;
@@ -1046,9 +1147,9 @@ function chainPayments(kind, r) {
   }
   const pays = [...map.values()].sort((a, b) => a.t.date.localeCompare(b.t.date));
   const billed = c.invs.length ? c.invs.reduce((s, i) => s + (+i.amount || 0), 0) : c.pos.length ? c.pos.reduce((s, p) => s + poTotals(p).total, 0) : r.type === 'receipt' ? +r.amount || 0 : c.quotes.reduce((s, q) => s + (+q.amount || 0), 0);
-  const paid = pays.reduce((s, p) => s + Math.abs(p.t.amount), 0);
-  const over = billed > 0 && pays.length > 1 && paid > billed * 1.01;
-  return { c, pays, billed, paid, over };
+  const pc = payCheck([...c.invs, ...c.pos, ...c.quotes, r], pays.map(p => p.t), billed);
+  const anchor = c.invs[0] ? ['docs', c.invs[0]] : c.pos[0] ? ['pos', c.pos[0]] : ['docs', r];   // where an "OK" is remembered
+  return { c, pays, billed, paid: pc.paid, over: pc.flagged, ack: pc.ack, matches: pc.matches, anchor };
 }
 function holderLabel(o) { return `${o.kind === 'po' ? 'PO' : DOC_TYPES[o.rec.type]} ${o.rec.number || o.rec.vendor || ''}`.trim(); }
 function paymentsManager(kind, r) {
@@ -1059,7 +1160,7 @@ function paymentsManager(kind, r) {
     $('#modal .mtitle').textContent = `Payments — ${[...c.quotes.map(q => 'Quote ' + (q.number || '')), ...c.pos.map(p => p.number), ...c.invs.map(i => 'Invoice ' + (i.number || '')), ...(rec.type === 'receipt' ? ['Receipt ' + (rec.number || rec.vendor || '')] : [])].join(' › ')}`;
     $('#modal .mbody').innerHTML = `
       <div class="small muted" style="margin-bottom:8px">Every bank/card transaction linked anywhere in this chain, and which document holds the link. A payment normally belongs on the <b>invoice</b> (or the receipt).</div>
-      ${over ? `<div class="banner warn small">⚠ ${pays.length} payments total <b>${money(paid)}</b> but the bill is <b>${money(billed)}</b> — one is probably a duplicate link (or a duplicate import of the same payment). Unlink the extra one below.</div>` : ''}
+      ${over ? `<div class="banner warn small">⚠ ${pays.length} payments total <b>${money(paid)}</b> but the bill is <b>${money(billed)}</b> — one may be a duplicate link (or a duplicate import). Unlink the extra one below, or <button class="b sm" id="pmOk">Mark as OK</button> if they're correct.</div>` : ''}
       ${pays.length ? `<table><thead><tr><th>Date</th><th>Transaction</th><th class="r">Amount</th><th>Linked on</th><th></th></tr></thead><tbody>
       ${pays.map(p => `<tr data-t="${p.t.id}"><td style="white-space:nowrap">${fmtDate(p.t.date)}</td><td>${esc(p.t.description)}<div class="small muted">${esc(acctName(p.t.accountId))}${isStale(p.t) ? ' · <span style="color:var(--crit)">⚑ not in bank statement</span>' : ''}${pays.some(q => q !== p && Math.abs(q.t.amount - p.t.amount) < 0.005) ? ' · <span style="color:var(--warn)">same amount as another payment here</span>' : ''}</div></td>
         <td class="r">${money(p.t.amount)}</td>
@@ -1068,6 +1169,7 @@ function paymentsManager(kind, r) {
       </tbody></table>
       <div class="small muted" style="margin-top:6px">Paid ${money(paid)}${billed ? ` of ${money(billed)} billed` : ''}.</div>` : '<div class="muted">No payments linked.</div>'}
       <div class="mfoot"><button class="b" id="pmAdd">＋ Link a payment…</button><span style="flex:1"></span><button class="b pri" data-close>Done</button></div>`;
+    $('#pmOk')?.addEventListener('click', async () => { const P = chainPayments(kind, rec); const [n, a] = P.anchor; a.payAck = { paid: +P.paid.toFixed(2), billed: +P.billed.toFixed(2), n: P.pays.length, at: new Date().toISOString() }; await persist(n, a); toast('Marked OK'); draw(); render(); });
     $('#pmAdd').onclick = () => { const tgt = inv ? ['doc', inv] : c.invs[0] ? ['doc', c.invs[0]] : c.pos[0] ? ['po', c.pos[0]] : [kind, rec]; txnPicker(tgt[0], tgt[1]); };
     return { c, inv };
   };
@@ -1085,19 +1187,6 @@ function paymentsManager(kind, r) {
   });
 }
 
-/* Generic picker: click a row to choose it. */
-function pickDialog(title, intro, items, onPick, extraHTML = '') {
-  const body = modal(title, `<div class="small muted" style="margin-bottom:8px">${intro}</div>${extraHTML}
-    <input id="pkQ" placeholder="Search" style="width:100%;margin-bottom:8px">
-    <div class="linklist" id="pkList" style="max-height:55vh"></div>
-    <div class="mfoot"><button class="b" data-close>Cancel</button></div>`, { wide: true });
-  const draw = () => { const q = $('#pkQ', body).value.toLowerCase();
-    const L = items.filter(i => !q || i.search.toLowerCase().includes(q)).slice(0, 150);
-    $('#pkList', body).innerHTML = L.length ? L.map(i => `<label data-id="${i.id}" style="cursor:pointer">${i.score >= 50 ? '<span class="sugg">MATCH</span>' : ''} <span>${i.label}</span><span class="amt">${i.amount != null ? money(i.amount) : ''}</span></label>`).join('') : '<div class="muted small" style="padding:10px">Nothing to choose from.</div>'; };
-  draw(); $('#pkQ', body).oninput = draw;
-  $('#pkList', body).onclick = async e => { const row = e.target.closest('label[data-id]'); if (!row) return; e.preventDefault(); const it = items.find(i => i.id === row.dataset.id); await onPick(it); closeModal(); render(); };
-  return body;
-}
 function relScore(a, b) {
   let s = 0; const va = tokens(a.vendor), vb = tokens(b.vendor);
   if (va.length && va.some(w => vb.includes(w))) s += 45;
@@ -1109,48 +1198,43 @@ function relScore(a, b) {
 const docItem = (d, ref) => ({ id: d.id, rec: d, score: relScore(ref, d), amount: +d.amount || 0, label: `<b>${DOC_TYPES[d.type]}</b> ${esc(d.number || '')} · ${esc(d.vendor || d.fileName || '')} <span class="muted small">${fmtDate(d.date)} · ${esc(d.status || '')}</span>`, search: [d.vendor, d.number, d.amount, d.fileName].join(' ') });
 const poItem = (p, ref) => ({ id: p.id, rec: p, score: relScore(ref, p), amount: poTotals(p).total, label: `<b>PO</b> ${esc(p.number || '')} · ${esc(p.vendor || p.fileName || '')} <span class="muted small">${fmtDate(p.date)} · ${esc(p.status || '')}</span>`, search: [p.vendor, p.number, poTotals(p).total, p.fileName].join(' ') });
 const byScore = L => L.sort((a, b) => b.score - a.score || (b.rec.date || '').localeCompare(a.rec.date || ''));
-/* Fill one missing link in a document's chain. */
-function linkStep(kind, r, step) {
+/* Fill one missing link in a document's chain (sortable picker; grayed = attached elsewhere, picking moves it). */
+const relRow = (kind, x, ref, taken) => { const c = linkItem(kind, x); return { id: x.id, c, rec: x, date: c.date, score: relScore(ref, x), on: false, taken: taken || '' }; };
+const poNum = id => S.pos.find(p => p.id === id)?.number || 'another PO';
+async function setPOQuote(po, q) {
+  for (const other of S.pos.filter(x => x.quoteId === q.id && x.id !== po.id)) { other.quoteId = ''; other.quoteRef = ''; await persist('pos', other); }
+  po.quoteId = q.id; po.quoteRef = q.number || ''; await persist('pos', po);
+  if (q.status === 'open') { q.status = 'accepted'; await persist('docs', q); }
+  toast(`Linked quote ${q.number || ''} → ${po.number}`);
+}
+async function setInvPO(inv, po) { const was = inv.poId && inv.poId !== po.id ? poNum(inv.poId) : ''; inv.poId = po.id; await persist('docs', inv); toast(`Linked ${inv.number || 'invoice'} → ${po.number}${was ? ` (moved from ${was})` : ''}`, was ? 5000 : 2600); }
+function linkStep(kind, r, step, onDone) {
   const c = chainOf(kind, r);
-  const setPOQuote = async (po, q) => { po.quoteId = q.id; po.quoteRef = q.number || ''; await persist('pos', po); if (q.status === 'open') { q.status = 'accepted'; await persist('docs', q); } toast(`Linked ${q.number || 'quote'} → ${po.number}`); };
-  const setInvPO = async (inv, po) => { inv.poId = po.id; await persist('docs', inv); toast(`Linked ${po.number} → ${inv.number || 'invoice'}`); };
   if (step === 'quote') {
     const po = c.pos[0];
     if (!po) return toast('Link this invoice to its PO first — the quote attaches to the PO', 4500);
-    return pickDialog(`Quote for ${po.number}`, `Choose the quote that ${esc(po.number)} was issued against.`, byScore(S.docs.filter(d => d.type === 'quote').map(d => docItem(d, po))), it => setPOQuote(po, it.rec));
+    const rows = S.docs.filter(d => d.type === 'quote').map(q => { const used = S.pos.find(p => p.quoteId === q.id && p.id !== po.id); return relRow('doc', q, po, used ? `on ${used.number}` : ''); });
+    return pickDialog(`Quote for ${po.number}`, `Choose the quote that ${esc(po.number)} was issued against.`, rows, it => setPOQuote(po, it.rec));
   }
   if (step === 'po') {
     if (r.type === 'quote') {
-      const body = pickDialog(`PO for quote ${r.number || ''}`, 'Choose an existing PO that was issued for this quote, or create one from it.', byScore(S.pos.filter(p => !p.quoteId).map(p => poItem(p, r))), it => setPOQuote(it.rec, r), '<button class="b pri" id="pkNewPO" style="margin-bottom:8px">＋ Create a PO from this quote</button>');
+      const rows = S.pos.filter(p => p.status !== 'cancelled').map(p => relRow('po', p, r, p.quoteId && p.quoteId !== r.id ? `for quote ${S.docs.find(d => d.id === p.quoteId)?.number || '?'}` : ''));
+      const body = pickDialog(`PO for quote ${r.number || ''}`, 'Choose the PO issued for this quote, or create one from it.', rows, it => setPOQuote(it.rec, r), '<button class="b pri" id="pkNewPO" style="margin-bottom:8px">＋ Create a PO from this quote</button>');
       $('#pkNewPO', body).onclick = () => editPO(null, r); return;
     }
-    return pickDialog(`PO for invoice ${r.number || ''}`, 'Choose the PO this invoice bills against.', byScore(S.pos.filter(p => p.status !== 'cancelled').map(p => poItem(p, r))), it => setInvPO(r, it.rec));
+    const rows = S.pos.filter(p => p.status !== 'cancelled').map(p => relRow('po', p, r, ''));
+    return pickDialog(`PO for invoice ${r.number || ''}`, 'Choose the PO this invoice bills against.', rows, it => setInvPO(r, it.rec));
   }
   if (step === 'invoice') {
     const po = c.pos[0];
     if (!po) return toast('Create or link a PO first — invoices attach to the PO', 4500);
-    return pickDialog(`Invoice for ${po.number}`, `Choose the invoice billed against ${esc(po.number)}.`, byScore(S.docs.filter(d => d.type === 'invoice' && !d.poId).map(d => docItem(d, po))), it => setInvPO(it.rec, po));
+    const rows = S.docs.filter(d => d.type === 'invoice' && d.poId !== po.id).map(i => relRow('doc', i, po, i.poId ? `on ${poNum(i.poId)}` : ''));
+    return pickDialog(`Invoice for ${po.number}`, `Choose the invoice billed against ${esc(po.number)}.`, rows, it => setInvPO(it.rec, po));
   }
   if (step === 'paid') {
     const target = c.invs[0] ? ['doc', c.invs[0]] : c.pos[0] ? ['po', c.pos[0]] : ['doc', r];
-    return txnPicker(target[0], target[1]);
+    return txnPicker(target[0], target[1], onDone);
   }
-}
-/* Link bank/card transactions to one document (ranked by amount, date, vendor). */
-function txnPicker(kind, rec) {
-  const item = () => linkItem(kind, (kind === 'po' ? S.pos : S.docs).find(x => x.id === rec.id) || rec);
-  const body = modal(`Payment for ${item().typeLabel} ${rec.number || ''}`, `
-    <div class="small muted" style="margin-bottom:8px">Tick the bank or card transaction(s) that paid ${esc(item().typeLabel.toLowerCase())} ${esc(rec.number || '')} · ${esc(rec.vendor || '')} · <b>${money(item().amount)}</b>. Saves immediately.</div>
-    <input id="tpQ" placeholder="Search description or amount" style="width:100%;margin-bottom:8px">
-    <div class="linklist" id="tpList" style="max-height:55vh"></div>
-    <div class="mfoot"><button class="b pri" id="tpDone">Done</button></div>`, { wide: true });
-  const draw = () => { const q = $('#tpQ', body).value.toLowerCase(); const it = item();
-    const L = S.txns.filter(t => t.cls !== 'transfer').map(t => ({ t, ...matchScore(t, it), on: it.linked.includes(t.id) }))
-      .filter(x => !q || (x.t.description + ' ' + x.t.amount).toLowerCase().includes(q)).sort((a, b) => (b.on - a.on) || (b.score - a.score) || b.t.date.localeCompare(a.t.date)).slice(0, 120);
-    $('#tpList', body).innerHTML = L.map(x => `<label><input type="checkbox" value="${x.t.id}" ${x.on ? 'checked' : ''}> ${x.score >= 50 && !x.on ? '<span class="sugg">MATCH</span>' : ''} ${fmtDate(x.t.date)} · ${esc(x.t.description)} <span class="muted small">${esc(acctName(x.t.accountId))}${x.score >= 50 ? ' · ' + x.why.join(', ') : ''}</span><span class="amt">${money(x.t.amount)}</span></label>`).join('') || '<div class="muted small" style="padding:10px">No transactions.</div>'; };
-  draw(); $('#tpQ', body).oninput = draw;
-  $('#tpList', body).onchange = async e => { const cb = e.target; cb.disabled = true; try { const note = await setLink(item(), cb.value, cb.checked); toast((cb.checked ? 'Linked' : 'Unlinked') + (note || '')); } catch { cb.checked = !cb.checked; } cb.disabled = false; draw(); };
-  $('#tpDone', body).onclick = () => { closeModal(); render(); };
 }
 
 function filteredAll() {
@@ -1464,7 +1548,7 @@ function editDoc(d, file, rest = [], prefill = null) {
     const btn = $('#dSave', body); btn.disabled = true; btn.textContent = 'Saving…';
     try {
       const items = readItems(body); const sub = items.reduce((s, i) => s + i.qty * i.price, 0);
-      const live = S.docs.find(x => x.id === d.id); if (live) { d.linkedTxnIds = live.linkedTxnIds || []; d.poId = live.poId || ''; }
+      const live = S.docs.find(x => x.id === d.id); if (live) { d.linkedTxnIds = live.linkedTxnIds || []; d.poId = live.poId || ''; if (live.payAck) d.payAck = live.payAck; else delete d.payAck; }
       if ($('#dT', body).value === 'receipt' && d.linkedTxnIds?.length && $('#dS', body).value === 'unreconciled') $('#dS', body).value = 'reconciled';
       if ($('#dT', body).value === 'invoice' && d.linkedTxnIds?.length && $('#dS', body).value === 'unpaid') $('#dS', body).value = 'paid';
       Object.assign(d, { type: $('#dT', body).value, vendor: $('#dV', body).value.trim(), number: $('#dN', body).value.trim(), date: $('#dD', body).value, amount: $('#dA', body).value === '' ? +sub.toFixed(2) : +$('#dA', body).value, dueDate: $('#dDue', body).value, status: $('#dS', body).value, tags: parseTags($('#dTags', body).value), description: $('#dDesc', body).value.trim(), items, updatedAt: new Date().toISOString() });
@@ -1527,7 +1611,9 @@ function linkagePanel(host, kind, id, hooks = {}) {
     const label = { quote: 'Quote', po: 'Purchase order', invoice: 'Invoice', paid: 'Payments', self: DOC_TYPES[r.type] };
     const item = (k, x, step) => `<div class="lkItem"><span><b>${k === 'po' ? 'PO' : DOC_TYPES[x.type]}</b> ${esc(x.number || '')} · ${esc(x.vendor || x.fileName || '')}<br><span class="small muted">${fmtDate(x.date)} · ${money(k === 'po' ? poTotals(x).total : x.amount)}${x.status ? ' · ' + esc(x.status) : ''}</span></span>
       <span class="lkBtns"><button type="button" class="b sm" data-open="${k}:${x.id}" title="Open this document">Open</button><button type="button" class="b sm danger" data-unlink="${step}:${x.id}" title="Remove this link">✕</button></span></div>`;
-    const sel = (step, opts, extra = '') => `<select class="lkAdd" data-add="${step}"><option value="">＋ Link ${{ paid: 'a payment', po: 'a PO', invoice: 'an invoice', quote: 'a quote' }[step]}…</option>${extra}${opts.map(o => `<option value="${o.id}">${o.score >= 50 ? '★ ' : ''}${esc(o.text)}</option>`).join('')}</select>`;
+    const opt = o => `<option value="${o.id}">${o.score >= 50 ? '★ ' : ''}${esc(o.text)}${o.taken ? ' — ' + esc(o.taken) : ''}</option>`;
+    const sel = (step, opts, extra = '') => { const av = opts.filter(o => !o.taken), tk = opts.filter(o => o.taken);
+      return `<select class="lkAdd" data-add="${step}"><option value="">＋ Link ${{ paid: 'a payment', po: 'a PO', invoice: 'an invoice', quote: 'a quote' }[step]}…</option>${extra}${av.map(opt).join('')}${tk.length ? `<optgroup label="Linked elsewhere — choosing one moves it here">${tk.map(opt).join('')}</optgroup>` : ''}</select>`; };
     const docOpt = (d, ref) => ({ id: d.id, score: relScore(ref, d), text: `${d.number || '—'} · ${d.vendor || d.fileName || ''} · ${money(d.amount)} · ${fmtDate(d.date)}` });
     const poOpt = (p, ref) => ({ id: p.id, score: relScore(ref, p), text: `${p.number || '—'} · ${p.vendor || ''} · ${money(poTotals(p).total)} · ${fmtDate(p.date)}` });
     const rank = L => L.sort((a, b) => b.score - a.score).slice(0, 60);
@@ -1536,20 +1622,22 @@ function linkagePanel(host, kind, id, hooks = {}) {
       let inner = '', ok = false;
       if (step === 'quote') {
         ok = !!c.quotes.length; inner = c.quotes.map(q => item('doc', q, 'quote')).join('');
-        if (!ok) inner += c.pos.length ? sel('quote', rank(S.docs.filter(d => d.type === 'quote').map(d => docOpt(d, c.pos[0])))) : `<div class="small muted">Link a PO first — the quote attaches to the PO.</div>`;
+        if (!ok) inner += c.pos.length ? sel('quote', rank(S.docs.filter(d => d.type === 'quote').map(d => { const u = S.pos.find(p => p.quoteId === d.id && p.id !== c.pos[0].id); return { ...docOpt(d, c.pos[0]), taken: u ? 'on ' + u.number : '' }; }))) : `<div class="small muted">Link a PO first — the quote attaches to the PO.</div>`;
       }
       if (step === 'po') {
         ok = !!c.pos.length; inner = c.pos.map(p => item('po', p, 'po')).join('');
-        if (!ok) inner += r.type === 'quote' ? sel('po', rank(S.pos.filter(p => !p.quoteId).map(p => poOpt(p, r))), '<option value="__new">＋ Create a PO from this quote</option>') : sel('po', rank(S.pos.filter(p => p.status !== 'cancelled').map(p => poOpt(p, r))));
+        if (!ok) inner += r.type === 'quote' ? sel('po', rank(S.pos.filter(p => p.status !== 'cancelled').map(p => ({ ...poOpt(p, r), taken: p.quoteId && p.quoteId !== r.id ? 'for quote ' + (S.docs.find(d => d.id === p.quoteId)?.number || '?') : '' }))), '<option value="__new">＋ Create a PO from this quote</option>') : sel('po', rank(S.pos.filter(p => p.status !== 'cancelled').map(p => poOpt(p, r))));
       }
       if (step === 'invoice') {
         ok = !!c.invs.length; inner = c.invs.map(i => item('doc', i, 'invoice')).join('');
-        inner += c.pos.length ? sel('invoice', rank(S.docs.filter(d => d.type === 'invoice' && !d.poId).map(d => docOpt(d, c.pos[0])))) : `<div class="small muted">Link a PO first — invoices attach to the PO.</div>`;
+        inner += c.pos.length ? sel('invoice', rank(S.docs.filter(d => d.type === 'invoice' && d.poId !== c.pos[0].id).map(d => ({ ...docOpt(d, c.pos[0]), taken: d.poId ? 'on ' + poNum(d.poId) : '' })))) : `<div class="small muted">Link a PO first — invoices attach to the PO.</div>`;
       }
       if (step === 'paid') {
         ok = P.pays.length > 0;
         const inv1 = c.invs.length === 1 ? c.invs[0] : null;
-        inner = (P.over ? `<div class="small" style="color:var(--warn);font-weight:600;margin-bottom:4px">⚠ ${money(P.paid)} paid vs ${money(P.billed)} billed — likely a duplicate</div>` : '')
+        inner = (P.over ? `<div class="small" style="color:var(--warn);font-weight:600;margin-bottom:4px">⚠ ${money(P.paid)} paid vs ${money(P.billed)} billed — possibly a duplicate. <button type="button" class="b sm" data-payok title="These payments are correct — stop flagging this chain">Mark as OK</button></div>`
+                 : P.ack ? `<div class="small muted" style="margin-bottom:4px">✓ ${money(P.paid)} paid vs ${money(P.billed)} billed — marked OK <a href="#" data-payundo>undo</a></div>`
+                 : P.matches ? `<div class="small" style="color:var(--good);margin-bottom:4px">✓ ${P.pays.length} payments total ${money(P.paid)} — matches the bill</div>` : '')
           + P.pays.map(p => `<div class="lkItem"><span>${fmtDate(p.t.date)} · ${esc(p.t.description)}<br><span class="small muted">${money(p.t.amount)} · ${esc(acctName(p.t.accountId))} · on ${p.on.map(o => esc(holderLabel(o))).join(', ')}${isStale(p.t) ? ' · <span style="color:var(--crit)">⚑ not in statement</span>' : ''}</span></span>
             <span class="lkBtns">${inv1 && !p.on.some(o => o.rec.id === inv1.id) ? `<button type="button" class="b sm" data-move="${p.t.id}" title="Attach to the invoice instead">→ Invoice</button>` : ''}<button type="button" class="b sm danger" data-unpay="${p.t.id}" title="Unlink this payment">✕</button></span></div>`).join('');
         const tgt = c.invs[0] ? linkItem('doc', c.invs[0]) : c.pos[0] ? linkItem('po', c.pos[0]) : linkItem(kind === 'po' ? 'po' : 'doc', r);
@@ -1571,6 +1659,8 @@ function linkagePanel(host, kind, id, hooks = {}) {
       if (step === 'invoice') { const i = recOf('doc', x); i.poId = ''; await persist('docs', i); return after('Invoice unlinked'); } }
     const up = e.target.closest('[data-unpay]');
     if (up) { const p = chainPayments(kind, r).pays.find(q => q.t.id === up.dataset.unpay); let note = ''; for (const h of p.on) note = (await setLink(linkItem(h.kind, h.rec), p.t.id, false)) || note; return after('Payment unlinked' + note); }
+    if (e.target.closest('[data-payok]')) { const P = chainPayments(kind, r); const [n, a] = P.anchor; a.payAck = { paid: +P.paid.toFixed(2), billed: +P.billed.toFixed(2), n: P.pays.length, at: new Date().toISOString() }; await persist(n, a); return after('Marked OK — this chain won\'t be flagged unless the amounts change'); }
+    if (e.target.closest('[data-payundo]')) { e.preventDefault(); const P = chainPayments(kind, r); const holder = [...P.c.invs, ...P.c.pos, ...P.c.quotes, r].find(x => x.payAck); if (holder) { delete holder.payAck; await persist(S.pos.includes(holder) ? 'pos' : 'docs', holder); } return after('Flag restored'); }
     const mv = e.target.closest('[data-move]');
     if (mv) { const p = chainPayments(kind, r).pays.find(q => q.t.id === mv.dataset.move); for (const h of p.on) await setLink(linkItem(h.kind, h.rec), p.t.id, false); const note = await setLink(linkItem('doc', c.invs[0]), p.t.id, true); return after('Moved to invoice' + (note || '')); }
   });
@@ -1578,15 +1668,14 @@ function linkagePanel(host, kind, id, hooks = {}) {
     const s = e.target.closest('.lkAdd'); if (!s || !s.value) return; const v = s.value; s.disabled = true;
     const r = recOf(kind, id); const c = chainOf(kind, r); const step = s.dataset.add;
     try {
-      if (step === 'quote') { const p = c.pos[0], q = recOf('doc', v); p.quoteId = q.id; p.quoteRef = q.number || ''; await persist('pos', p); if (q.status === 'open') { q.status = 'accepted'; await persist('docs', q); } return after('Quote linked'); }
+      if (step === 'quote') { await setPOQuote(c.pos[0], recOf('doc', v)); return after(); }
       if (step === 'po') {
         if (v === '__new') return hooks.newPO ? hooks.newPO(r) : editPO(null, r);
         const p = recOf('po', v);
-        if (r.type === 'quote') { p.quoteId = r.id; p.quoteRef = r.number || ''; await persist('pos', p); if (r.status === 'open') { r.status = 'accepted'; await persist('docs', r); } }
-        else { r.poId = p.id; await persist('docs', r); }
-        return after('PO linked');
+        if (r.type === 'quote') await setPOQuote(p, r); else await setInvPO(r, p);
+        return after();
       }
-      if (step === 'invoice') { const i = recOf('doc', v); i.poId = c.pos[0].id; await persist('docs', i); return after('Invoice linked'); }
+      if (step === 'invoice') { await setInvPO(recOf('doc', v), c.pos[0]); return after(); }
       if (step === 'paid') { const tgt = c.invs[0] ? linkItem('doc', c.invs[0]) : c.pos[0] ? linkItem('po', c.pos[0]) : linkItem(kind === 'po' ? 'po' : 'doc', r); const note = await setLink(tgt, v, true); return after('Payment linked to ' + tgt.typeLabel.toLowerCase() + ' ' + (tgt.number || '') + (note || '')); }
     } catch (err) { DBG.err('linkage change failed', err); toast('Could not link: ' + (err.code || err.message), 5000); s.disabled = false; }
   });
@@ -1728,7 +1817,7 @@ function editPO(p, quote, file = null, rest = [], prefill = null) {
   const collect = () => Object.assign(p, { number: $('#pN', body).value.trim(), date: $('#pD', body).value, status: $('#pS', body).value, vendor: $('#pV', body).value.trim(), vendorContact: $('#pVC', body).value.trim(), terms: $('#pT', body).value.trim(), deliveryDate: $('#pDel', body).value, vendorAddress: $('#pVA', body).value.trim(), shipTo: $('#pST', body).value.trim(), items: readItems(body), taxRate: +$('#pTax', body).value || 0, shipping: +$('#pShip', body).value || 0, tags: parseTags($('#pTags', body).value), notes: $('#pNotes', body).value.trim(), totalOverride: +$('#pOver', body).value || 0, updatedAt: new Date().toISOString() });
   const save = async (pdf, after) => {
     collect();
-    const live = S.pos.find(x => x.id === p.id); if (live) { p.linkedTxnIds = live.linkedTxnIds || []; p.quoteId = live.quoteId || ''; p.quoteRef = live.quoteRef || ''; }
+    const live = S.pos.find(x => x.id === p.id); if (live) { p.linkedTxnIds = live.linkedTxnIds || []; p.quoteId = live.quoteId || ''; p.quoteRef = live.quoteRef || ''; if (live.payAck) p.payAck = live.payAck; else delete p.payAck; }
     if (!p.number) { toast('Enter the PO number'); return false; }
     if (S.pos.some(x => x.number === p.number && x.id !== p.id)) { toast('That PO number is already used'); return false; }
     const btn = $('#pSave', body); btn.disabled = true; btn.textContent = 'Saving…';
@@ -2099,92 +2188,3 @@ async function boot() {
   }
   if (!store) store = await makeLocal();
   DBG.info('boot: storage backend = ' + store.kind);
-  try {
-    const d = await store.loadAll();
-    S.accounts = d.accounts || []; S.txns = d.txns || []; S.docs = d.docs || []; S.pos = d.pos || [];
-    S.settings = { ...DEFAULT_SETTINGS, ...((d.settings || []).find(x => x.id === 'main') || {}) };
-    const ph = S.txns.filter(t => t.autoTransfer);
-    if (ph.length) {
-      const origins = ph.map(x => S.txns.find(o => o.id === x.transferPairId)).filter(Boolean); origins.forEach(o => o.transferPairId = '');
-      S.txns = S.txns.filter(t => !t.autoTransfer);
-      try { await store.delMany('txns', ph.map(x => x.id)); if (origins.length) await persistMany('txns', origins); await autoPairTransfers(); DBG.info(`removed ${ph.length} auto-created transfer entries`); toast(`Removed ${ph.length} auto-created transfer entr${ph.length > 1 ? 'ies' : 'y'} — transfers now pair only with real transactions`, 6000); }
-      catch (e) { DBG.err('transfer placeholder cleanup failed', e); }
-    }
-    { const ids = new Set(S.txns.map(t => t.id)); const fixD = [], fixP = [];
-      if (S.txns.length) for (const [arr, out] of [[S.docs, fixD], [S.pos, fixP]]) arr.forEach(x => { const L = x.linkedTxnIds || []; const keep = [...new Set(L.filter(id => ids.has(id)))]; if (keep.length !== L.length) { x.linkedTxnIds = keep; out.push(x); } });
-      if (fixD.length || fixP.length) { try { if (fixD.length) await persistMany('docs', fixD); if (fixP.length) await persistMany('pos', fixP); DBG.info(`removed links to deleted transactions from ${fixD.length + fixP.length} document(s)`); } catch (e) { DBG.err('link cleanup failed', e); } } }
-    const legacy = S.txns.filter(t => LEGACY_CAPITAL.has(t.cls));
-    if (legacy.length) { legacy.forEach(t => t.cls = 'capital'); DBG.info(`migrating ${legacy.length} capital infusion/withdrawal → capital`); persistMany('txns', legacy).catch(e => DBG.err('capital migration failed', e)); }
-    setConn(store.kind === 'firebase' ? 'ok' : 'warn', store.kind === 'firebase' ? `Firebase · ${store.projectId}${store.auth.currentUser ? ' · ' + (store.auth.currentUser.email || 'anon') : ''}` : 'Local mode');
-    DBG.info('boot: data loaded', { accounts: S.accounts.length, txns: S.txns.length, docs: S.docs.length, pos: S.pos.length });
-  } catch (e) {
-    DBG.err('boot: data load failed', e);
-    setConn('bad', 'Load failed'); toast('Could not load data: ' + (e.code || e.message) + (e.code === 'permission-denied' ? ' — Firestore rules rejected this user.' : '') + ' Open Debug for details.', 9000);
-    if (store.kind === 'firebase') { const fb = store; store = await makeLocal(); store._failedFirebase = fb; const d = await store.loadAll(); Object.assign(S, { accounts: d.accounts, txns: d.txns, docs: d.docs, pos: d.pos }); setConn('bad', 'Firebase error — local mode'); }
-  }
-  go(UI.tab);
-}
-
-/* ---------------- debug panel & diagnostics ---------------- */
-function envInfo() {
-  const cfg = LS.get('ledger.fbConfig', FIREBASE_CONFIG) || {};
-  const fb = store?.kind === 'firebase' ? store : store?._failedFirebase;
-  const u = fb?.auth?.currentUser;
-  let ls = false, ss = false; try { localStorage.setItem('_t', '1'); localStorage.removeItem('_t'); ls = true; } catch {} try { sessionStorage.setItem('_t', '1'); sessionStorage.removeItem('_t'); ss = true; } catch {}
-  return {
-    when: new Date().toString(), href: location.href, origin: location.origin, protocol: location.protocol, hostname: location.hostname,
-    userAgent: navigator.userAgent, cookiesEnabled: navigator.cookieEnabled, localStorage: ls, sessionStorage: ss, indexedDB: !!window.indexedDB,
-    inIframe: window.top !== window.self, online: navigator.onLine,
-    config: { apiKey: cfg.apiKey ? cfg.apiKey.slice(0, 8) + '…' + cfg.apiKey.slice(-4) : null, authDomain: cfg.authDomain, projectId: cfg.projectId, storageBucket: cfg.storageBucket, appId: cfg.appId, source: localStorage.getItem('ledger.fbConfig') ? 'Settings/localStorage' : 'hard-coded' },
-    prefix: LS.get('ledger.prefix', defaultPrefix(cfg)), requireAuth: LS.get('ledger.auth', false), forceLocal: LS.get('ledger.forceLocal', false),
-    backend: store?.kind, firebaseSdk: FB_VER,
-    user: u ? { uid: u.uid, email: u.email, emailVerified: u.emailVerified, anonymous: u.isAnonymous, providers: u.providerData.map(p => p.providerId) } : null,
-    libs: { Chart: !!window.Chart, jsPDF: !!window.jspdf }
-  };
-}
-function report() { return ['=== LEDGER DEBUG REPORT ===', JSON.stringify(envInfo(), null, 2), '', '=== LOG ===', ...DBG.lines()].join('\n'); }
-async function runDiagnostics() {
-  DBG.mark('diagnostics start');
-  const env = envInfo(); DBG.info('env', env);
-  if (location.protocol === 'file:') DBG.warn('Opened as file:// — Google sign-in cannot work here.');
-  if (env.inIframe) DBG.warn('Page is inside an iframe — popups/storage may be restricted.');
-  if (/github\.io$/.test(location.hostname)) DBG.info(`GitHub Pages host — make sure "${location.hostname}" is in Firebase Authorized domains (no https://, no path).`);
-  const fb = store?.kind === 'firebase' ? store : store?._failedFirebase;
-  if (!fb) { DBG.warn('Firebase not active (local mode). Try Settings → Save & reconnect, then rerun.'); return; }
-  try { const r = await fetch(`https://${env.config.authDomain}/__/auth/handler`, { method: 'HEAD', mode: 'no-cors' }); DBG.info('authDomain handler reachable (opaque response)', { type: r.type }); } catch (e) { DBG.err('authDomain handler NOT reachable', e); }
-  const u = fb.auth.currentUser;
-  if (!u) { DBG.warn('Not signed in — Firestore/Storage tests will use no auth.'); }
-  else {
-    try { const t = await u.getIdTokenResult(true); DBG.info('ID token claims', { email: t.claims.email, email_verified: t.claims.email_verified, sign_in_provider: t.signInProvider, aud: t.claims.aud, expires: t.expirationTime }); if (t.claims.aud !== env.config.projectId) DBG.err('token audience ≠ projectId'); }
-    catch (e) { DBG.err('getIdTokenResult failed', e); }
-  }
-  const { F, S, db, st, prefix } = fb;
-  try { const s = await F.getDocs(F.query(F.collection(db, prefix + 'settings'), F.limit(1))); DBG.info(`TEST firestore read ${prefix}settings: OK (${s.size} doc)`); } catch (e) { DBG.err(`TEST firestore read ${prefix}settings: FAILED`, e); }
-  const probe = F.doc(db, prefix + 'settings', '_debug_probe');
-  try { await F.setDoc(probe, { at: new Date().toISOString(), uid: u?.uid || null }); DBG.info('TEST firestore write: OK'); await F.deleteDoc(probe); DBG.info('TEST firestore delete: OK'); } catch (e) { DBG.err('TEST firestore write/delete: FAILED', e); }
-  try { const l = await S.list(S.ref(st, 'accounting/docs'), { maxResults: 1 }); DBG.info(`TEST storage list accounting/docs: OK (${l.prefixes.length + l.items.length} entries)`); } catch (e) { DBG.err('TEST storage list: FAILED', e); }
-  const pr = S.ref(st, 'accounting/_debug_probe.txt');
-  try { await S.uploadString(pr, 'probe ' + new Date().toISOString()); DBG.info('TEST storage upload: OK'); await S.getDownloadURL(pr); DBG.info('TEST storage getDownloadURL: OK'); await S.deleteObject(pr); DBG.info('TEST storage delete: OK'); } catch (e) { DBG.err('TEST storage upload/url/delete: FAILED', e); }
-  DBG.mark('diagnostics done');
-}
-function toggleDebug(show) {
-  const p = $('#dbgPanel'); p.hidden = show === undefined ? !p.hidden : !show;
-  if (!p.hidden) { $('#dbgLog').textContent = DBG.lines().join('\n'); $('#dbgLog').scrollTop = 1e9; }
-}
-document.body.insertAdjacentHTML('beforeend', `
-<button id="dbgBtn" title="Debug log">🐞 Debug</button>
-<div id="dbgPanel" hidden>
-  <div class="dbgHead"><b>Debug</b><span class="small muted">Run diagnostics, then copy the report and paste it to Claude. API key is redacted.</span><span style="flex:1"></span>
-    <button class="b sm" id="dbgRun">Run diagnostics</button><button class="b sm pri" id="dbgCopy">Copy debug report</button><button class="b sm" id="dbgDl">Download .txt</button><button class="b sm" id="dbgClear">Clear</button><button class="x" id="dbgX">&times;</button></div>
-  <pre id="dbgLog"></pre>
-</div>`);
-$('#dbgBtn').onclick = () => toggleDebug(); $('#dbgX').onclick = () => toggleDebug(false);
-$('#dbgClear').onclick = () => DBG.clear();
-$('#dbgRun').onclick = async () => { const b = $('#dbgRun'); b.disabled = true; b.textContent = 'Running…'; try { await runDiagnostics(); } finally { b.disabled = false; b.textContent = 'Run diagnostics'; } };
-$('#dbgCopy').onclick = async () => { const txt = report(); try { await navigator.clipboard.writeText(txt); toast('Debug report copied — paste it into the chat'); } catch { const ta = document.createElement('textarea'); ta.value = txt; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); toast('Debug report copied'); } };
-$('#dbgDl').onclick = () => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([report()], { type: 'text/plain' })); a.download = `ledger-debug-${today()}.txt`; a.click(); };
-if (/[?&]debug\b/.test(location.search)) toggleDebug(true);
-boot();
-</script>
-</body>
-</html>
