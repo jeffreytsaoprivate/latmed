@@ -1133,18 +1133,24 @@ function payCheck(recs, txns, billed) {
   return { paid, over, ack, flagged: over && !ack, matches };
 }
 function chainOf(kind, r) {
-  let quotes = [], pos = [], invs = [];
+  let quotes = [], pos = [];
   if (kind === 'po') pos = [r];
   else if (r.type === 'quote') { quotes = [r]; pos = S.pos.filter(p => p.quoteId === r.id); }
-  else if (r.type === 'invoice') { invs = [r]; const p = r.poId && S.pos.find(x => x.id === r.poId); if (p) pos = [p]; }
+  else if (r.type === 'invoice') {
+    const p = r.poId && S.pos.find(x => x.id === r.poId);
+    if (p) pos = [p];
+    else if (r.quoteId) { const q = S.docs.find(d => d.id === r.quoteId); if (q) { quotes = [q]; pos = S.pos.filter(x => x.quoteId === q.id); } }
+  }
   if (!quotes.length) quotes = [...new Set(pos.map(p => p.quoteId).filter(Boolean))].map(id => S.docs.find(d => d.id === id)).filter(Boolean);
-  if (kind === 'po' || r.type === 'quote') invs = S.docs.filter(d => d.type === 'invoice' && pos.some(p => p.id === d.poId));
+  // every invoice billed against these POs, plus invoices linked straight to these quotes (no PO)
+  const invs = S.docs.filter(d => d.type === 'invoice' && (pos.some(p => p.id === d.poId) || (!d.poId && d.quoteId && quotes.some(q => q.id === d.quoteId))));
+  if (r.type === 'invoice' && !invs.includes(r)) invs.unshift(r);
   const txIds = new Set([...quotes, ...pos, ...invs, ...(r.type === 'receipt' ? [r] : [])].flatMap(x => x.linkedTxnIds || []));
   const txns = [...txIds].map(id => S.txns.find(t => t.id === id)).filter(Boolean);
   const closed = (r.type === 'invoice' && r.status === 'void') || (kind === 'po' && r.status === 'cancelled') || (r.type === 'quote' && ['rejected', 'expired'].includes(r.status) && !pos.length);
   const steps = r.type === 'receipt' ? [['self', 'Receipt', [r]], ['paid', 'Paid', txns]]
     : r.type === 'other' ? []
-    : [['quote', 'Quote', quotes], ['po', 'PO', pos], ['invoice', 'Invoice', invs], ['paid', 'Paid', txns]].map(st => (st[0] === (kind === 'po' ? 'po' : r.type)) ? ['self', st[1], [r]] : st);
+    : [['quote', 'Quote', quotes], ['po', 'PO', pos], ['invoice', 'Invoice', invs], ['paid', 'Paid', txns]].map(st => (st[0] === (kind === 'po' ? 'po' : r.type)) ? ['self', st[1], st[0] === 'invoice' ? invs : [r]] : st);
   const missing = closed || r.needsReview ? [] : steps.filter(st => !st[2].length).map(st => st[0]);
   const billed0 = invs.length ? invs.reduce((s, i) => s + (+i.amount || 0), 0) : pos.length ? pos.reduce((s, p) => s + poTotals(p).total, 0) : +r.amount || 0;
   const ac = amountCheck(quotes, pos, invs, txns, r);
@@ -1235,12 +1241,23 @@ async function setPOQuote(po, q) {
   if (q.status === 'open') { q.status = 'accepted'; await persist('docs', q); }
   toast(`Linked quote ${q.number || ''} → ${po.number}`);
 }
-async function setInvPO(inv, po) { const was = inv.poId && inv.poId !== po.id ? poNum(inv.poId) : ''; inv.poId = po.id; await persist('docs', inv); toast(`Linked ${inv.number || 'invoice'} → ${po.number}${was ? ` (moved from ${was})` : ''}`, was ? 5000 : 2600); }
+async function setInvQuote(inv, q) {
+  const was = inv.poId ? poNum(inv.poId) : inv.quoteId && inv.quoteId !== q.id ? 'quote ' + (S.docs.find(d => d.id === inv.quoteId)?.number || '') : '';
+  inv.quoteId = q.id; inv.poId = ''; await persist('docs', inv);
+  if (q.status === 'open') { q.status = 'accepted'; await persist('docs', q); }
+  toast(`Linked ${inv.number || 'invoice'} → quote ${q.number || ''}${was ? ` (moved from ${was})` : ''}`, was ? 5000 : 2600);
+}
+const invTaken = (d, c) => d.poId && !c.pos.some(p => p.id === d.poId) ? 'on ' + poNum(d.poId) : !d.poId && d.quoteId && !c.quotes.some(q => q.id === d.quoteId) ? 'on quote ' + (S.docs.find(x => x.id === d.quoteId)?.number || '?') : '';
+async function setInvPO(inv, po) {
+  if (inv.quoteId && !po.quoteId) { const q = S.docs.find(d => d.id === inv.quoteId); if (q) { po.quoteId = q.id; po.quoteRef = q.number || ''; await persist('pos', po); } }   // the PO takes over the quote link
+  inv.quoteId = '';
+  const was = inv.poId && inv.poId !== po.id ? poNum(inv.poId) : ''; inv.poId = po.id; await persist('docs', inv); toast(`Linked ${inv.number || 'invoice'} → ${po.number}${was ? ` (moved from ${was})` : ''}`, was ? 5000 : 2600); }
 function linkStep(kind, r, step, onDone) {
   const c = chainOf(kind, r);
   if (step === 'quote') {
     const po = c.pos[0];
-    if (!po) return toast('Link this invoice to its PO first — the quote attaches to the PO', 4500);
+    if (!po && r.type === 'invoice') return pickDialog(`Quote for invoice ${r.number || ''}`, 'Choose the quote this invoice bills against (no PO needed).', S.docs.filter(d => d.type === 'quote').map(q => relRow('doc', q, r, '')), it => setInvQuote(r, it.rec));
+    if (!po) return toast('Link a PO first', 4000);
     const rows = S.docs.filter(d => d.type === 'quote').map(q => { const used = S.pos.find(p => p.quoteId === q.id && p.id !== po.id); return relRow('doc', q, po, used ? `on ${used.number}` : ''); });
     return pickDialog(`Quote for ${po.number}`, `Choose the quote that ${esc(po.number)} was issued against.`, rows, it => setPOQuote(po, it.rec));
   }
@@ -1254,10 +1271,11 @@ function linkStep(kind, r, step, onDone) {
     return pickDialog(`PO for invoice ${r.number || ''}`, 'Choose the PO this invoice bills against.', rows, it => setInvPO(r, it.rec));
   }
   if (step === 'invoice') {
-    const po = c.pos[0];
-    if (!po) return toast('Create or link a PO first — invoices attach to the PO', 4500);
-    const rows = S.docs.filter(d => d.type === 'invoice' && d.poId !== po.id).map(i => relRow('doc', i, po, i.poId ? `on ${poNum(i.poId)}` : ''));
-    return pickDialog(`Invoice for ${po.number}`, `Choose the invoice billed against ${esc(po.number)}.`, rows, it => setInvPO(it.rec, po));
+    const po = c.pos[0], q = c.quotes[0];
+    if (!po && !q) return toast('Link a quote or PO first', 4000);
+    const rows = S.docs.filter(d => d.type === 'invoice' && !c.invs.includes(d)).map(i => relRow('doc', i, po || q, invTaken(i, c)));
+    return po ? pickDialog(`Invoice for ${po.number}`, `Choose an invoice billed against ${esc(po.number)} — a PO can have several.`, rows, it => setInvPO(it.rec, po))
+              : pickDialog(`Invoice for quote ${q.number || ''}`, `Choose an invoice billed against quote ${esc(q.number || '')} — a quote can have several.`, rows, it => setInvQuote(it.rec, q));
   }
   if (step === 'paid') {
     const target = c.invs[0] ? ['doc', c.invs[0]] : c.pos[0] ? ['po', c.pos[0]] : ['doc', r];
@@ -1576,7 +1594,7 @@ function editDoc(d, file, rest = [], prefill = null) {
     const btn = $('#dSave', body); btn.disabled = true; btn.textContent = 'Saving…';
     try {
       const items = readItems(body); const sub = items.reduce((s, i) => s + i.qty * i.price, 0);
-      const live = S.docs.find(x => x.id === d.id); if (live) { d.linkedTxnIds = live.linkedTxnIds || []; d.poId = live.poId || ''; if (live.payAck) d.payAck = live.payAck; else delete d.payAck; if (live.amtAck) d.amtAck = live.amtAck; else delete d.amtAck; }
+      const live = S.docs.find(x => x.id === d.id); if (live) { d.linkedTxnIds = live.linkedTxnIds || []; d.poId = live.poId || ''; d.quoteId = live.quoteId || ''; if (live.payAck) d.payAck = live.payAck; else delete d.payAck; if (live.amtAck) d.amtAck = live.amtAck; else delete d.amtAck; }
       if ($('#dT', body).value === 'receipt' && d.linkedTxnIds?.length && $('#dS', body).value === 'unreconciled') $('#dS', body).value = 'reconciled';
       if ($('#dT', body).value === 'invoice' && d.linkedTxnIds?.length && $('#dS', body).value === 'unpaid') $('#dS', body).value = 'paid';
       Object.assign(d, { type: $('#dT', body).value, vendor: $('#dV', body).value.trim(), number: $('#dN', body).value.trim(), date: $('#dD', body).value, amount: $('#dA', body).value === '' ? +sub.toFixed(2) : +$('#dA', body).value, dueDate: $('#dDue', body).value, status: $('#dS', body).value, tags: parseTags($('#dTags', body).value), description: $('#dDesc', body).value.trim(), items, updatedAt: new Date().toISOString() });
@@ -1646,11 +1664,15 @@ function linkagePanel(host, kind, id, hooks = {}) {
     const poOpt = (p, ref) => ({ id: p.id, score: relScore(ref, p), text: `${p.number || '—'} · ${p.vendor || ''} · ${money(poTotals(p).total)} · ${fmtDate(p.date)}` });
     const rank = L => L.sort((a, b) => b.score - a.score).slice(0, 60);
     const col = step => {
-      if (step === 'self' || step === myType) return `<div class="lkCol self"><div class="lkHead">● ${label[step === 'self' ? 'self' : step]}</div><div class="small muted">this document</div></div>`;
+      if (step === 'self' || step === myType) {
+        const sib = myType === 'invoice' ? c.invs.filter(i => i.id !== r.id) : [];
+        return `<div class="lkCol self"><div class="lkHead">● ${label[step === 'self' ? 'self' : step]}${sib.length ? ` <span class="muted">(${c.invs.length})</span>` : ''}</div><div class="small muted">this document</div>${sib.map(i => item('doc', i, 'invoice')).join('')}${sib.length ? '' : ''}</div>`;
+      }
       let inner = '', ok = false;
       if (step === 'quote') {
         ok = !!c.quotes.length; inner = c.quotes.map(q => item('doc', q, 'quote')).join('');
-        if (!ok) inner += c.pos.length ? sel('quote', rank(S.docs.filter(d => d.type === 'quote').map(d => { const u = S.pos.find(p => p.quoteId === d.id && p.id !== c.pos[0].id); return { ...docOpt(d, c.pos[0]), taken: u ? 'on ' + u.number : '' }; }))) : `<div class="small muted">Link a PO first — the quote attaches to the PO.</div>`;
+        if (!ok) inner += c.pos.length ? sel('quote', rank(S.docs.filter(d => d.type === 'quote').map(d => { const u = S.pos.find(p => p.quoteId === d.id && p.id !== c.pos[0].id); return { ...docOpt(d, c.pos[0]), taken: u ? 'on ' + u.number : '' }; })))
+          : r.type === 'invoice' ? sel('quote', rank(S.docs.filter(d => d.type === 'quote').map(d => docOpt(d, r)))) : `<div class="small muted">Link a PO first.</div>`;
       }
       if (step === 'po') {
         ok = !!c.pos.length; inner = c.pos.map(p => item('po', p, 'po')).join('');
@@ -1658,7 +1680,7 @@ function linkagePanel(host, kind, id, hooks = {}) {
       }
       if (step === 'invoice') {
         ok = !!c.invs.length; inner = c.invs.map(i => item('doc', i, 'invoice')).join('');
-        inner += c.pos.length ? sel('invoice', rank(S.docs.filter(d => d.type === 'invoice' && d.poId !== c.pos[0].id).map(d => ({ ...docOpt(d, c.pos[0]), taken: d.poId ? 'on ' + poNum(d.poId) : '' })))) : `<div class="small muted">Link a PO first — invoices attach to the PO.</div>`;
+        inner += (c.pos.length || c.quotes.length) ? sel('invoice', rank(S.docs.filter(d => d.type === 'invoice' && !c.invs.includes(d)).map(d => ({ ...docOpt(d, c.pos[0] || c.quotes[0]), taken: invTaken(d, c) })))) : `<div class="small muted">Link a quote or PO first.</div>`;
       }
       if (step === 'paid') {
         ok = P.pays.length > 0;
@@ -1682,9 +1704,9 @@ function linkagePanel(host, kind, id, hooks = {}) {
     const o = e.target.closest('[data-open]'); if (o) { const [k, x] = o.dataset.open.split(':'); return hooks.open ? hooks.open(k, x) : openRecord(k, x); }
     const u = e.target.closest('[data-unlink]');
     if (u) { const [step, x] = u.dataset.unlink.split(':');
-      if (step === 'quote') { const p = c.pos[0]; p.quoteId = ''; p.quoteRef = ''; await persist('pos', p); return after('Quote unlinked'); }
+      if (step === 'quote') { if (c.pos[0]) { const p = c.pos[0]; p.quoteId = ''; p.quoteRef = ''; await persist('pos', p); } for (const i of c.invs.filter(i => !i.poId && i.quoteId === x)) { i.quoteId = ''; await persist('docs', i); } return after('Quote unlinked'); }
       if (step === 'po') { if (r.type === 'invoice') { r.poId = ''; await persist('docs', r); } else { const p = recOf('po', x); p.quoteId = ''; p.quoteRef = ''; await persist('pos', p); } return after('PO unlinked'); }
-      if (step === 'invoice') { const i = recOf('doc', x); i.poId = ''; await persist('docs', i); return after('Invoice unlinked'); } }
+      if (step === 'invoice') { const i = recOf('doc', x); i.poId = ''; i.quoteId = ''; await persist('docs', i); return after('Invoice unlinked'); } }
     const up = e.target.closest('[data-unpay]');
     if (up) { const p = chainPayments(kind, r).pays.find(q => q.t.id === up.dataset.unpay); let note = ''; for (const h of p.on) note = (await setLink(linkItem(h.kind, h.rec), p.t.id, false)) || note; return after('Payment unlinked' + note); }
     if (e.target.closest('[data-amtok]')) { const P = chainPayments(kind, r); const [n, a] = P.anchor; a.amtAck = c.ac.sig; await persist(n, a); return after('Marked OK — this chain won\'t be flagged unless the amounts change'); }
@@ -1696,14 +1718,14 @@ function linkagePanel(host, kind, id, hooks = {}) {
     const s = e.target.closest('.lkAdd'); if (!s || !s.value) return; const v = s.value; s.disabled = true;
     const r = recOf(kind, id); const c = chainOf(kind, r); const step = s.dataset.add;
     try {
-      if (step === 'quote') { await setPOQuote(c.pos[0], recOf('doc', v)); return after(); }
+      if (step === 'quote') { if (c.pos[0]) await setPOQuote(c.pos[0], recOf('doc', v)); else await setInvQuote(r, recOf('doc', v)); return after(); }
       if (step === 'po') {
         if (v === '__new') return hooks.newPO ? hooks.newPO(r) : editPO(null, r);
         const p = recOf('po', v);
         if (r.type === 'quote') await setPOQuote(p, r); else await setInvPO(r, p);
         return after();
       }
-      if (step === 'invoice') { await setInvPO(recOf('doc', v), c.pos[0]); return after(); }
+      if (step === 'invoice') { if (c.pos[0]) await setInvPO(recOf('doc', v), c.pos[0]); else await setInvQuote(recOf('doc', v), c.quotes[0]); return after(); }
       if (step === 'paid') { const tgt = c.invs[0] ? linkItem('doc', c.invs[0]) : c.pos[0] ? linkItem('po', c.pos[0]) : linkItem(kind === 'po' ? 'po' : 'doc', r); const note = await setLink(tgt, v, true); return after('Payment linked to ' + tgt.typeLabel.toLowerCase() + ' ' + (tgt.number || '') + (note || '')); }
     } catch (err) { DBG.err('linkage change failed', err); toast('Could not link: ' + (err.code || err.message), 5000); s.disabled = false; }
   });
