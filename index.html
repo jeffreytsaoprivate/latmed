@@ -191,6 +191,9 @@ tr.rowlink{cursor:pointer}
 .ptable tr.sel td{background:color-mix(in srgb,var(--accent) 10%,transparent)}
 .ptable tr.pgroup td{font-size:11.5px;color:var(--text-muted);background:var(--surface-2);font-weight:600;opacity:1}
 .ptable tbody tr[data-id]{cursor:pointer}
+.lkSum{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px;font-size:12.5px;padding:6px 8px;border-radius:7px;background:var(--surface-1);border:1px solid var(--border)}
+.lkSum.bad{border-color:var(--warn);color:var(--text-primary)}
+.lkSum .amtx{color:var(--warn);font-weight:700}
 @media (max-width:1000px){.split{grid-template-columns:1fr}.splitR{position:static;height:70vh}}
 @media (max-width:760px){.g2{grid-template-columns:1fr}.viewer{grid-template-columns:1fr;height:auto}.vlist{max-height:200px}.vframe{height:60vh}}
 </style>
@@ -309,14 +312,17 @@ function parseCSV(text) {
 }
 
 /* ---------------- constants ---------------- */
-const CLASSES = { '': 'Operating', capital: 'Capital (+ in / − out)', transfer: 'Internal transfer' };
+const CLASSES = { '': '⚙️ Operating', bank: '🏦 Bank activity', capital: '💵 Capital (+ in / − out)', transfer: '⇄ Internal transfer' };
 const LEGACY_CAPITAL = new Set(['infusion', 'withdrawal']);
-const capLabel = t => t.amount >= 0 ? 'Capital +' : 'Capital −';
+const capLabel = t => t.amount >= 0 ? '💵 Capital +' : '💵 Capital −';
 const DOC_TYPES = { quote: 'Quote', invoice: 'Invoice', receipt: 'Receipt', other: 'Other' };
 const DOC_STATUS = { quote: ['open','accepted','rejected','expired'], invoice: ['unpaid','paid','void'], receipt: ['unreconciled','reconciled'], other: ['filed'] };
 const PO_STATUS = ['draft','issued','partially received','received','closed','cancelled'];
 const COLS = ['accounts','txns','docs','pos','settings'];
 const DEFAULT_SETTINGS = { id:'main', company:'', address:'', email:'', phone:'', poPrefix:'PO', taxRate:0, burnMonths:3, largeTxn:5000, paymentTerms:'Net 30', currency:'USD' };
+/* Routine bank entries (interest, account fees, wire fees…) → 🏦 Bank activity, so they can be ignored */
+const BANK_RE = /(interest earned|interest paid|interest payment|monthly fee|monthly maintenance|maintenance fee|service fee|service charge|account fee|analysis fee|wire (transfer )?fee|wire in fee|wire out fee|incoming wire fee|outgoing wire fee|overdraft|nsf fee|returned item fee|stop payment fee|atm fee|non-bofa atm|foreign transaction fee|intl transaction fee|international transaction fee|annual fee|late fee|finance charge|interest charge|paper statement fee|cashier'?s check fee|card replacement fee)/i;
+const autoClass = desc => TRANSFER_RE.test(desc) ? 'transfer' : BANK_RE.test(desc) ? 'bank' : '';
 const TRANSFER_RE = /(payment\s*-?\s*thank you|online banking transfer|transfer (to|from)|bank of america credit card bill payment|online payment|autopay)/i;
 
 /* ---------------- storage adapters ---------------- */
@@ -391,7 +397,7 @@ async function makeLocal() {
 /* ---------------- state ---------------- */
 let store = null;
 const S = { accounts: [], txns: [], docs: [], pos: [], settings: {...DEFAULT_SETTINGS} };
-const UI = { tab: location.hash.slice(1) || 'overview', range: LS.get('ledger.range', '12m'), tx: { acct:'', cls:'all', q:'', tag:'', from:'', to:'', link:'' }, txSort: LS.get('ledger.txSort', { key: 'date', dir: 'desc' }), sel: new Set(), docF: { type:'', status:'', q:'', tag:'', chain:'' }, docSort: LS.get('ledger.docSort', { key: 'date', dir: 'desc' }), skipped: new Set(), viewIdx: 0, pendingImport: null };
+const UI = { tab: location.hash.slice(1) || 'overview', range: LS.get('ledger.range', '12m'), tx: { acct:'', cls:'all', q:'', tag:'', from:'', to:'', link:'' }, txSort: LS.get('ledger.txSort', { key: 'date', dir: 'desc' }), sel: new Set(), hideBank: LS.get('ledger.hideBank', false), docF: { type:'', status:'', q:'', tag:'', chain:'' }, docSort: LS.get('ledger.docSort', { key: 'date', dir: 'desc' }), skipped: new Set(), viewIdx: 0, pendingImport: null };
 let docsByTxn = {};
 const charts = {};
 
@@ -437,7 +443,7 @@ function balanceAt(series, d) { let b = series.opening; for (const p of series.p
 function monthly(from) {
   const m = {};
   for (const t of S.txns) {
-    if (t.date < from || t.cls === 'transfer') continue;
+    if (t.date < from || t.cls === 'transfer' || t.cls === 'bank') continue;
     const k = monthKey(t.date); const r = (m[k] ??= { inflow: 0, outflow: 0, capital: 0 });
     if (t.cls === 'capital') r.capital += t.amount;
     else if (t.amount >= 0) r.inflow += t.amount; else r.outflow += -t.amount;
@@ -611,7 +617,7 @@ function vOverview(root) {
     ${legendHTML([[cssVar('--series-1'), 'Cash balance'], [cssVar('--series-1'), 'Projection', true], [cssVar('--series-3'), 'Capital + (in)'], [cssVar('--series-2'), 'Capital − (out)']])}
     <div class="chartbox tall"><canvas id="cCash"></canvas></div></div>
   <div class="grid g2">
-    <div class="card"><h3>Monthly cash flow</h3><div class="sub">Operating inflow and outflow, plus net capital movement. Internal transfers excluded.</div>
+    <div class="card"><h3>Monthly cash flow</h3><div class="sub">Operating inflow and outflow, plus net capital movement. Internal transfers and 🏦 bank activity excluded.</div>
       ${legendHTML([[cssVar('--series-1'), 'Operating inflow'], [cssVar('--series-2'), 'Operating outflow'], [cssVar('--series-3'), 'Net capital']])}
       <div class="chartbox"><canvas id="cMonthly"></canvas></div></div>
     <div class="card"><h3>Spending by category</h3><div class="sub">Operating outflow in range, by category (or first tag). Top 8.</div><div class="chartbox"><canvas id="cCat"></canvas></div></div>
@@ -708,7 +714,7 @@ function matchScore(t, c) {
   return { score: sc, why };
 }
 function suggestionsFor(t, cands = linkCandidates()) {
-  if (t.cls === 'transfer') return [];
+  if (t.cls === 'transfer' || t.cls === 'bank') return [];
   return cands.filter(c => !c.linked.includes(t.id)).map(c => ({ c, ...matchScore(t, c) })).filter(x => x.score >= 50).sort((a, b) => b.score - a.score);
 }
 async function setLink(item, txnId, on) {
@@ -817,7 +823,7 @@ function txnPicker(kind, rec, onDone) {
       { k: 'desc', label: 'Description', val: r => r.t.description.toLowerCase(), html: r => esc(r.t.description) + (isStale(r.t) ? ' <span class="small" style="color:var(--crit)">⚑ not in statement</span>' : '') },
       { k: 'amount', label: 'Amount', cls: 'r', val: r => Math.abs(r.t.amount), html: r => `<span style="white-space:nowrap">${money(r.t.amount)}</span>` },
       { k: 'linked', label: 'Linked to', val: r => r.taken || (r.on ? '0' : '1'), html: r => r.on ? '<span class="small" style="color:var(--good)">✓ this one</span>' : r.taken ? `<span class="small">${esc(r.taken)}</span>` : '<span class="small muted">— available</span>' }],
-    rows: () => { const it = item(); return S.txns.filter(t => t.cls !== 'transfer').map(t => { const on = it.linked.includes(t.id); const others = (docsByTxn[t.id] || []).filter(l => l.id !== it.id); return { id: t.id, t, date: t.date, ...matchScore(t, it), on, taken: !on && others.length ? 'pays ' + others.map(l => `${l.short} ${l.number || l.vendor}`).join(', ') : '' }; }); },
+    rows: () => { const it = item(); return S.txns.filter(t => t.cls !== 'transfer' && t.cls !== 'bank').map(t => { const on = it.linked.includes(t.id); const others = (docsByTxn[t.id] || []).filter(l => l.id !== it.id); return { id: t.id, t, date: t.date, ...matchScore(t, it), on, taken: !on && others.length ? 'pays ' + others.map(l => `${l.short} ${l.number || l.vendor}`).join(', ') : '' }; }); },
     search: r => r.t.description + ' ' + r.t.amount + ' ' + acctName(r.t.accountId),
     actions: r => r.taken ? '<button class="b sm ptAlso" title="Link here too, keeping its other links (one payment covering several documents)">＋ also</button>' : '' };
   const draw = () => renderPickTable($('#tpList', body), cfg); draw();
@@ -855,7 +861,7 @@ function pickDialog(title, intro, rows, onPick, extraHTML = '') {
 /* Review & apply strong, unambiguous matches across all unlinked transactions */
 function autoLinkReview() {
   const cands = linkCandidates(); const used = new Set(); const props = [];
-  S.txns.filter(t => !(docsByTxn[t.id] || []).length && t.cls !== 'transfer').slice().reverse().forEach(t => {
+  S.txns.filter(t => !(docsByTxn[t.id] || []).length && t.cls !== 'transfer' && t.cls !== 'bank').slice().reverse().forEach(t => {
     const sug = suggestionsFor(t, cands).filter(x => !x.c.linked.length && !used.has(x.c.id));
     if (sug.length && sug[0].score >= 90 && (sug.length === 1 || sug[0].score - sug[1].score >= 20)) { used.add(sug[0].c.id); props.push({ t, ...sug[0] }); }
   });
@@ -965,7 +971,7 @@ function transferBadge(t) {
 function filteredTxns() {
   const f = UI.tx, q = f.q.toLowerCase();
   const cands = f.link === 'suggested' ? linkCandidates() : null;
-  return S.txns.filter(t => (!f.link || (f.link === 'stale' ? isStale(t) : f.link === 'xfer' ? isUnmatchedTransfer(t) : f.link === 'linked' ? (docsByTxn[t.id] || []).length : f.link === 'unlinked' ? !(docsByTxn[t.id] || []).length : !(docsByTxn[t.id] || []).length && suggestionsFor(t, cands).length)) && (!f.acct || t.accountId === f.acct) && (f.cls === 'all' || (f.cls === 'untagged' ? (!t.cls && !(t.tags || []).length && !t.category) : (t.cls || '') === f.cls)) && (!f.tag || (t.tags || []).includes(f.tag)) && (!f.from || t.date >= f.from) && (!f.to || t.date <= f.to) && (!q || (t.description + ' ' + (t.notes || '') + ' ' + (t.category || '') + ' ' + t.amount).toLowerCase().includes(q)));
+  return S.txns.filter(t => (!UI.hideBank || t.cls !== 'bank' || f.cls === 'bank') && (!f.link || (f.link === 'stale' ? isStale(t) : f.link === 'xfer' ? isUnmatchedTransfer(t) : f.link === 'linked' ? (docsByTxn[t.id] || []).length : f.link === 'unlinked' ? !(docsByTxn[t.id] || []).length : !(docsByTxn[t.id] || []).length && suggestionsFor(t, cands).length)) && (!f.acct || t.accountId === f.acct) && (f.cls === 'all' || (f.cls === 'untagged' ? (!t.cls && !(t.tags || []).length && !t.category) : (t.cls || '') === f.cls)) && (!f.tag || (t.tags || []).includes(f.tag)) && (!f.from || t.date >= f.from) && (!f.to || t.date <= f.to) && (!q || (t.description + ' ' + (t.notes || '') + ' ' + (t.category || '') + ' ' + t.amount).toLowerCase().includes(q)));
 }
 function vTxns(root) {
   const f = UI.tx; if (f.link === 'stale' && !S.txns.some(isStale)) { f.link = ''; f.acct = ''; }
@@ -980,11 +986,12 @@ function vTxns(root) {
   <div class="card">
     <div class="toolbar">
       <select id="fAcct"><option value="">All accounts</option>${S.accounts.map(a => `<option value="${a.id}" ${f.acct === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select>
-      <select id="fCls">${[['all','All types'],['','Operating'],['capital','Capital (±)'],['transfer','Internal transfer'],['untagged','Untagged']].map(([v, l]) => `<option value="${v}" ${f.cls === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+      <select id="fCls">${[['all','All types'],['','⚙️ Operating'],['bank','🏦 Bank activity'],['capital','💵 Capital (±)'],['transfer','⇄ Internal transfer'],['untagged','Untagged']].map(([v, l]) => `<option value="${v}" ${f.cls === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
       <select id="fTag"><option value="">Any tag</option>${allTags().map(t => `<option ${f.tag === t ? 'selected' : ''}>${esc(t)}</option>`).join('')}</select>
       <select id="fLink">${[['', 'Linked or not'], ['linked', 'Linked to docs'], ['unlinked', 'Not linked'], ['suggested', 'Has suggested match'], ['xfer', '⚑ Unmatched transfers'], ['stale', '⚑ Not in bank statement']].map(([v, l]) => `<option value="${v}" ${f.link === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
       <input type="date" id="fFrom" value="${f.from}" title="From"><input type="date" id="fTo" value="${f.to}" title="To">
       <input id="fQ" placeholder="Search description, notes, amount" value="${esc(f.q)}" class="grow">
+      <label class="small" style="display:inline-flex;gap:5px;align-items:center;white-space:nowrap" title="Hide interest, account fees, wire fees and other routine bank entries"><input type="checkbox" id="hideBank" ${UI.hideBank ? 'checked' : ''}> Hide 🏦 bank activity</label>
       <button class="b" id="autoLink" title="Find transactions that clearly match a quote, invoice or PO">🔗 Auto-link matches</button>
       <button class="b" id="addTx">+ Manual entry</button>
     </div>
@@ -1005,7 +1012,7 @@ function vTxns(root) {
       <td>${esc(t.description)}${t.notes ? `<div class="small muted">${esc(t.notes)}</div>` : ''}${isStale(t) ? `<div class="small" style="color:var(--crit);font-weight:600">⚑ Not in bank statement ${esc(t.notInStatement.file || '')} (${fmtDate(t.notInStatement.from)} – ${fmtDate(t.notInStatement.to)}) <button class="b sm danger stDel">Delete</button> <button class="b sm stKeep" title="Keep it and stop flagging it">Keep</button></div><div class="small muted">${staleNote(t)}</div>` : ''}</td>
       <td class="r" style="white-space:nowrap">${money(t.amount)}</td>
       <td class="r small" style="white-space:nowrap;color:var(--text-secondary)" title="${esc(acctById(t.accountId)?.name || '')} balance after this transaction">${t._bal != null ? money(t._bal) : ''}</td>
-      <td><select class="clsSel" style="padding:2px 4px;font-size:12px">${Object.entries(CLASSES).map(([v, l]) => `<option value="${v}" ${(t.cls || '') === v ? 'selected' : ''}>${v === 'capital' ? (t.cls === 'capital' ? capLabel(t) : 'Capital') : l}</option>`).join('')}</select>${transferBadge(t)}</td>
+      <td><select class="clsSel" style="padding:2px 4px;font-size:12px">${Object.entries(CLASSES).map(([v, l]) => `<option value="${v}" ${(t.cls || '') === v ? 'selected' : ''}>${v === 'capital' ? (t.cls === 'capital' ? capLabel(t) : '💵 Capital') : l}</option>`).join('')}</select>${transferBadge(t)}</td>
       <td>${t.category ? `<span class="chip" style="font-weight:600">${esc(t.category)}</span>` : ''}${(t.tags || []).map(g => `<span class="chip">${esc(g)}</span>`).join('')}</td>
       <td class="small" style="min-width:150px">${linkChips(t)}${sg.length ? `<button class="b sm linkTx" style="border-color:var(--accent);color:var(--accent);font-weight:600" title="${esc(sg.slice(0, 3).map(x => x.c.typeLabel + ' ' + x.c.number + ' · ' + x.c.vendor + ' (' + x.why.join(', ') + ')').join('\n'))}">🔗 ${sg.length} match${sg.length > 1 ? 'es' : ''}</button>` : `<button class="b sm linkTx" title="Link to quotes, invoices or POs">🔗${ds.length ? '' : ' Link'}</button>`}</td>
       <td><button class="b sm editTx">Edit</button></td></tr>`; }).join(''); })()}
@@ -1018,6 +1025,7 @@ function vTxns(root) {
   $('#fTag').onchange = e => { f.tag = e.target.value; rf(); };
   $('#fLink').onchange = e => { f.link = e.target.value; rf(); };
   $('#autoLink').onclick = () => autoLinkReview();
+  $('#hideBank').onchange = e => { UI.hideBank = e.target.checked; LS.set('ledger.hideBank', UI.hideBank); rf(); };
   $$('th[data-tsort]', root).forEach(th => th.onclick = () => { const k = th.dataset.tsort; UI.txSort = UI.txSort.key === k ? { key: k, dir: UI.txSort.dir === 'asc' ? 'desc' : 'asc' } : { key: k, dir: ['date', 'amount', 'bal', 'docs'].includes(k) ? 'desc' : 'asc' }; LS.set('ledger.txSort', UI.txSort); rf(); });
   $('#stShow')?.addEventListener('click', () => { f.link = 'stale'; rf(); });
   $('#stDelAll')?.addEventListener('click', async () => { const st = S.txns.filter(isStale); if (!confirm(`Delete all ${st.length} entries that aren't in their bank statements? Type, tags and document links move to the matching statement entry where there is one.`)) return; const r = await deleteStale(st); f.link = ''; toast(`Deleted ${r.deleted}${r.moved ? ` · details moved to ${r.moved} statement entr${r.moved > 1 ? 'ies' : 'y'}` : ''}`, 5000); rf(); });
@@ -1099,6 +1107,24 @@ function statusCls(s) { return { reconciled: 'good', unreconciled: 'warn', paid:
 function statusHTML(d) { if (d.needsReview) return '<span class="status warn">⚑ needs review</span>'; const od = d.type === 'invoice' && d.status === 'unpaid' && d.dueDate && d.dueDate < today(); return `<span class="status ${od ? 'crit' : statusCls(d.status)}">${od ? '⚠ overdue' : esc(d.status || '')}</span>`; }
 /* ---------- Document chain: Quote › PO › Invoice › Paid (bank/card transaction) ---------- */
 /* Payment check for a chain: net total paid vs billed. Flag only if clearly over, and not marked OK for these exact amounts. */
+/* Totals of each document type in a chain must roughly agree (within 1% or $1). Reference: invoice › receipt › PO › quote. */
+const AMT_LBL = { quote: 'Quote', po: 'PO', invoice: 'Invoice', receipt: 'Receipt', paid: 'Paid' };
+function amountCheck(quotes, pos, invs, txns, r) {
+  const vals = {}, add = (k, v) => { if (v > 0.004) vals[k] = +v.toFixed(2); };
+  add('quote', quotes.reduce((s, q) => s + (+q.amount || 0), 0));
+  add('po', pos.reduce((s, p) => s + poTotals(p).total, 0));
+  add('invoice', invs.reduce((s, i) => s + (+i.amount || 0), 0));
+  if (r.type === 'receipt') add('receipt', +r.amount || 0);
+  if (txns.length) vals.paid = +Math.abs(txns.reduce((s, t) => s + t.amount, 0)).toFixed(2);   // net
+  const refKey = ['invoice', 'receipt', 'po', 'quote'].find(k => k in vals) || null; const ref = refKey ? vals[refKey] : 0;
+  const tol = Math.max(1, ref * 0.01);
+  const bad = !ref ? [] : Object.keys(vals).filter(k => k !== refKey && Math.abs(vals[k] - ref) > tol);
+  const sig = Object.keys(vals).sort().map(k => k + ':' + vals[k].toFixed(2)).join('|');
+  const recs = [...invs, ...pos, ...quotes, r];
+  const ack = bad.length ? (recs.find(x => x?.amtAck === sig) || (bad.length === 1 && bad[0] === 'paid' ? recs.find(x => x?.payAck && Math.abs(x.payAck.paid - vals.paid) < 0.01 && Math.abs(x.payAck.billed - ref) < 0.01) : null)) : null;
+  const msg = bad.map(k => k === 'paid' && vals.paid < ref ? `paid ${money(vals.paid)} of ${money(ref)} (${money(ref - vals.paid)} outstanding)` : `${AMT_LBL[k]} ${money(vals[k])} vs ${AMT_LBL[refKey]} ${money(ref)} (${vals[k] > ref ? '+' : '−'}${money(Math.abs(vals[k] - ref))})`).join('; ');
+  return { vals, refKey, ref, bad, sig, ack, flagged: bad.length > 0 && !ack, msg };
+}
 function payCheck(recs, txns, billed) {
   const paid = Math.abs(txns.reduce((s, t) => s + t.amount, 0));            // net: a refund cancels the charge it reverses
   const over = billed > 0 && txns.length > 1 && paid > billed * 1.01 + 0.5;
@@ -1121,8 +1147,9 @@ function chainOf(kind, r) {
     : [['quote', 'Quote', quotes], ['po', 'PO', pos], ['invoice', 'Invoice', invs], ['paid', 'Paid', txns]].map(st => (st[0] === (kind === 'po' ? 'po' : r.type)) ? ['self', st[1], [r]] : st);
   const missing = closed || r.needsReview ? [] : steps.filter(st => !st[2].length).map(st => st[0]);
   const billed0 = invs.length ? invs.reduce((s, i) => s + (+i.amount || 0), 0) : pos.length ? pos.reduce((s, p) => s + poTotals(p).total, 0) : +r.amount || 0;
-  if (!closed && !r.needsReview && payCheck([...invs, ...pos, ...quotes, r], txns, billed0).flagged) missing.push('overpaid');
-  return { quotes, pos, invs, txns, steps, closed, missing };
+  const ac = amountCheck(quotes, pos, invs, txns, r);
+  if (!closed && !r.needsReview && ac.flagged) missing.push('amounts');
+  return { quotes, pos, invs, txns, steps, closed, missing, ac };
 }
 function chainHTML(kind, r) {
   const c = chainOf(kind, r);
@@ -1130,9 +1157,10 @@ function chainHTML(kind, r) {
   if (r.needsReview) return '<span class="muted small">review first</span>';
   return `<div class="chain">${c.steps.map(([k, label, items]) => {
     const ok = items.length > 0; let cls = k === 'self' ? 'self' : ok ? 'ok' : c.closed ? 'na' : 'miss';
-    const overpaid = k === 'paid' && items.length > 1 && !c.closed && chainPayments(kind, r).over; if (overpaid) cls = 'miss';
+    const key = k === 'self' ? (kind === 'po' ? 'po' : r.type) : k;
+    const overpaid = !c.closed && c.ac.flagged && c.ac.bad.includes(key); if (overpaid) cls = 'miss';
     const title = k === 'self' ? 'This document' : ok ? items.map(x => x.date ? `${fmtDate(x.date)} · ${x.description || x.vendor || ''} ${money(x.amount ?? poTotals(x).total)}`.trim() : x.number || '').join('\n') : c.closed ? 'Closed — not expected' : `Not linked yet — click to link a ${label.toLowerCase()}`;
-    return `<button type="button" class="ch ${cls}${overpaid ? ' over' : ''}" data-step="${k}" title="${esc(overpaid ? 'Payments add up to more than the bill — click to review\n' + title : title)}">${overpaid ? '⚠' : ok ? '✓' : c.closed ? '–' : '○'} ${label}${ok && items.length > 1 ? ' ×' + items.length : ''}</button>`;
+    return `<button type="button" class="ch ${cls}${overpaid ? ' over' : ''}" data-step="${k}" title="${esc(overpaid ? 'Totals don\'t agree: ' + c.ac.msg + ' — click to review\n' + title : title)}">${overpaid ? '⚠' : ok ? '✓' : c.closed ? '–' : '○'} ${label}${ok && items.length > 1 ? ' ×' + items.length : ''}</button>`;
   }).join('<span class="chsep">›</span>')}${c.closed ? '<span class="small muted"> closed</span>' : ''}</div>`;
 }
 /* ---------- Payments in a chain: who holds each link, over-payment check, unlink / move ---------- */
@@ -1147,9 +1175,9 @@ function chainPayments(kind, r) {
   }
   const pays = [...map.values()].sort((a, b) => a.t.date.localeCompare(b.t.date));
   const billed = c.invs.length ? c.invs.reduce((s, i) => s + (+i.amount || 0), 0) : c.pos.length ? c.pos.reduce((s, p) => s + poTotals(p).total, 0) : r.type === 'receipt' ? +r.amount || 0 : c.quotes.reduce((s, q) => s + (+q.amount || 0), 0);
-  const pc = payCheck([...c.invs, ...c.pos, ...c.quotes, r], pays.map(p => p.t), billed);
-  const anchor = c.invs[0] ? ['docs', c.invs[0]] : c.pos[0] ? ['pos', c.pos[0]] : ['docs', r];   // where an "OK" is remembered
-  return { c, pays, billed, paid: pc.paid, over: pc.flagged, ack: pc.ack, matches: pc.matches, anchor };
+  const paid = c.ac.vals.paid || 0;
+  const anchor = c.invs[0] ? ['docs', c.invs[0]] : c.pos[0] ? ['pos', c.pos[0]] : [r.type ? 'docs' : 'pos', r];   // where an "OK" is remembered
+  return { c, pays, billed, paid, over: c.ac.flagged && c.ac.bad.includes('paid'), ack: c.ac.ack, matches: pays.length > 1 && !c.ac.bad.includes('paid'), anchor };
 }
 function holderLabel(o) { return `${o.kind === 'po' ? 'PO' : DOC_TYPES[o.rec.type]} ${o.rec.number || o.rec.vendor || ''}`.trim(); }
 function paymentsManager(kind, r) {
@@ -1169,7 +1197,7 @@ function paymentsManager(kind, r) {
       </tbody></table>
       <div class="small muted" style="margin-top:6px">Paid ${money(paid)}${billed ? ` of ${money(billed)} billed` : ''}.</div>` : '<div class="muted">No payments linked.</div>'}
       <div class="mfoot"><button class="b" id="pmAdd">＋ Link a payment…</button><span style="flex:1"></span><button class="b pri" data-close>Done</button></div>`;
-    $('#pmOk')?.addEventListener('click', async () => { const P = chainPayments(kind, rec); const [n, a] = P.anchor; a.payAck = { paid: +P.paid.toFixed(2), billed: +P.billed.toFixed(2), n: P.pays.length, at: new Date().toISOString() }; await persist(n, a); toast('Marked OK'); draw(); render(); });
+    $('#pmOk')?.addEventListener('click', async () => { const P = chainPayments(kind, rec); const [n, a] = P.anchor; a.amtAck = P.c.ac.sig; await persist(n, a); toast('Marked OK'); draw(); render(); });
     $('#pmAdd').onclick = () => { const tgt = inv ? ['doc', inv] : c.invs[0] ? ['doc', c.invs[0]] : c.pos[0] ? ['po', c.pos[0]] : [kind, rec]; txnPicker(tgt[0], tgt[1]); };
     return { c, inv };
   };
@@ -1268,7 +1296,7 @@ function vDocs(root) {
     </div>
   </div>
   ${pend.length ? `<div class="banner warn" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><span>⚑ <b>${pend.length} uploaded file${pend.length > 1 ? 's need' : ' needs'} details.</b> ${pend.length > 1 ? 'They are' : 'It is'} highlighted below — you can review them now or any time later.</span><span style="flex:1"></span><button class="b pri" id="rvGo">Review ${pend.length} pending</button></div>` : ''}
-  ${(() => { const g = [...S.docs.map(d => chainOf('doc', d)), ...S.pos.map(p => chainOf('po', p))].filter(c => c.missing.length).length; return g && f.chain !== 'gaps' ? `<div class="banner" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><span><b>${g} document${g > 1 ? 's have' : ' has'} missing links</b> in the Quote › PO › Invoice › Paid chain — shown as dashed orange steps. Click a step to link it.</span><span style="flex:1"></span><button class="b" id="gapGo">Show only these</button></div>` : ''; })()}
+  ${(() => { const g = [...S.docs.map(d => chainOf('doc', d)), ...S.pos.map(p => chainOf('po', p))].filter(c => c.missing.length).length; return g && f.chain !== 'gaps' ? `<div class="banner" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap"><span><b>${g} document${g > 1 ? 's have' : ' has'} missing links</b> or totals that don't agree in the Quote › PO › Invoice › Paid chain — shown as dashed orange (○ missing, ⚠ amount). Click a step to fix it.</span><span style="flex:1"></span><button class="b" id="gapGo">Show only these</button></div>` : ''; })()}
   <div class="kpis">${sum.map(([t, l, n, sub]) => `<div class="kpi" data-type="${t}" style="cursor:pointer;${f.type === t ? 'outline:2px solid var(--accent)' : ''}"><div class="l">${l}</div><div class="v">${n}</div><div class="n">${sub}</div></div>`).join('')}</div>
   <div class="card">
     <div class="toolbar">
@@ -1548,7 +1576,7 @@ function editDoc(d, file, rest = [], prefill = null) {
     const btn = $('#dSave', body); btn.disabled = true; btn.textContent = 'Saving…';
     try {
       const items = readItems(body); const sub = items.reduce((s, i) => s + i.qty * i.price, 0);
-      const live = S.docs.find(x => x.id === d.id); if (live) { d.linkedTxnIds = live.linkedTxnIds || []; d.poId = live.poId || ''; if (live.payAck) d.payAck = live.payAck; else delete d.payAck; }
+      const live = S.docs.find(x => x.id === d.id); if (live) { d.linkedTxnIds = live.linkedTxnIds || []; d.poId = live.poId || ''; if (live.payAck) d.payAck = live.payAck; else delete d.payAck; if (live.amtAck) d.amtAck = live.amtAck; else delete d.amtAck; }
       if ($('#dT', body).value === 'receipt' && d.linkedTxnIds?.length && $('#dS', body).value === 'unreconciled') $('#dS', body).value = 'reconciled';
       if ($('#dT', body).value === 'invoice' && d.linkedTxnIds?.length && $('#dS', body).value === 'unpaid') $('#dS', body).value = 'paid';
       Object.assign(d, { type: $('#dT', body).value, vendor: $('#dV', body).value.trim(), number: $('#dN', body).value.trim(), date: $('#dD', body).value, amount: $('#dA', body).value === '' ? +sub.toFixed(2) : +$('#dA', body).value, dueDate: $('#dDue', body).value, status: $('#dS', body).value, tags: parseTags($('#dTags', body).value), description: $('#dDesc', body).value.trim(), items, updatedAt: new Date().toISOString() });
@@ -1635,18 +1663,18 @@ function linkagePanel(host, kind, id, hooks = {}) {
       if (step === 'paid') {
         ok = P.pays.length > 0;
         const inv1 = c.invs.length === 1 ? c.invs[0] : null;
-        inner = (P.over ? `<div class="small" style="color:var(--warn);font-weight:600;margin-bottom:4px">⚠ ${money(P.paid)} paid vs ${money(P.billed)} billed — possibly a duplicate. <button type="button" class="b sm" data-payok title="These payments are correct — stop flagging this chain">Mark as OK</button></div>`
-                 : P.ack ? `<div class="small muted" style="margin-bottom:4px">✓ ${money(P.paid)} paid vs ${money(P.billed)} billed — marked OK <a href="#" data-payundo>undo</a></div>`
-                 : P.matches ? `<div class="small" style="color:var(--good);margin-bottom:4px">✓ ${P.pays.length} payments total ${money(P.paid)} — matches the bill</div>` : '')
-          + P.pays.map(p => `<div class="lkItem"><span>${fmtDate(p.t.date)} · ${esc(p.t.description)}<br><span class="small muted">${money(p.t.amount)} · ${esc(acctName(p.t.accountId))} · on ${p.on.map(o => esc(holderLabel(o))).join(', ')}${isStale(p.t) ? ' · <span style="color:var(--crit)">⚑ not in statement</span>' : ''}</span></span>
+        inner = P.pays.map(p => `<div class="lkItem"><span>${fmtDate(p.t.date)} · ${esc(p.t.description)}<br><span class="small muted">${money(p.t.amount)} · ${esc(acctName(p.t.accountId))} · on ${p.on.map(o => esc(holderLabel(o))).join(', ')}${isStale(p.t) ? ' · <span style="color:var(--crit)">⚑ not in statement</span>' : ''}</span></span>
             <span class="lkBtns">${inv1 && !p.on.some(o => o.rec.id === inv1.id) ? `<button type="button" class="b sm" data-move="${p.t.id}" title="Attach to the invoice instead">→ Invoice</button>` : ''}<button type="button" class="b sm danger" data-unpay="${p.t.id}" title="Unlink this payment">✕</button></span></div>`).join('');
         const tgt = c.invs[0] ? linkItem('doc', c.invs[0]) : c.pos[0] ? linkItem('po', c.pos[0]) : linkItem(kind === 'po' ? 'po' : 'doc', r);
-        const txo = S.txns.filter(t => t.cls !== 'transfer' && !P.pays.some(p => p.t.id === t.id)).map(t => ({ id: t.id, score: matchScore(t, tgt).score, text: `${fmtDate(t.date)} · ${t.description} · ${money(t.amount)}` }));
+        const txo = S.txns.filter(t => t.cls !== 'transfer' && t.cls !== 'bank' && !P.pays.some(p => p.t.id === t.id)).map(t => ({ id: t.id, score: matchScore(t, tgt).score, text: `${fmtDate(t.date)} · ${t.description} · ${money(t.amount)}` }));
         inner += sel('paid', rank(txo));
       }
       return `<div class="lkCol ${ok ? 'ok' : 'miss'}"><div class="lkHead">${ok ? '✓' : '○'} ${label[step]}</div>${inner}</div>`;
     };
-    host.innerHTML = r.needsReview ? '' : `<div class="lkTitle">Linkage <span class="small muted">— ★ = likely match. Changes save immediately.</span></div><div class="lkRow">${cols.map(col).join('<div class="lkArrow">›</div>')}</div>`;
+    const ac = c.ac; const keys = ['quote', 'po', 'invoice', 'receipt', 'paid'].filter(k => k in ac.vals);
+    const totals = keys.length > 1 ? `<div class="lkSum ${c.closed ? '' : ac.flagged ? 'bad' : ''}"><b>Totals</b> ${keys.map(k => `<span class="${ac.flagged && !c.closed && ac.bad.includes(k) ? 'amtx' : ''}">${AMT_LBL[k]} ${money(ac.vals[k])}</span>`).join('<span class="muted"> · </span>')}
+      <span style="flex:1"></span>${c.closed ? '<span class="muted">closed</span>' : ac.flagged ? `<span>⚠ ${esc(ac.msg)}</span> <button type="button" class="b sm" data-amtok title="The amounts are correct as they are — stop flagging this chain">Mark as OK</button>` : ac.ack ? `<span class="muted">✓ difference marked OK — ${esc(ac.msg)}</span> <a href="#" data-amtundo>undo</a>` : `<span style="color:var(--good)">✓ totals agree${P.pays.length > 1 ? ` (${P.pays.length} payments)` : ''}</span>`}</div>` : '';
+    host.innerHTML = r.needsReview ? '' : `<div class="lkTitle">Linkage <span class="small muted">— ★ = likely match. Changes save immediately.</span></div><div class="lkRow">${cols.map(col).join('<div class="lkArrow">›</div>')}</div>${totals}`;
   };
   const after = async msg => { if (msg) toast(msg); derive(); draw(); hooks.changed?.(recOf(kind, id)); render(); };
   host.addEventListener('click', async e => {
@@ -1659,8 +1687,8 @@ function linkagePanel(host, kind, id, hooks = {}) {
       if (step === 'invoice') { const i = recOf('doc', x); i.poId = ''; await persist('docs', i); return after('Invoice unlinked'); } }
     const up = e.target.closest('[data-unpay]');
     if (up) { const p = chainPayments(kind, r).pays.find(q => q.t.id === up.dataset.unpay); let note = ''; for (const h of p.on) note = (await setLink(linkItem(h.kind, h.rec), p.t.id, false)) || note; return after('Payment unlinked' + note); }
-    if (e.target.closest('[data-payok]')) { const P = chainPayments(kind, r); const [n, a] = P.anchor; a.payAck = { paid: +P.paid.toFixed(2), billed: +P.billed.toFixed(2), n: P.pays.length, at: new Date().toISOString() }; await persist(n, a); return after('Marked OK — this chain won\'t be flagged unless the amounts change'); }
-    if (e.target.closest('[data-payundo]')) { e.preventDefault(); const P = chainPayments(kind, r); const holder = [...P.c.invs, ...P.c.pos, ...P.c.quotes, r].find(x => x.payAck); if (holder) { delete holder.payAck; await persist(S.pos.includes(holder) ? 'pos' : 'docs', holder); } return after('Flag restored'); }
+    if (e.target.closest('[data-amtok]')) { const P = chainPayments(kind, r); const [n, a] = P.anchor; a.amtAck = c.ac.sig; await persist(n, a); return after('Marked OK — this chain won\'t be flagged unless the amounts change'); }
+    if (e.target.closest('[data-amtundo]')) { e.preventDefault(); for (const h of [...c.invs, ...c.pos, ...c.quotes, r]) if (h.amtAck || h.payAck) { delete h.amtAck; delete h.payAck; await persist(S.pos.includes(h) ? 'pos' : 'docs', h); } return after('Flag restored'); }
     const mv = e.target.closest('[data-move]');
     if (mv) { const p = chainPayments(kind, r).pays.find(q => q.t.id === mv.dataset.move); for (const h of p.on) await setLink(linkItem(h.kind, h.rec), p.t.id, false); const note = await setLink(linkItem('doc', c.invs[0]), p.t.id, true); return after('Moved to invoice' + (note || '')); }
   });
@@ -1817,7 +1845,7 @@ function editPO(p, quote, file = null, rest = [], prefill = null) {
   const collect = () => Object.assign(p, { number: $('#pN', body).value.trim(), date: $('#pD', body).value, status: $('#pS', body).value, vendor: $('#pV', body).value.trim(), vendorContact: $('#pVC', body).value.trim(), terms: $('#pT', body).value.trim(), deliveryDate: $('#pDel', body).value, vendorAddress: $('#pVA', body).value.trim(), shipTo: $('#pST', body).value.trim(), items: readItems(body), taxRate: +$('#pTax', body).value || 0, shipping: +$('#pShip', body).value || 0, tags: parseTags($('#pTags', body).value), notes: $('#pNotes', body).value.trim(), totalOverride: +$('#pOver', body).value || 0, updatedAt: new Date().toISOString() });
   const save = async (pdf, after) => {
     collect();
-    const live = S.pos.find(x => x.id === p.id); if (live) { p.linkedTxnIds = live.linkedTxnIds || []; p.quoteId = live.quoteId || ''; p.quoteRef = live.quoteRef || ''; if (live.payAck) p.payAck = live.payAck; else delete p.payAck; }
+    const live = S.pos.find(x => x.id === p.id); if (live) { p.linkedTxnIds = live.linkedTxnIds || []; p.quoteId = live.quoteId || ''; p.quoteRef = live.quoteRef || ''; if (live.payAck) p.payAck = live.payAck; else delete p.payAck; if (live.amtAck) p.amtAck = live.amtAck; else delete p.amtAck; }
     if (!p.number) { toast('Enter the PO number'); return false; }
     if (S.pos.some(x => x.number === p.number && x.id !== p.id)) { toast('That PO number is already used'); return false; }
     const btn = $('#pSave', body); btn.disabled = true; btn.textContent = 'Saving…';
@@ -2059,7 +2087,7 @@ function importPreviewHTML(pi) {
   ${stale.length ? `<div class="banner warn"><b>⚑ ${stale.length} existing entr${stale.length > 1 ? 'ies' : 'y'} in ${esc(acctName(acctId))} between ${fmtDate(rg.from)} and ${fmtDate(rg.to)} ${stale.length > 1 ? 'are' : 'is'} not in this statement.</b> Nothing else should exist in that period — these will be flagged for deletion after import.
     <label class="small" style="display:flex;gap:6px;align-items:center;margin-top:6px"><input type="checkbox" id="impDelStale"> Delete them now (type, tags and document links move to the matching statement entry where there is one)</label>
     <div class="tw" style="max-height:200px;margin-top:6px"><table><tbody>${stale.map(t => `<tr><td style="white-space:nowrap">${fmtDate(t.date)}</td><td>${esc(t.description)}</td><td class="r">${money(t.amount)}</td><td class="small muted">${staleNote(t, pi.txns)}</td></tr>`).join('')}</tbody></table></div></div>` : acctId ? `<div class="small" style="margin:-4px 0 8px;color:var(--good)">✓ No other entries in ${esc(acctName(acctId))} during the statement period.</div>` : ''}
-  <div class="tw" style="max-height:280px"><table><thead><tr><th>Date</th><th>Description</th><th class="r">Amount</th><th>Auto type</th>${acctId ? '<th></th>' : ''}</tr></thead><tbody>${pi.txns.slice(0, 200).map((t, i) => `<tr><td>${fmtDate(t.date)}</td><td>${esc(t.description)}</td><td class="r">${money(t.amount)}</td><td class="small muted">${TRANSFER_RE.test(t.description) ? 'Internal transfer' : ''}</td>${acctId ? `<td class="small muted">${existing.has(ids[i]) ? 'duplicate' : ''}</td>` : ''}</tr>`).join('')}</tbody></table></div>`;
+  <div class="tw" style="max-height:280px"><table><thead><tr><th>Date</th><th>Description</th><th class="r">Amount</th><th>Auto type</th>${acctId ? '<th></th>' : ''}</tr></thead><tbody>${pi.txns.slice(0, 200).map((t, i) => `<tr><td>${fmtDate(t.date)}</td><td>${esc(t.description)}</td><td class="r">${money(t.amount)}</td><td class="small muted">${autoClass(t.description) ? CLASSES[autoClass(t.description)] : ''}</td>${acctId ? `<td class="small muted">${existing.has(ids[i]) ? 'duplicate' : ''}</td>` : ''}</tr>`).join('')}</tbody></table></div>`;
 }
 function bindImportPreview() {
   const pi = UI.pendingImport;
@@ -2075,7 +2103,7 @@ function bindImportPreview() {
       acct.lastImport = new Date().toISOString(); acct.lastImportFile = pi.fileName;
       await persist('accounts', acct);
       const ids = importIds(pi, acct.id); const existing = new Set(S.txns.map(t => t.id)); const now = new Date().toISOString();
-      const fresh = pi.txns.map((t, i) => ({ id: ids[i], accountId: acct.id, date: t.date, description: t.description, amount: +t.amount.toFixed(2), seq: t.seq, ref: t.ref || '', fitid: t.fitid || '', cls: TRANSFER_RE.test(t.description) ? 'transfer' : '', tags: [], category: '', importedAt: now, source: pi.fileName })).filter(t => !existing.has(t.id));
+      const fresh = pi.txns.map((t, i) => ({ id: ids[i], accountId: acct.id, date: t.date, description: t.description, amount: +t.amount.toFixed(2), seq: t.seq, ref: t.ref || '', fitid: t.fitid || '', cls: autoClass(t.description), tags: [], category: '', importedAt: now, source: pi.fileName })).filter(t => !existing.has(t.id));
       if (fresh.length) await persistMany('txns', fresh);
       const fileIds = new Set(ids); const rg = statementRange(pi);
       const cleared = S.txns.filter(t => t.accountId === acct.id && t.notInStatement && fileIds.has(t.id)).map(t => { delete t.notInStatement; return t; });
@@ -2202,6 +2230,10 @@ async function boot() {
     { const ids = new Set(S.txns.map(t => t.id)); const fixD = [], fixP = [];
       if (S.txns.length) for (const [arr, out] of [[S.docs, fixD], [S.pos, fixP]]) arr.forEach(x => { const L = x.linkedTxnIds || []; const keep = [...new Set(L.filter(id => ids.has(id)))]; if (keep.length !== L.length) { x.linkedTxnIds = keep; out.push(x); } });
       if (fixD.length || fixP.length) { try { if (fixD.length) await persistMany('docs', fixD); if (fixP.length) await persistMany('pos', fixP); DBG.info(`removed links to deleted transactions from ${fixD.length + fixP.length} document(s)`); } catch (e) { DBG.err('link cleanup failed', e); } } }
+    if (!S.settings.bankClassified) {
+      const bk = S.txns.filter(t => !t.cls && BANK_RE.test(t.description)); bk.forEach(t => t.cls = 'bank');
+      try { if (bk.length) await persistMany('txns', bk); S.settings.bankClassified = true; await persist('settings', S.settings); if (bk.length) { DBG.info(`classified ${bk.length} existing entries as bank activity`); toast(`Marked ${bk.length} interest/fee entr${bk.length > 1 ? 'ies' : 'y'} as 🏦 Bank activity`, 5000); } } catch (e) { DBG.err('bank classification failed', e); }
+    }
     const legacy = S.txns.filter(t => LEGACY_CAPITAL.has(t.cls));
     if (legacy.length) { legacy.forEach(t => t.cls = 'capital'); DBG.info(`migrating ${legacy.length} capital infusion/withdrawal → capital`); persistMany('txns', legacy).catch(e => DBG.err('capital migration failed', e)); }
     setConn(store.kind === 'firebase' ? 'ok' : 'warn', store.kind === 'firebase' ? `Firebase · ${store.projectId}${store.auth.currentUser ? ' · ' + (store.auth.currentUser.email || 'anon') : ''}` : 'Local mode');
