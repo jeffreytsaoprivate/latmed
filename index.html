@@ -194,6 +194,11 @@ tr.rowlink{cursor:pointer}
 .lkSum{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-top:8px;font-size:12.5px;padding:6px 8px;border-radius:7px;background:var(--surface-1);border:1px solid var(--border)}
 .lkSum.bad{border-color:var(--warn);color:var(--text-primary)}
 .lkSum .amtx{color:var(--warn);font-weight:700}
+.lkUp{display:block;margin-top:auto;padding:6px;border:1px dashed var(--border);border-radius:6px;text-align:center;font-size:11.5px;color:var(--text-muted);cursor:pointer}
+.lkUp:hover{color:var(--text-secondary);border-color:var(--accent)}
+.lkCol.dropping{outline:2px solid var(--accent);outline-offset:-2px;background:color-mix(in srgb,var(--accent) 8%,var(--surface-1))}
+.lkCol.dropping .lkUp{border-color:var(--accent);color:var(--accent)}
+.lkCol.busy{opacity:.6;pointer-events:none}
 @media (max-width:1000px){.split{grid-template-columns:1fr}.splitR{position:static;height:70vh}}
 @media (max-width:760px){.g2{grid-template-columns:1fr}.viewer{grid-template-columns:1fr;height:auto}.vlist{max-height:200px}.vframe{height:60vh}}
 </style>
@@ -548,6 +553,8 @@ async function attachPreview(body, src) {
   const wrap = document.createElement('div'); wrap.className = 'split'; wrap.append(left, right); body.appendChild(wrap);
   await fillPreview(right, src);
 }
+['dragover', 'drop'].forEach(ev => $('#modal').addEventListener(ev, e => { if (e.dataTransfer?.types?.includes('Files') && !e.target.closest('.lkCol[data-step], .drop')) e.preventDefault(); }));
+document.addEventListener('click', e => { const a = e.target.closest('[data-dupid]'); if (a) { e.preventDefault(); showRecord(a.dataset.dupk, a.dataset.dupid); } });
 $('#modal').addEventListener('click', e => { if (e.target.id === 'modal' || e.target.closest('[data-close]')) closeModal(); });
 document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#modal').hidden) closeModal(); });
 
@@ -1290,8 +1297,8 @@ function filteredAll() {
     .map(p => ({ kind: 'po', rec: p, type: 'po', date: p.date || '', amount: poTotals(p).total }));
   const all = [...docs, ...pos].filter(x => !f.chain || (f.chain === 'gaps' ? chainOf(x.kind, x.rec).missing.length : !chainOf(x.kind, x.rec).missing.length && !x.rec.needsReview));
   const k = UI.docSort.key, dir = UI.docSort.dir === 'asc' ? 1 : -1;
-  const val = x => k === 'date' ? x.date : k === 'type' ? (x.kind === 'po' ? 'Purchase order' : DOC_TYPES[x.rec.type]) : k === 'vendor' ? (x.rec.vendor || x.rec.fileName || '').toLowerCase() : k === 'number' ? (x.rec.number || '').toLowerCase() : k === 'amount' ? x.amount : k === 'status' ? (x.rec.needsReview ? '0' : x.rec.status || '') : k === 'chain' ? chainOf(x.kind, x.rec).missing.length : k === 'tags' ? (x.rec.tags || []).join(',').toLowerCase() : '';
-  return all.sort((a, b) => { const A = val(a), B = val(b); return (A < B ? -1 : A > B ? 1 : 0) * dir || b.date.localeCompare(a.date); });
+  const val = x => k === 'date' ? (x.date || (dir < 0 ? '9999' : '0000')) : k === 'type' ? (x.kind === 'po' ? 'Purchase order' : DOC_TYPES[x.rec.type]) : k === 'vendor' ? (x.rec.vendor || x.rec.fileName || '').toLowerCase() : k === 'number' ? (x.rec.number || '').toLowerCase() : k === 'amount' ? x.amount : k === 'status' ? (x.rec.needsReview ? '0' : x.rec.status || '') : k === 'chain' ? chainOf(x.kind, x.rec).missing.length : k === 'tags' ? (x.rec.tags || []).join(',').toLowerCase() : '';
+  return all.sort((a, b) => (!!b.rec.needsReview - !!a.rec.needsReview) || (() => { const A = val(a), B = val(b); return (A < B ? -1 : A > B ? 1 : 0) * dir; })() || b.date.localeCompare(a.date));
 }
 function vDocs(root) {
   const f = UI.docF; const rows = filteredAll();
@@ -1325,7 +1332,8 @@ function vDocs(root) {
       <input id="dQ" class="grow" placeholder="Search vendor, number, description, file" value="${esc(f.q)}">
       <button class="b" id="findDups" title="Find files stored more than once">Find duplicates</button>
     </div>
-    <div class="small muted" style="margin-bottom:6px">${rows.length} items · ${money(rows.reduce((s, r) => s + r.amount, 0))}</div>
+    ${(() => { const on = [f.type && 'type: ' + VIEW_TYPES[f.type], f.status && 'status: ' + f.status, f.tag && 'tag: ' + f.tag, f.chain && (f.chain === 'gaps' ? 'missing links / totals' : 'fully linked'), f.q && `search “${f.q}”`].filter(Boolean); const total = S.docs.length + S.pos.length;
+      return on.length ? `<div class="banner" style="display:flex;gap:10px;align-items:center;padding:6px 10px;margin-bottom:8px"><span>🔎 Showing <b>${rows.length} of ${total}</b> — filtered by ${esc(on.join(', '))}</span><span style="flex:1"></span><button class="b sm" id="clrF">Clear filters</button></div>` : `<div class="small muted" style="margin-bottom:6px">${rows.length} items · ${money(rows.reduce((s, r) => s + r.amount, 0))}</div>`; })()}
     <div class="tw"><table><thead><tr>${[['type', 'Type'], ['date', 'Date'], ['vendor', 'Vendor'], ['number', 'No.'], ['amount', 'Amount', 'r'], ['status', 'Status'], ['tags', 'Tags'], ['chain', 'Quote › PO › Invoice › Paid']].map(([k, l, c]) => `<th class="sortable ${c || ''}" data-sort="${k}" ${k === 'chain' ? 'title="Sort by missing links. Dashed orange = not linked yet — click a step to link."' : ''}>${l}${UI.docSort.key === k ? `<span class="arr">${UI.docSort.dir === 'asc' ? '▲' : '▼'}</span>` : ''}</th>`).join('')}<th></th></tr></thead><tbody>
     ${rows.map(r => {
       const d = r.rec; const tx = (d.linkedTxnIds || []).map(id => S.txns.find(t => t.id === id)).filter(Boolean);
@@ -1363,6 +1371,7 @@ function vDocs(root) {
   $('#dStatus').onchange = e => { f.status = e.target.value; rf(); };
   $('#dTag').onchange = e => { f.tag = e.target.value; rf(); };
   $('#dChain').onchange = e => { f.chain = e.target.value; rf(); };
+  $('#clrF')?.addEventListener('click', () => { UI.docF = { type: '', status: '', q: '', tag: '', chain: '' }; rf(); });
   $$('th[data-sort]', root).forEach(th => th.onclick = () => { const k = th.dataset.sort; UI.docSort = UI.docSort.key === k ? { key: k, dir: UI.docSort.dir === 'asc' ? 'desc' : 'asc' } : { key: k, dir: ['date', 'amount', 'chain'].includes(k) ? 'desc' : 'asc' }; LS.set('ledger.docSort', UI.docSort); rf(); });
   $('#gapGo')?.addEventListener('click', () => { f.chain = 'gaps'; rf(); });
   let qh; $('#dQ').oninput = e => { clearTimeout(qh); qh = setTimeout(() => { f.q = e.target.value; rf(); setTimeout(() => { const i = $('#dQ'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }); }, 300); };
@@ -1391,6 +1400,14 @@ const fileRecs = () => [...S.docs.filter(d => d.file).map(d => ({ kind: 'doc', r
 function findDupFile(name, size, hash, exceptId) {
   return fileRecs().find(x => x.rec.id !== exceptId && ((hash && x.rec.file.sha256 === hash) || (!x.rec.file.sha256 || !hash) && x.rec.fileName === name && x.rec.file.size === size));
 }
+function dupWhere(x) {
+  const r = x.rec, up = r.createdAt ? fmtDate(r.createdAt.slice(0, 10)) : '';
+  return `${recLabel(x)}${r.date ? ' · dated ' + fmtDate(r.date) : ' · no date yet'}${up ? ' · uploaded ' + up : ''}${r.fileName ? ' · file “' + r.fileName + '”' : ''}${!r.file?.sha256 ? ' (older upload — matched on name + size)' : ''}`;
+}
+/* Clear Documents filters and open the given record, so a "duplicate" can always be found. */
+function showRecord(kind, id) {
+  UI.docF = { type: '', status: '', q: '', tag: '', chain: '' }; go('docs'); setTimeout(() => openRecord(kind, id), 0);
+}
 function recLabel(x) { const r = x.rec; return `${x.kind === 'po' ? 'Purchase order' : DOC_TYPES[r.type]} ${r.number || ''}${r.vendor ? ' · ' + r.vendor : ''}${r.needsReview ? ' (needs review)' : ''}`.replace(/\s+/g, ' ').trim(); }
 /* Delete a record's stored file and clear it from the record (the record itself is kept). */
 async function removeAttachment(kind, id) {
@@ -1408,7 +1425,8 @@ async function screenDuplicates(files) {
     const hash = await fileHash(f);
     const key = hash || `${f.name}|${f.size}`;
     const ex = findDupFile(f.name, f.size, hash);
-    out.push({ f, hash, dupOf: ex ? recLabel(ex) : seen.has(key) ? `“${seen.get(key)}” earlier in this batch` : null });
+    if (ex) DBG.info('duplicate file', { file: f.name, matches: ex.kind + ':' + ex.rec.id, label: recLabel(ex), bySha: !!(hash && ex.rec.file?.sha256 === hash) });
+    out.push({ f, hash, ex, dupOf: ex ? dupWhere(ex) : seen.has(key) ? `“${seen.get(key)}” earlier in this batch` : null });
     if (!seen.has(key)) seen.set(key, f.name);
   }
   const dups = out.filter(x => x.dupOf);
@@ -1416,12 +1434,13 @@ async function screenDuplicates(files) {
   return new Promise(res => {
     const body = modal(`${dups.length} duplicate file${dups.length > 1 ? 's' : ''} found`, `
       <div class="small muted" style="margin-bottom:8px">These files are identical to ones already in Ledger (same content${out.some(x => !x.hash) ? ', or same name and size' : ''}). They'll be skipped unless you tick <b>Upload anyway</b>.</div>
-      <div class="linklist" style="max-height:50vh">${dups.map((x, i) => `<label><input type="checkbox" data-i="${i}"> <span><b>${esc(x.f.name)}</b> <span class="muted small">· ${(x.f.size / 1024).toFixed(0)} KB</span><br><span class="small muted">already uploaded as ${esc(x.dupOf)}</span></span><span class="amt small">Upload anyway</span></label>`).join('')}</div>
+      <div class="linklist" style="max-height:50vh">${dups.map((x, i) => `<label><input type="checkbox" data-i="${i}"> <span><b>${esc(x.f.name)}</b> <span class="muted small">· ${(x.f.size / 1024).toFixed(0)} KB</span><br><span class="small muted">already uploaded as ${esc(x.dupOf)}</span></span><span class="amt" style="display:flex;gap:6px;align-items:center"><span class="small">Upload anyway</span>${x.ex ? `<button type="button" class="b sm dupShow" data-k="${x.ex.kind}" data-id="${x.ex.rec.id}" title="Cancel this upload and open the existing entry">Show it</button>` : ''}</span></label>`).join('')}</div>
       <div class="mfoot"><button class="b" id="dupCancel">Cancel all</button><button class="b pri" id="dupGo">Continue (${out.length - dups.length} new)</button></div>`);
     $('#modal .mbox').classList.remove('wide', 'xwide');
     const upd = () => { const n = out.length - dups.length + $$('input[data-i]:checked', body).length; $('#dupGo', body).textContent = `Continue (${n} to upload)`; };
     body.addEventListener('change', upd); upd();
     $('#dupCancel', body).onclick = () => { closeModal(); toast('Upload cancelled'); res([]); };
+    body.addEventListener('click', e => { const b = e.target.closest('.dupShow'); if (!b) return; e.preventDefault(); closeModal(); res([]); showRecord(b.dataset.k, b.dataset.id); });
     $('#dupGo', body).onclick = () => { const keep = new Set($$('input[data-i]:checked', body).map(i => dups[+i.dataset.i])); closeModal(); res(out.filter(x => !x.dupOf || keep.has(x))); };
   });
 }
@@ -1584,7 +1603,7 @@ function editDoc(d, file, rest = [], prefill = null) {
   $('#dFile', body)?.addEventListener('change', async e => {
     const f = e.target.files[0]; const w = $('#dDupWarn', body); w.textContent = ''; if (!f) return;
     const ex = findDupFile(f.name, f.size, await fileHash(f), d.id);
-    if (ex) w.textContent = `⚠ This file is already attached to ${recLabel(ex)}. Saving will store a second copy.`;
+    if (ex) w.innerHTML = `⚠ This file is already attached to ${esc(dupWhere(ex))}. Saving will store a second copy. <a href="#" data-dupk="${ex.kind}" data-dupid="${ex.rec.id}">Show it</a>`;
   });
   $('#dDel', body)?.addEventListener('click', async () => {
     if (!confirm('Delete this document' + (d.file ? ' and its file' : '') + '?')) return;
@@ -1647,6 +1666,38 @@ document.addEventListener('keydown', e => {
   if ($('#modal').hidden || !UI.navGo || !$('#modal .mnav')) return;
   if (e.altKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) { e.preventDefault(); UI.navGo(e.key === 'ArrowLeft' ? 'prev' : 'next'); }
 });
+/* Files dropped on a linkage column become new documents of that type, linked into the chain and marked "needs review".
+   On Payments they become receipts (e.g. a wire confirmation) attached to the payment. */
+async function addFilesToChain(files, step, kind, id, payTxnId) {
+  let n = 0; const made = [];
+  for (const f of files) {
+    const hash = await fileHash(f); const ex = findDupFile(f.name, f.size, hash);
+    if (ex && !confirm(`${f.name} is already uploaded as:\n${dupWhere(ex)}\n\nUpload it again anyway? (Cancel, then search Documents for “${ex.rec.number || ex.rec.fileName || ''}” to find it.)`)) continue;
+    toast(`Uploading ${f.name}…`, 60000);
+    const r = recOf(kind, id); const c = chainOf(kind, r); const g = guessFromName(f.name);
+    const fileObj = async path => { const up = await store.upload(path, f); return { path: up.path, url: up.url, contentType: f.type || '', size: f.size, ...(hash ? { sha256: hash } : {}) }; };
+    try {
+      if (step === 'po') {
+        const p = blankPO({ number: g.type === 'po' ? g.number : '', vendor: r.vendor || '', needsReview: true, fileName: f.name });
+        p.file = await fileObj(`accounting/pos/${p.id}/${safeId(f.name)}`); await persist('pos', p);
+        if (r.type === 'quote') await setPOQuote(p, r); else if (r.type === 'invoice') await setInvPO(r, p);
+        made.push('PO');
+      } else {
+        const type = step === 'paid' ? 'receipt' : step;
+        const d = { id: 'd_' + uid(), type, number: g.number, vendor: r.vendor || '', date: '', amount: '', status: DOC_STATUS[type][0], tags: [], description: step === 'paid' ? 'Payment confirmation' : '', items: [], linkedTxnIds: [], needsReview: true, createdAt: new Date().toISOString(), fileName: f.name };
+        d.file = await fileObj(`accounting/docs/${d.id}/${safeId(f.name)}`); await persist('docs', d);
+        if (type === 'invoice') { if (c.pos[0]) await setInvPO(d, c.pos[0]); else if (c.quotes[0]) await setInvQuote(d, c.quotes[0]); }
+        if (type === 'quote') { if (c.pos[0]) await setPOQuote(c.pos[0], d); else if (r.type === 'invoice') await setInvQuote(r, d); }
+        if (type === 'receipt') { const pays = chainPayments(kind, r).pays; const tid = payTxnId || (pays.length === 1 ? pays[0].t.id : null); if (tid) { const t = S.txns.find(x => x.id === tid); d.amount = Math.abs(t.amount); d.date = t.date; await persist('docs', d); await setLink(linkItem('doc', d), tid, true); } }
+        made.push(DOC_TYPES[type].toLowerCase());
+      }
+      n++;
+    } catch (e) { DBG.err('drop upload failed: ' + f.name, e); toast('Upload failed: ' + (e.code || e.message), 6000); }
+  }
+  if (n) toast(`Added ${n === 1 ? 'a ' + made[0] : n + ' documents'} from file — linked and marked "needs review" so you can fill in the details`, 5000);
+  return n;
+}
+
 /* Linkage panel: Quote › PO › Invoice › Payments for the record being edited — open, unlink, or link in place. */
 function linkagePanel(host, kind, id, hooks = {}) {
   const draw = () => {
@@ -1685,13 +1736,14 @@ function linkagePanel(host, kind, id, hooks = {}) {
       if (step === 'paid') {
         ok = P.pays.length > 0;
         const inv1 = c.invs.length === 1 ? c.invs[0] : null;
-        inner = P.pays.map(p => `<div class="lkItem"><span>${fmtDate(p.t.date)} · ${esc(p.t.description)}<br><span class="small muted">${money(p.t.amount)} · ${esc(acctName(p.t.accountId))} · on ${p.on.map(o => esc(holderLabel(o))).join(', ')}${isStale(p.t) ? ' · <span style="color:var(--crit)">⚑ not in statement</span>' : ''}</span></span>
+        inner = P.pays.map(p => `<div class="lkItem" data-paytx="${p.t.id}"><span>${fmtDate(p.t.date)} · ${esc(p.t.description)}<br><span class="small muted">${money(p.t.amount)} · ${esc(acctName(p.t.accountId))} · on ${p.on.map(o => esc(holderLabel(o))).join(', ')}${isStale(p.t) ? ' · <span style="color:var(--crit)">⚑ not in statement</span>' : ''}</span>${(docsByTxn[p.t.id] || []).filter(l => l.type === 'receipt').map(l => `<br><a href="#" class="small" data-open="doc:${l.id}">📎 ${esc(l.rec.needsReview ? 'receipt (needs review)' : 'receipt ' + (l.number || l.vendor || ''))}</a>`).join('')}</span>
             <span class="lkBtns">${inv1 && !p.on.some(o => o.rec.id === inv1.id) ? `<button type="button" class="b sm" data-move="${p.t.id}" title="Attach to the invoice instead">→ Invoice</button>` : ''}<button type="button" class="b sm danger" data-unpay="${p.t.id}" title="Unlink this payment">✕</button></span></div>`).join('');
         const tgt = c.invs[0] ? linkItem('doc', c.invs[0]) : c.pos[0] ? linkItem('po', c.pos[0]) : linkItem(kind === 'po' ? 'po' : 'doc', r);
         const txo = S.txns.filter(t => t.cls !== 'transfer' && t.cls !== 'bank' && !P.pays.some(p => p.t.id === t.id)).map(t => ({ id: t.id, score: matchScore(t, tgt).score, text: `${fmtDate(t.date)} · ${t.description} · ${money(t.amount)}` }));
         inner += sel('paid', rank(txo));
       }
-      return `<div class="lkCol ${ok ? 'ok' : 'miss'}"><div class="lkHead">${ok ? '✓' : '○'} ${label[step]}</div>${inner}</div>`;
+      const up = `<label class="lkUp" title="${step === 'paid' ? 'Add a payment confirmation (saved as a receipt and attached to the payment)' : 'Add a new ' + label[step].toLowerCase() + ' from a file — it is linked here and marked needs review'}">📎 ${step === 'paid' ? 'Drop a payment confirmation' : 'Drop a file to add'} or <u>choose</u><input type="file" multiple hidden accept=".pdf,image/*,.doc,.docx,.xls,.xlsx,.eml,.msg,.heic"></label>`;
+      return `<div class="lkCol ${ok ? 'ok' : 'miss'}" data-step="${step}"><div class="lkHead">${ok ? '✓' : '○'} ${label[step]}</div>${inner}${up}</div>`;
     };
     const ac = c.ac; const keys = ['quote', 'po', 'invoice', 'receipt', 'paid'].filter(k => k in ac.vals);
     const totals = keys.length > 1 ? `<div class="lkSum ${c.closed ? '' : ac.flagged ? 'bad' : ''}"><b>Totals</b> ${keys.map(k => `<span class="${ac.flagged && !c.closed && ac.bad.includes(k) ? 'amtx' : ''}">${AMT_LBL[k]} ${money(ac.vals[k])}</span>`).join('<span class="muted"> · </span>')}
@@ -1701,7 +1753,7 @@ function linkagePanel(host, kind, id, hooks = {}) {
   const after = async msg => { if (msg) toast(msg); derive(); draw(); hooks.changed?.(recOf(kind, id)); render(); };
   host.addEventListener('click', async e => {
     const r = recOf(kind, id); const c = chainOf(kind, r);
-    const o = e.target.closest('[data-open]'); if (o) { const [k, x] = o.dataset.open.split(':'); return hooks.open ? hooks.open(k, x) : openRecord(k, x); }
+    const o = e.target.closest('[data-open]'); if (o) { e.preventDefault(); const [k, x] = o.dataset.open.split(':'); return hooks.open ? hooks.open(k, x) : openRecord(k, x); }
     const u = e.target.closest('[data-unlink]');
     if (u) { const [step, x] = u.dataset.unlink.split(':');
       if (step === 'quote') { if (c.pos[0]) { const p = c.pos[0]; p.quoteId = ''; p.quoteRef = ''; await persist('pos', p); } for (const i of c.invs.filter(i => !i.poId && i.quoteId === x)) { i.quoteId = ''; await persist('docs', i); } return after('Quote unlinked'); }
@@ -1714,7 +1766,12 @@ function linkagePanel(host, kind, id, hooks = {}) {
     const mv = e.target.closest('[data-move]');
     if (mv) { const p = chainPayments(kind, r).pays.find(q => q.t.id === mv.dataset.move); for (const h of p.on) await setLink(linkItem(h.kind, h.rec), p.t.id, false); const note = await setLink(linkItem('doc', c.invs[0]), p.t.id, true); return after('Moved to invoice' + (note || '')); }
   });
+  const dropTo = async (files, col, payTx) => { if (!files.length) return; col.classList.add('busy'); try { if (await addFilesToChain(files, col.dataset.step, kind, id, payTx)) { derive(); draw(); hooks.changed?.(recOf(kind, id)); render(); } } finally { col.classList.remove('busy'); } };
+  host.addEventListener('dragover', e => { const col = e.target.closest('.lkCol[data-step]'); if (!col || !e.dataTransfer.types.includes('Files')) return; e.preventDefault(); $$('.lkCol.dropping', host).forEach(x => x !== col && x.classList.remove('dropping')); col.classList.add('dropping'); });
+  host.addEventListener('dragleave', e => { const col = e.target.closest('.lkCol[data-step]'); if (col && !col.contains(e.relatedTarget)) col.classList.remove('dropping'); });
+  host.addEventListener('drop', e => { const col = e.target.closest('.lkCol[data-step]'); if (!col) return; e.preventDefault(); e.stopPropagation(); col.classList.remove('dropping'); dropTo([...e.dataTransfer.files], col, e.target.closest('[data-paytx]')?.dataset.paytx); });
   host.addEventListener('change', async e => {
+    if (e.target.matches('.lkUp input[type=file]')) { const fs = [...e.target.files]; e.target.value = ''; return dropTo(fs, e.target.closest('.lkCol[data-step]')); }
     const s = e.target.closest('.lkAdd'); if (!s || !s.value) return; const v = s.value; s.disabled = true;
     const r = recOf(kind, id); const c = chainOf(kind, r); const step = s.dataset.add;
     try {
@@ -1900,7 +1957,7 @@ function editPO(p, quote, file = null, rest = [], prefill = null) {
   $('#pFile', body)?.addEventListener('change', async e => {
     const f = e.target.files[0]; const w = $('#pDupWarn', body); w.textContent = ''; if (!f) return;
     const ex = findDupFile(f.name, f.size, await fileHash(f), p.id);
-    if (ex) w.textContent = `⚠ This file is already attached to ${recLabel(ex)}. Saving will store a second copy.`;
+    if (ex) w.innerHTML = `⚠ This file is already attached to ${esc(dupWhere(ex))}. Saving will store a second copy. <a href="#" data-dupk="${ex.kind}" data-dupid="${ex.rec.id}">Show it</a>`;
   });
   $('#pDelBtn', body)?.addEventListener('click', async () => { if (!confirm('Delete ' + p.number + (p.file ? ' and its file' : '') + '?')) return; if (p.file) await store.removeFile(p.file.path); await store.del('pos', p.id); S.pos = S.pos.filter(x => x.id !== p.id); if (reviewing) return reviewNext(); closeModal(); render(); });
 }
