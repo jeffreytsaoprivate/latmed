@@ -2188,3 +2188,92 @@ async function boot() {
   }
   if (!store) store = await makeLocal();
   DBG.info('boot: storage backend = ' + store.kind);
+  try {
+    const d = await store.loadAll();
+    S.accounts = d.accounts || []; S.txns = d.txns || []; S.docs = d.docs || []; S.pos = d.pos || [];
+    S.settings = { ...DEFAULT_SETTINGS, ...((d.settings || []).find(x => x.id === 'main') || {}) };
+    const ph = S.txns.filter(t => t.autoTransfer);
+    if (ph.length) {
+      const origins = ph.map(x => S.txns.find(o => o.id === x.transferPairId)).filter(Boolean); origins.forEach(o => o.transferPairId = '');
+      S.txns = S.txns.filter(t => !t.autoTransfer);
+      try { await store.delMany('txns', ph.map(x => x.id)); if (origins.length) await persistMany('txns', origins); await autoPairTransfers(); DBG.info(`removed ${ph.length} auto-created transfer entries`); toast(`Removed ${ph.length} auto-created transfer entr${ph.length > 1 ? 'ies' : 'y'} — transfers now pair only with real transactions`, 6000); }
+      catch (e) { DBG.err('transfer placeholder cleanup failed', e); }
+    }
+    { const ids = new Set(S.txns.map(t => t.id)); const fixD = [], fixP = [];
+      if (S.txns.length) for (const [arr, out] of [[S.docs, fixD], [S.pos, fixP]]) arr.forEach(x => { const L = x.linkedTxnIds || []; const keep = [...new Set(L.filter(id => ids.has(id)))]; if (keep.length !== L.length) { x.linkedTxnIds = keep; out.push(x); } });
+      if (fixD.length || fixP.length) { try { if (fixD.length) await persistMany('docs', fixD); if (fixP.length) await persistMany('pos', fixP); DBG.info(`removed links to deleted transactions from ${fixD.length + fixP.length} document(s)`); } catch (e) { DBG.err('link cleanup failed', e); } } }
+    const legacy = S.txns.filter(t => LEGACY_CAPITAL.has(t.cls));
+    if (legacy.length) { legacy.forEach(t => t.cls = 'capital'); DBG.info(`migrating ${legacy.length} capital infusion/withdrawal → capital`); persistMany('txns', legacy).catch(e => DBG.err('capital migration failed', e)); }
+    setConn(store.kind === 'firebase' ? 'ok' : 'warn', store.kind === 'firebase' ? `Firebase · ${store.projectId}${store.auth.currentUser ? ' · ' + (store.auth.currentUser.email || 'anon') : ''}` : 'Local mode');
+    DBG.info('boot: data loaded', { accounts: S.accounts.length, txns: S.txns.length, docs: S.docs.length, pos: S.pos.length });
+  } catch (e) {
+    DBG.err('boot: data load failed', e);
+    setConn('bad', 'Load failed'); toast('Could not load data: ' + (e.code || e.message) + (e.code === 'permission-denied' ? ' — Firestore rules rejected this user.' : '') + ' Open Debug for details.', 9000);
+    if (store.kind === 'firebase') { const fb = store; store = await makeLocal(); store._failedFirebase = fb; const d = await store.loadAll(); Object.assign(S, { accounts: d.accounts, txns: d.txns, docs: d.docs, pos: d.pos }); setConn('bad', 'Firebase error — local mode'); }
+  }
+  go(UI.tab);
+}
+
+/* ---------------- debug panel & diagnostics ---------------- */
+function envInfo() {
+  const cfg = LS.get('ledger.fbConfig', FIREBASE_CONFIG) || {};
+  const fb = store?.kind === 'firebase' ? store : store?._failedFirebase;
+  const u = fb?.auth?.currentUser;
+  let ls = false, ss = false; try { localStorage.setItem('_t', '1'); localStorage.removeItem('_t'); ls = true; } catch {} try { sessionStorage.setItem('_t', '1'); sessionStorage.removeItem('_t'); ss = true; } catch {}
+  return {
+    when: new Date().toString(), href: location.href, origin: location.origin, protocol: location.protocol, hostname: location.hostname,
+    userAgent: navigator.userAgent, cookiesEnabled: navigator.cookieEnabled, localStorage: ls, sessionStorage: ss, indexedDB: !!window.indexedDB,
+    inIframe: window.top !== window.self, online: navigator.onLine,
+    config: { apiKey: cfg.apiKey ? cfg.apiKey.slice(0, 8) + '…' + cfg.apiKey.slice(-4) : null, authDomain: cfg.authDomain, projectId: cfg.projectId, storageBucket: cfg.storageBucket, appId: cfg.appId, source: localStorage.getItem('ledger.fbConfig') ? 'Settings/localStorage' : 'hard-coded' },
+    prefix: LS.get('ledger.prefix', defaultPrefix(cfg)), requireAuth: LS.get('ledger.auth', false), forceLocal: LS.get('ledger.forceLocal', false),
+    backend: store?.kind, firebaseSdk: FB_VER,
+    user: u ? { uid: u.uid, email: u.email, emailVerified: u.emailVerified, anonymous: u.isAnonymous, providers: u.providerData.map(p => p.providerId) } : null,
+    libs: { Chart: !!window.Chart, jsPDF: !!window.jspdf }
+  };
+}
+function report() { return ['=== LEDGER DEBUG REPORT ===', JSON.stringify(envInfo(), null, 2), '', '=== LOG ===', ...DBG.lines()].join('\n'); }
+async function runDiagnostics() {
+  DBG.mark('diagnostics start');
+  const env = envInfo(); DBG.info('env', env);
+  if (location.protocol === 'file:') DBG.warn('Opened as file:// — Google sign-in cannot work here.');
+  if (env.inIframe) DBG.warn('Page is inside an iframe — popups/storage may be restricted.');
+  if (/github\.io$/.test(location.hostname)) DBG.info(`GitHub Pages host — make sure "${location.hostname}" is in Firebase Authorized domains (no https://, no path).`);
+  const fb = store?.kind === 'firebase' ? store : store?._failedFirebase;
+  if (!fb) { DBG.warn('Firebase not active (local mode). Try Settings → Save & reconnect, then rerun.'); return; }
+  try { const r = await fetch(`https://${env.config.authDomain}/__/auth/handler`, { method: 'HEAD', mode: 'no-cors' }); DBG.info('authDomain handler reachable (opaque response)', { type: r.type }); } catch (e) { DBG.err('authDomain handler NOT reachable', e); }
+  const u = fb.auth.currentUser;
+  if (!u) { DBG.warn('Not signed in — Firestore/Storage tests will use no auth.'); }
+  else {
+    try { const t = await u.getIdTokenResult(true); DBG.info('ID token claims', { email: t.claims.email, email_verified: t.claims.email_verified, sign_in_provider: t.signInProvider, aud: t.claims.aud, expires: t.expirationTime }); if (t.claims.aud !== env.config.projectId) DBG.err('token audience ≠ projectId'); }
+    catch (e) { DBG.err('getIdTokenResult failed', e); }
+  }
+  const { F, S, db, st, prefix } = fb;
+  try { const s = await F.getDocs(F.query(F.collection(db, prefix + 'settings'), F.limit(1))); DBG.info(`TEST firestore read ${prefix}settings: OK (${s.size} doc)`); } catch (e) { DBG.err(`TEST firestore read ${prefix}settings: FAILED`, e); }
+  const probe = F.doc(db, prefix + 'settings', '_debug_probe');
+  try { await F.setDoc(probe, { at: new Date().toISOString(), uid: u?.uid || null }); DBG.info('TEST firestore write: OK'); await F.deleteDoc(probe); DBG.info('TEST firestore delete: OK'); } catch (e) { DBG.err('TEST firestore write/delete: FAILED', e); }
+  try { const l = await S.list(S.ref(st, 'accounting/docs'), { maxResults: 1 }); DBG.info(`TEST storage list accounting/docs: OK (${l.prefixes.length + l.items.length} entries)`); } catch (e) { DBG.err('TEST storage list: FAILED', e); }
+  const pr = S.ref(st, 'accounting/_debug_probe.txt');
+  try { await S.uploadString(pr, 'probe ' + new Date().toISOString()); DBG.info('TEST storage upload: OK'); await S.getDownloadURL(pr); DBG.info('TEST storage getDownloadURL: OK'); await S.deleteObject(pr); DBG.info('TEST storage delete: OK'); } catch (e) { DBG.err('TEST storage upload/url/delete: FAILED', e); }
+  DBG.mark('diagnostics done');
+}
+function toggleDebug(show) {
+  const p = $('#dbgPanel'); p.hidden = show === undefined ? !p.hidden : !show;
+  if (!p.hidden) { $('#dbgLog').textContent = DBG.lines().join('\n'); $('#dbgLog').scrollTop = 1e9; }
+}
+document.body.insertAdjacentHTML('beforeend', `
+<button id="dbgBtn" title="Debug log">🐞 Debug</button>
+<div id="dbgPanel" hidden>
+  <div class="dbgHead"><b>Debug</b><span class="small muted">Run diagnostics, then copy the report and paste it to Claude. API key is redacted.</span><span style="flex:1"></span>
+    <button class="b sm" id="dbgRun">Run diagnostics</button><button class="b sm pri" id="dbgCopy">Copy debug report</button><button class="b sm" id="dbgDl">Download .txt</button><button class="b sm" id="dbgClear">Clear</button><button class="x" id="dbgX">&times;</button></div>
+  <pre id="dbgLog"></pre>
+</div>`);
+$('#dbgBtn').onclick = () => toggleDebug(); $('#dbgX').onclick = () => toggleDebug(false);
+$('#dbgClear').onclick = () => DBG.clear();
+$('#dbgRun').onclick = async () => { const b = $('#dbgRun'); b.disabled = true; b.textContent = 'Running…'; try { await runDiagnostics(); } finally { b.disabled = false; b.textContent = 'Run diagnostics'; } };
+$('#dbgCopy').onclick = async () => { const txt = report(); try { await navigator.clipboard.writeText(txt); toast('Debug report copied — paste it into the chat'); } catch { const ta = document.createElement('textarea'); ta.value = txt; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); toast('Debug report copied'); } };
+$('#dbgDl').onclick = () => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([report()], { type: 'text/plain' })); a.download = `ledger-debug-${today()}.txt`; a.click(); };
+if (/[?&]debug\b/.test(location.search)) toggleDebug(true);
+boot();
+</script>
+</body>
+</html>
