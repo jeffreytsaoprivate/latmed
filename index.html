@@ -165,6 +165,9 @@ tr.pending td:first-child{box-shadow:inset 3px 0 0 var(--warn)}
 .kpi.kgo:hover{border-color:var(--accent);box-shadow:0 1px 6px color-mix(in srgb,var(--accent) 18%,transparent)}
 .kpi .kar{color:var(--text-muted);font-weight:600}
 .kpi.kgo:hover .kar{color:var(--accent)}
+.racts{white-space:nowrap;text-align:right}
+.racts .ract{min-width:30px;padding:2px 6px;margin-left:3px;line-height:1.3}
+.racts .ract[data-act=edit]{font-weight:700;letter-spacing:1px}
 .chsep{color:var(--text-muted);font-size:11px}
 /* editor navigation + linkage panel */
 .mnav{display:flex;align-items:center;gap:8px;margin-right:12px}
@@ -1303,6 +1306,27 @@ function linkStep(kind, r, step, onDone) {
   }
 }
 
+/* Row quick actions: 🆗 close, ❌ cancel, ↺ reopen — status meaning depends on the document type */
+const QUICK = {
+  quote:   { close: 'accepted',   cancel: 'rejected',  open: 'open',         done: ['accepted', 'rejected', 'expired'] },
+  invoice: { close: 'paid',       cancel: 'void',      open: 'unpaid',       done: ['paid', 'void'] },
+  po:      { close: 'closed',     cancel: 'cancelled', open: 'issued',       done: ['received', 'closed', 'cancelled'] },
+  receipt: { close: 'reconciled', cancel: null,        open: 'unreconciled', done: ['reconciled'] } };
+function rowActions(kind, r) {
+  const q = QUICK[kind === 'po' ? 'po' : r.type];
+  let h = `<button class="b sm ract" data-act="edit" title="Open / edit">…</button>`;
+  if (q && !r.needsReview) {
+    if (q.done.includes(r.status)) h = `<button class="b sm ract" data-act="reopen" title="Reopen — set back to “${q.open}”">↺</button>` + h;
+    else h = `<button class="b sm ract" data-act="close" title="Close — mark as “${q.close}”">🆗</button>${q.cancel ? `<button class="b sm ract" data-act="cancel" title="Cancel — mark as “${q.cancel}”">❌</button>` : ''}` + h;
+  }
+  return h;
+}
+async function quickStatus(kind, r, act) {
+  const q = QUICK[kind === 'po' ? 'po' : r.type]; const st = act === 'reopen' ? q.open : q[act]; if (!st) return;
+  const was = r.status; r.status = st; await persist(kind === 'po' ? 'pos' : 'docs', r);
+  const name = `${kind === 'po' ? 'PO' : DOC_TYPES[r.type]} ${r.number || r.vendor || ''}`.trim();
+  toast(`${name}: ${was} → ${st}${act !== 'reopen' ? ' (↺ to reopen)' : ''}`, 3500); render();
+}
 function filteredAll() {
   const f = UI.docF, q = f.q.toLowerCase();
   const docs = f.type === 'po' ? [] : filteredDocs().map(d => ({ kind: 'doc', rec: d, type: d.type, date: d.date || '', amount: +d.amount || 0 }));
@@ -1357,14 +1381,14 @@ function vDocs(root) {
           <td>${d.needsReview && !d.vendor ? `<span class="muted">${esc(d.fileName || '')}</span>` : esc(d.vendor)}${d.notes ? `<div class="small muted">${esc(d.notes).slice(0, 120)}</div>` : ''}</td><td>${esc(d.number)}</td><td class="r">${money(r.amount)}</td>
           <td>${d.needsReview ? '<span class="status warn">⚑ needs review</span>' : `<span class="status ${statusCls(d.status)}">${esc(d.status)}</span>`}</td><td>${(d.tags || []).map(g => `<span class="chip">${esc(g)}</span>`).join('')}</td>
           <td>${chainHTML('po', d)}${inv.length ? `<div class="small muted">${inv.length} invoice${inv.length > 1 ? 's' : ''} · ${money(inv.reduce((s, x) => s + (+x.amount || 0), 0))}</div>` : ''}</td>
-          <td style="white-space:nowrap">${d.file ? '<span class="small muted" title="File attached">📎</span> ' : ''}<button class="b sm edit">Edit</button></td></tr>`;
+          <td class="racts">${d.file ? '<span class="small muted" title="File attached">📎</span>' : ''}${rowActions('po', d)}</td></tr>`;
       }
       const po = d.poId && S.pos.find(p => p.id === d.poId); const pos = S.pos.filter(p => p.quoteId === d.id);
       return `<tr data-id="${d.id}" data-kind="doc" class="rowlink ${d.needsReview ? 'pending' : ''}"><td><b>${DOC_TYPES[d.type]}</b>${d.needsReview ? '<div class="small muted">guessed</div>' : ''}</td><td style="white-space:nowrap">${fmtDate(d.date)}${d.dueDate && d.type !== 'receipt' ? `<div class="small muted">${d.type === 'quote' ? 'valid to' : 'due'} ${fmtDate(d.dueDate)}</div>` : ''}</td>
         <td>${d.needsReview && !d.vendor ? `<span class="muted">${esc(d.fileName || '')}</span>` : esc(d.vendor)}${d.description ? `<div class="small muted">${esc(d.description).slice(0, 120)}</div>` : ''}</td><td>${esc(d.number || '')}</td>
         <td class="r">${money(d.amount)}</td><td>${statusHTML(d)}</td><td>${(d.tags || []).map(g => `<span class="chip">${esc(g)}</span>`).join('')}</td>
         <td>${chainHTML('doc', d)}</td>
-        <td style="white-space:nowrap">${d.file ? '<span class="small muted" title="File attached">📎</span> ' : ''}<button class="b sm edit">Edit</button></td></tr>`;
+        <td class="racts">${d.file ? '<span class="small muted" title="File attached">📎</span>' : ''}${rowActions('doc', d)}</td></tr>`;
     }).join('') || '<tr><td colspan="9" class="muted">Nothing here yet — drop files above.</td></tr>'}
     </tbody></table></div>
   </div>`;
@@ -1391,6 +1415,8 @@ function vDocs(root) {
   root.querySelector('tbody').addEventListener('click', e => {
     const tr = e.target.closest('tr[data-id]'); if (!tr) return;
     const isPO = tr.dataset.kind === 'po'; const r = (isPO ? S.pos : S.docs).find(x => x.id === tr.dataset.id); if (!r) return;
+    const act = e.target.closest('[data-act]');
+    if (act && act.dataset.act !== 'edit') return quickStatus(isPO ? 'po' : 'doc', r, act.dataset.act);
     if (!e.target.closest('.ch') && !e.target.closest('a')) { UI.skipped.clear(); return isPO ? editPO(r) : editDoc(r); }
     const ch = e.target.closest('.ch');
     if (ch) {
