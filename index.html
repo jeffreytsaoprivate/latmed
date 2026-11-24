@@ -162,6 +162,26 @@ tr.pending td:first-child{box-shadow:inset 3px 0 0 var(--warn)}
 .ch.miss:hover{background:color-mix(in srgb,var(--warn) 18%,transparent)}
 .ch.na{opacity:.5;cursor:default}
 .chsep{color:var(--text-muted);font-size:11px}
+/* editor navigation + linkage panel */
+.mnav{display:flex;align-items:center;gap:8px;margin-right:12px}
+.linkage{border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin-bottom:14px;background:var(--surface-2)}
+.linkage:empty{display:none}
+.lkTitle{font-weight:650;font-size:13px;margin-bottom:8px}
+.lkRow{display:flex;gap:6px;align-items:stretch;overflow-x:auto}
+.lkCol{flex:1 1 0;min-width:170px;background:var(--surface-1);border:1px solid var(--border);border-radius:8px;padding:8px;display:flex;flex-direction:column;gap:6px}
+.lkCol.miss{border:1px dashed var(--warn)}
+.lkCol.self{background:transparent;border-style:dotted}
+.lkHead{font-size:12px;font-weight:650;color:var(--text-secondary)}
+.lkCol.ok .lkHead{color:var(--good)} .lkCol.miss .lkHead{color:var(--warn)}
+.lkItem{display:flex;gap:6px;justify-content:space-between;align-items:flex-start;font-size:12.5px;border-top:1px solid var(--border);padding-top:5px}
+.lkItem:first-of-type{border-top:0;padding-top:0}
+.lkBtns{display:flex;gap:4px;flex:none}
+.lkAdd{font-size:12px;width:100%;max-width:100%}
+.lkArrow{align-self:center;color:var(--text-muted)}
+th.sortable{cursor:pointer;user-select:none;white-space:nowrap}
+th.sortable:hover{color:var(--text-primary)}
+th.sortable .arr{font-size:10px;margin-left:3px;color:var(--accent)}
+tr.rowlink{cursor:pointer}
 @media (max-width:1000px){.split{grid-template-columns:1fr}.splitR{position:static;height:70vh}}
 @media (max-width:760px){.g2{grid-template-columns:1fr}.viewer{grid-template-columns:1fr;height:auto}.vlist{max-height:200px}.vframe{height:60vh}}
 </style>
@@ -178,7 +198,6 @@ tr.pending td:first-child{box-shadow:inset 3px 0 0 var(--warn)}
     <button data-tab="overview" class="active">Overview</button>
     <button data-tab="txns">Transactions</button>
     <button data-tab="docs">Documents<span id="pendBadge"></span></button>
-    <button data-tab="files">File browser</button>
     <button data-tab="timeline">Timeline</button>
     <button data-tab="accounts">Accounts &amp; import</button>
     <button data-tab="settings">Settings</button>
@@ -363,7 +382,7 @@ async function makeLocal() {
 /* ---------------- state ---------------- */
 let store = null;
 const S = { accounts: [], txns: [], docs: [], pos: [], settings: {...DEFAULT_SETTINGS} };
-const UI = { tab: location.hash.slice(1) || 'overview', range: LS.get('ledger.range', '12m'), tx: { acct:'', cls:'all', q:'', tag:'', from:'', to:'', link:'' }, sel: new Set(), docF: { type:'', status:'', q:'', tag:'', chain:'' }, skipped: new Set(), viewIdx: 0, pendingImport: null };
+const UI = { tab: location.hash.slice(1) || 'overview', range: LS.get('ledger.range', '12m'), tx: { acct:'', cls:'all', q:'', tag:'', from:'', to:'', link:'' }, sel: new Set(), docF: { type:'', status:'', q:'', tag:'', chain:'' }, docSort: LS.get('ledger.docSort', { key: 'date', dir: 'desc' }), skipped: new Set(), viewIdx: 0, pendingImport: null };
 let docsByTxn = {};
 const charts = {};
 
@@ -430,7 +449,7 @@ function burn() {
 /* ---------------- modal ---------------- */
 function modal(title, html, { wide } = {}) {
   const m = $('#modal'); $('.mbox', m).className = 'mbox' + (wide ? ' wide' : '');
-  $('.mtitle', m).textContent = title;
+  $('.mtitle', m).textContent = title; $$('.mnav', m).forEach(x => x.remove()); UI.navGo = null;
   const old = $('.mbody', m), nb = old.cloneNode(false); old.replaceWith(nb); // fresh element: no listeners left over from the previous form
   nb.innerHTML = html; m.hidden = false; return nb;
 }
@@ -520,7 +539,7 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#modal
 /* ---------------- tabs ---------------- */
 $('#tabs').addEventListener('click', e => { const b = e.target.closest('button[data-tab]'); if (b) go(b.dataset.tab); });
 window.addEventListener('hashchange', () => { const t = location.hash.slice(1); if (t && t !== UI.tab) go(t); });
-function go(tab) { if (tab === 'pos') { UI.docF.type = 'po'; tab = 'docs'; } UI.tab = tab; if (location.hash.slice(1) !== tab) location.hash = tab; $$('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab)); render(); }
+function go(tab) { if (tab === 'pos') { UI.docF.type = 'po'; tab = 'docs'; } if (tab === 'files') tab = 'docs'; UI.tab = tab; if (location.hash.slice(1) !== tab) location.hash = tab; $$('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab)); render(); }
 function render() {
   Object.values(charts).forEach(c => c.destroy()); for (const k in charts) delete charts[k];
   derive();
@@ -690,6 +709,7 @@ async function setLink(item, txnId, on) {
   r.linkedTxnIds = [...cur];
   let note = '';
   if (on && r.type === 'invoice' && r.status === 'unpaid') { r.status = 'paid'; note = ' · invoice marked paid'; }
+  if (!on && r.type === 'invoice' && r.status === 'paid' && !r.linkedTxnIds.length) { r.status = 'unpaid'; note = ' · invoice back to unpaid'; }
   if (r.type === 'receipt') { const was = r.status; r.status = r.linkedTxnIds.length ? 'reconciled' : 'unreconciled'; if (was !== r.status) note = ' · receipt ' + r.status; }
   await persist(item.kind === 'po' ? 'pos' : 'docs', r);
   derive(); return note;
@@ -956,7 +976,7 @@ function editTxn(t) {
     <datalist id="catList">${[...new Set(S.txns.map(x => x.category).filter(Boolean))].map(c => `<option value="${esc(c)}">`).join('')}</datalist>
     <div class="mfoot">${!isNew && t.manual ? '<button class="b danger" id="tDel">Delete</button>' : ''}<span style="flex:1"></span><button class="b" data-close>Cancel</button><button class="b pri" id="tSave">Save</button></div>`);
   $('#tXfer', body)?.addEventListener('click', e => { e.preventDefault(); transferDialog(S.txns.find(x => x.id === t.id)); });
-  $('#tDel', body)?.addEventListener('click', async () => { if (!confirm('Delete this manual transaction?')) return; { const o = t.transferPairId && S.txns.find(x => x.id === t.transferPairId); if (o) { o.transferPairId = ''; await persist('txns', o); } } await store.del('txns', t.id); S.txns = S.txns.filter(x => x.id !== t.id); closeModal(); render(); });
+  $('#tDel', body)?.addEventListener('click', async () => { if (!confirm('Delete this manual transaction?')) return; { const o = t.transferPairId && S.txns.find(x => x.id === t.transferPairId); if (o) { o.transferPairId = ''; await persist('txns', o); } } await store.del('txns', t.id); S.txns = S.txns.filter(x => x.id !== t.id); for (const [n, arr] of [['docs', S.docs], ['pos', S.pos]]) for (const r of arr.filter(r => (r.linkedTxnIds || []).includes(t.id))) { r.linkedTxnIds = r.linkedTxnIds.filter(id => id !== t.id); await persist(n, r); } closeModal(); render(); });
   $('#tSave', body).onclick = async () => {
     const newCls = $('#tCls', body).value; const wasCls = (S.txns.find(x => x.id === t.id) || {}).cls || '';
     if (wasCls === 'transfer' && newCls !== 'transfer') { const live = S.txns.find(x => x.id === t.id); await clearTransferPair(live); t.transferPairId = ''; t.transferAcct = ''; }
@@ -999,6 +1019,8 @@ function chainOf(kind, r) {
     : r.type === 'other' ? []
     : [['quote', 'Quote', quotes], ['po', 'PO', pos], ['invoice', 'Invoice', invs], ['paid', 'Paid', txns]].map(st => (st[0] === (kind === 'po' ? 'po' : r.type)) ? ['self', st[1], [r]] : st);
   const missing = closed || r.needsReview ? [] : steps.filter(st => !st[2].length).map(st => st[0]);
+  const billed0 = invs.length ? invs.reduce((s, i) => s + (+i.amount || 0), 0) : pos.length ? pos.reduce((s, p) => s + poTotals(p).total, 0) : +r.amount || 0;
+  if (!closed && !r.needsReview && txns.length > 1 && billed0 > 0 && txns.reduce((s, t) => s + Math.abs(t.amount), 0) > billed0 * 1.01) missing.push('overpaid');
   return { quotes, pos, invs, txns, steps, closed, missing };
 }
 function chainHTML(kind, r) {
@@ -1006,11 +1028,63 @@ function chainHTML(kind, r) {
   if (!c.steps.length) return '<span class="muted small">—</span>';
   if (r.needsReview) return '<span class="muted small">review first</span>';
   return `<div class="chain">${c.steps.map(([k, label, items]) => {
-    const ok = items.length > 0, cls = k === 'self' ? 'self' : ok ? 'ok' : c.closed ? 'na' : 'miss';
+    const ok = items.length > 0; let cls = k === 'self' ? 'self' : ok ? 'ok' : c.closed ? 'na' : 'miss';
+    const overpaid = k === 'paid' && items.length > 1 && chainPayments(kind, r).over; if (overpaid) cls = 'miss';
     const title = k === 'self' ? 'This document' : ok ? items.map(x => x.date ? `${fmtDate(x.date)} · ${x.description || x.vendor || ''} ${money(x.amount ?? poTotals(x).total)}`.trim() : x.number || '').join('\n') : c.closed ? 'Closed — not expected' : `Not linked yet — click to link a ${label.toLowerCase()}`;
-    return `<button type="button" class="ch ${cls}" data-step="${k}" title="${esc(title)}">${ok ? '✓' : c.closed ? '–' : '○'} ${label}${ok && items.length > 1 ? ' ×' + items.length : ''}</button>`;
+    return `<button type="button" class="ch ${cls}${overpaid ? ' over' : ''}" data-step="${k}" title="${esc(overpaid ? 'Payments add up to more than the bill — click to review\n' + title : title)}">${overpaid ? '⚠' : ok ? '✓' : c.closed ? '–' : '○'} ${label}${ok && items.length > 1 ? ' ×' + items.length : ''}</button>`;
   }).join('<span class="chsep">›</span>')}${c.closed ? '<span class="small muted"> closed</span>' : ''}</div>`;
 }
+/* ---------- Payments in a chain: who holds each link, over-payment check, unlink / move ---------- */
+function chainPayments(kind, r) {
+  const c = chainOf(kind, r);
+  const holders = [...c.quotes.map(x => ['doc', x]), ...c.pos.map(x => ['po', x]), ...c.invs.map(x => ['doc', x]), ...(r.type === 'receipt' ? [['doc', r]] : [])];
+  const map = new Map();
+  for (const [k, h] of holders) for (const id of h.linkedTxnIds || []) {
+    const t = S.txns.find(x => x.id === id); if (!t) continue;
+    if (!map.has(id)) map.set(id, { t, on: [] });
+    if (!map.get(id).on.some(o => o.rec.id === h.id)) map.get(id).on.push({ kind: k, rec: h });
+  }
+  const pays = [...map.values()].sort((a, b) => a.t.date.localeCompare(b.t.date));
+  const billed = c.invs.length ? c.invs.reduce((s, i) => s + (+i.amount || 0), 0) : c.pos.length ? c.pos.reduce((s, p) => s + poTotals(p).total, 0) : r.type === 'receipt' ? +r.amount || 0 : c.quotes.reduce((s, q) => s + (+q.amount || 0), 0);
+  const paid = pays.reduce((s, p) => s + Math.abs(p.t.amount), 0);
+  const over = billed > 0 && pays.length > 1 && paid > billed * 1.01;
+  return { c, pays, billed, paid, over };
+}
+function holderLabel(o) { return `${o.kind === 'po' ? 'PO' : DOC_TYPES[o.rec.type]} ${o.rec.number || o.rec.vendor || ''}`.trim(); }
+function paymentsManager(kind, r) {
+  const draw = () => {
+    const rec = (kind === 'po' ? S.pos : S.docs).find(x => x.id === r.id) || r;
+    const { c, pays, billed, paid, over } = chainPayments(kind, rec);
+    const inv = c.invs.length === 1 ? c.invs[0] : null;
+    $('#modal .mtitle').textContent = `Payments — ${[...c.quotes.map(q => 'Quote ' + (q.number || '')), ...c.pos.map(p => p.number), ...c.invs.map(i => 'Invoice ' + (i.number || '')), ...(rec.type === 'receipt' ? ['Receipt ' + (rec.number || rec.vendor || '')] : [])].join(' › ')}`;
+    $('#modal .mbody').innerHTML = `
+      <div class="small muted" style="margin-bottom:8px">Every bank/card transaction linked anywhere in this chain, and which document holds the link. A payment normally belongs on the <b>invoice</b> (or the receipt).</div>
+      ${over ? `<div class="banner warn small">⚠ ${pays.length} payments total <b>${money(paid)}</b> but the bill is <b>${money(billed)}</b> — one is probably a duplicate link (or a duplicate import of the same payment). Unlink the extra one below.</div>` : ''}
+      ${pays.length ? `<table><thead><tr><th>Date</th><th>Transaction</th><th class="r">Amount</th><th>Linked on</th><th></th></tr></thead><tbody>
+      ${pays.map(p => `<tr data-t="${p.t.id}"><td style="white-space:nowrap">${fmtDate(p.t.date)}</td><td>${esc(p.t.description)}<div class="small muted">${esc(acctName(p.t.accountId))}${isStale(p.t) ? ' · <span style="color:var(--crit)">⚑ not in bank statement</span>' : ''}${pays.some(q => q !== p && Math.abs(q.t.amount - p.t.amount) < 0.005) ? ' · <span style="color:var(--warn)">same amount as another payment here</span>' : ''}</div></td>
+        <td class="r">${money(p.t.amount)}</td>
+        <td>${p.on.map(o => `<span class="chip" style="white-space:nowrap">${esc(holderLabel(o))} <a href="#" class="pmUn" data-k="${o.kind}" data-id="${o.rec.id}" title="Unlink from ${esc(holderLabel(o))}" style="color:var(--crit);text-decoration:none;margin-left:3px">✕</a></span>`).join(' ')}</td>
+        <td style="white-space:nowrap">${inv && !p.on.some(o => o.rec.id === inv.id) ? `<button class="b sm pmMove" title="Link to the invoice instead">Move to invoice</button>` : ''}</td></tr>`).join('')}
+      </tbody></table>
+      <div class="small muted" style="margin-top:6px">Paid ${money(paid)}${billed ? ` of ${money(billed)} billed` : ''}.</div>` : '<div class="muted">No payments linked.</div>'}
+      <div class="mfoot"><button class="b" id="pmAdd">＋ Link a payment…</button><span style="flex:1"></span><button class="b pri" data-close>Done</button></div>`;
+    $('#pmAdd').onclick = () => { const tgt = inv ? ['doc', inv] : c.invs[0] ? ['doc', c.invs[0]] : c.pos[0] ? ['po', c.pos[0]] : [kind, rec]; txnPicker(tgt[0], tgt[1]); };
+    return { c, inv };
+  };
+  modal('Payments', '', { wide: true }); let st = draw();
+  $('#modal .mbody').addEventListener('click', async e => {
+    const un = e.target.closest('.pmUn'), mv = e.target.closest('.pmMove'); if (!un && !mv) return; e.preventDefault();
+    const tid = e.target.closest('tr').dataset.t;
+    if (un) { const h = (un.dataset.k === 'po' ? S.pos : S.docs).find(x => x.id === un.dataset.id); const note = await setLink(linkItem(un.dataset.k, h), tid, false); toast('Unlinked' + (note || '')); }
+    if (mv) {
+      const p = chainPayments(kind, r).pays.find(x => x.t.id === tid);
+      for (const o of p.on) await setLink(linkItem(o.kind, o.rec), tid, false);
+      const note = await setLink(linkItem('doc', st.inv), tid, true); toast('Moved to invoice ' + (st.inv.number || '') + (note || ''));
+    }
+    st = draw(); render();
+  });
+}
+
 /* Generic picker: click a row to choose it. */
 function pickDialog(title, intro, items, onPick, extraHTML = '') {
   const body = modal(title, `<div class="small muted" style="margin-bottom:8px">${intro}</div>${extraHTML}
@@ -1085,7 +1159,9 @@ function filteredAll() {
   const pos = f.type && f.type !== 'po' ? [] : S.pos.filter(p => (!f.status || (f.status === 'needs review' ? p.needsReview : p.status === f.status)) && (!f.tag || (p.tags || []).includes(f.tag)) && (!q || [p.vendor, p.number, p.notes, p.quoteRef, p.fileName, poTotals(p).total, (p.tags || []).join(' ')].join(' ').toLowerCase().includes(q)))
     .map(p => ({ kind: 'po', rec: p, type: 'po', date: p.date || '', amount: poTotals(p).total }));
   const all = [...docs, ...pos].filter(x => !f.chain || (f.chain === 'gaps' ? chainOf(x.kind, x.rec).missing.length : !chainOf(x.kind, x.rec).missing.length && !x.rec.needsReview));
-  return all.sort((a, b) => (!!b.rec.needsReview - !!a.rec.needsReview) || b.date.localeCompare(a.date));
+  const k = UI.docSort.key, dir = UI.docSort.dir === 'asc' ? 1 : -1;
+  const val = x => k === 'date' ? x.date : k === 'type' ? (x.kind === 'po' ? 'Purchase order' : DOC_TYPES[x.rec.type]) : k === 'vendor' ? (x.rec.vendor || x.rec.fileName || '').toLowerCase() : k === 'number' ? (x.rec.number || '').toLowerCase() : k === 'amount' ? x.amount : k === 'status' ? (x.rec.needsReview ? '0' : x.rec.status || '') : k === 'chain' ? chainOf(x.kind, x.rec).missing.length : k === 'tags' ? (x.rec.tags || []).join(',').toLowerCase() : '';
+  return all.sort((a, b) => { const A = val(a), B = val(b); return (A < B ? -1 : A > B ? 1 : 0) * dir || b.date.localeCompare(a.date); });
 }
 function vDocs(root) {
   const f = UI.docF; const rows = filteredAll();
@@ -1118,27 +1194,26 @@ function vDocs(root) {
       <select id="dChain">${[['', 'Any link status'], ['gaps', '○ Missing links'], ['complete', '✓ Fully linked']].map(([v, l]) => `<option value="${v}" ${f.chain === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
       <input id="dQ" class="grow" placeholder="Search vendor, number, description, file" value="${esc(f.q)}">
       <button class="b" id="findDups" title="Find files stored more than once">Find duplicates</button>
-      <button class="b" onclick="location.hash='files'">Open file browser</button>
     </div>
     <div class="small muted" style="margin-bottom:6px">${rows.length} items · ${money(rows.reduce((s, r) => s + r.amount, 0))}</div>
-    <div class="tw"><table><thead><tr><th>Type</th><th>Date</th><th>Vendor</th><th>No.</th><th class="r">Amount</th><th>Status</th><th>Tags</th><th title="Quote › PO › Invoice › Paid (bank/card transaction). Dashed orange = not linked yet — click to link.">Quote › PO › Invoice › Paid</th><th></th></tr></thead><tbody>
+    <div class="tw"><table><thead><tr>${[['type', 'Type'], ['date', 'Date'], ['vendor', 'Vendor'], ['number', 'No.'], ['amount', 'Amount', 'r'], ['status', 'Status'], ['tags', 'Tags'], ['chain', 'Quote › PO › Invoice › Paid']].map(([k, l, c]) => `<th class="sortable ${c || ''}" data-sort="${k}" ${k === 'chain' ? 'title="Sort by missing links. Dashed orange = not linked yet — click a step to link."' : ''}>${l}${UI.docSort.key === k ? `<span class="arr">${UI.docSort.dir === 'asc' ? '▲' : '▼'}</span>` : ''}</th>`).join('')}<th></th></tr></thead><tbody>
     ${rows.map(r => {
       const d = r.rec; const tx = (d.linkedTxnIds || []).map(id => S.txns.find(t => t.id === id)).filter(Boolean);
       const txHTML = tx.map(t => `💳 ${fmtDate(t.date)} ${money(t.amount)}`).join('<br>');
       if (r.kind === 'po') {
         const q = S.docs.find(x => x.id === d.quoteId); const inv = S.docs.filter(x => x.type === 'invoice' && x.poId === d.id);
-        return `<tr data-id="${d.id}" data-kind="po" class="${d.needsReview ? 'pending' : ''}"><td><b>Purchase order</b>${d.imported ? '<div class="small muted">uploaded</div>' : ''}</td><td style="white-space:nowrap">${fmtDate(d.date)}</td>
+        return `<tr data-id="${d.id}" data-kind="po" class="rowlink ${d.needsReview ? 'pending' : ''}"><td><b>Purchase order</b>${d.imported ? '<div class="small muted">uploaded</div>' : ''}</td><td style="white-space:nowrap">${fmtDate(d.date)}</td>
           <td>${d.needsReview && !d.vendor ? `<span class="muted">${esc(d.fileName || '')}</span>` : esc(d.vendor)}${d.notes ? `<div class="small muted">${esc(d.notes).slice(0, 120)}</div>` : ''}</td><td>${esc(d.number)}</td><td class="r">${money(r.amount)}</td>
           <td>${d.needsReview ? '<span class="status warn">⚑ needs review</span>' : `<span class="status ${statusCls(d.status)}">${esc(d.status)}</span>`}</td><td>${(d.tags || []).map(g => `<span class="chip">${esc(g)}</span>`).join('')}</td>
           <td>${chainHTML('po', d)}${inv.length ? `<div class="small muted">${inv.length} invoice${inv.length > 1 ? 's' : ''} · ${money(inv.reduce((s, x) => s + (+x.amount || 0), 0))}</div>` : ''}</td>
-          <td style="white-space:nowrap">${d.file ? '<button class="b sm view">View</button> ' : ''}<button class="b sm pdf" title="Generate a PDF from these details">PDF</button> <button class="b sm edit">Edit</button></td></tr>`;
+          <td style="white-space:nowrap">${d.file ? '<span class="small muted" title="File attached">📎</span> ' : ''}<button class="b sm edit">Edit</button></td></tr>`;
       }
       const po = d.poId && S.pos.find(p => p.id === d.poId); const pos = S.pos.filter(p => p.quoteId === d.id);
-      return `<tr data-id="${d.id}" data-kind="doc" class="${d.needsReview ? 'pending' : ''}"><td><b>${DOC_TYPES[d.type]}</b>${d.needsReview ? '<div class="small muted">guessed</div>' : ''}</td><td style="white-space:nowrap">${fmtDate(d.date)}${d.dueDate && d.type !== 'receipt' ? `<div class="small muted">${d.type === 'quote' ? 'valid to' : 'due'} ${fmtDate(d.dueDate)}</div>` : ''}</td>
+      return `<tr data-id="${d.id}" data-kind="doc" class="rowlink ${d.needsReview ? 'pending' : ''}"><td><b>${DOC_TYPES[d.type]}</b>${d.needsReview ? '<div class="small muted">guessed</div>' : ''}</td><td style="white-space:nowrap">${fmtDate(d.date)}${d.dueDate && d.type !== 'receipt' ? `<div class="small muted">${d.type === 'quote' ? 'valid to' : 'due'} ${fmtDate(d.dueDate)}</div>` : ''}</td>
         <td>${d.needsReview && !d.vendor ? `<span class="muted">${esc(d.fileName || '')}</span>` : esc(d.vendor)}${d.description ? `<div class="small muted">${esc(d.description).slice(0, 120)}</div>` : ''}</td><td>${esc(d.number || '')}</td>
         <td class="r">${money(d.amount)}</td><td>${statusHTML(d)}</td><td>${(d.tags || []).map(g => `<span class="chip">${esc(g)}</span>`).join('')}</td>
         <td>${chainHTML('doc', d)}</td>
-        <td style="white-space:nowrap">${d.file ? '<button class="b sm view">View</button> ' : ''}<button class="b sm edit">Edit</button> ${d.type === 'quote' ? '<button class="b sm mkpo">→ PO</button>' : ''}</td></tr>`;
+        <td style="white-space:nowrap">${d.file ? '<span class="small muted" title="File attached">📎</span> ' : ''}<button class="b sm edit">Edit</button></td></tr>`;
     }).join('') || '<tr><td colspan="9" class="muted">Nothing here yet — drop files above.</td></tr>'}
     </tbody></table></div>
   </div>`;
@@ -1158,18 +1233,17 @@ function vDocs(root) {
   $('#dStatus').onchange = e => { f.status = e.target.value; rf(); };
   $('#dTag').onchange = e => { f.tag = e.target.value; rf(); };
   $('#dChain').onchange = e => { f.chain = e.target.value; rf(); };
+  $$('th[data-sort]', root).forEach(th => th.onclick = () => { const k = th.dataset.sort; UI.docSort = UI.docSort.key === k ? { key: k, dir: UI.docSort.dir === 'asc' ? 'desc' : 'asc' } : { key: k, dir: ['date', 'amount', 'chain'].includes(k) ? 'desc' : 'asc' }; LS.set('ledger.docSort', UI.docSort); rf(); });
   $('#gapGo')?.addEventListener('click', () => { f.chain = 'gaps'; rf(); });
   let qh; $('#dQ').oninput = e => { clearTimeout(qh); qh = setTimeout(() => { f.q = e.target.value; rf(); setTimeout(() => { const i = $('#dQ'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }); }, 300); };
   root.querySelector('tbody').addEventListener('click', e => {
     const tr = e.target.closest('tr[data-id]'); if (!tr) return;
     const isPO = tr.dataset.kind === 'po'; const r = (isPO ? S.pos : S.docs).find(x => x.id === tr.dataset.id); if (!r) return;
-    if (e.target.classList.contains('edit')) { UI.skipped.clear(); isPO ? editPO(r) : editDoc(r); }
-    if (e.target.classList.contains('view')) openDocViewer(r.id);
-    if (e.target.classList.contains('pdf')) poPDF(r);
-    if (e.target.classList.contains('mkpo')) editPO(null, r);
+    if (!e.target.closest('.ch') && !e.target.closest('a')) { UI.skipped.clear(); return isPO ? editPO(r) : editDoc(r); }
     const ch = e.target.closest('.ch');
     if (ch) {
       const k = isPO ? 'po' : 'doc', step = ch.dataset.step;
+      if (ch.classList.contains('ok') || ch.classList.contains('over')) return isPO ? editPO(r) : editDoc(r);
       if (ch.classList.contains('miss')) return linkStep(k, r, step);
       if (ch.classList.contains('ok')) { const c = chainOf(k, r);
         if (step === 'quote') editDoc(c.quotes[0]); else if (step === 'po') editPO(c.pos[0]); else if (step === 'invoice') editDoc(c.invs[0]);
@@ -1332,7 +1406,8 @@ function editDoc(d, file, rest = [], prefill = null) {
   d = d ? structuredClone(d) : { id: 'd_' + uid(), type: g.type, number: g.number, vendor: '', date: today(), amount: '', status: DOC_STATUS[g.type][0], tags: [], description: '', items: [], linkedTxnIds: [], createdAt: new Date().toISOString() };
   if (isNew && prefill) { const { type, ...rest2 } = prefill; Object.keys(rest2).forEach(k => { if (rest2[k] !== undefined && rest2[k] !== '' && rest2[k] !== null) d[k] = rest2[k]; }); d.status = DOC_STATUS[d.type][0]; }
   const vendors = [...new Set([...S.docs.map(x => x.vendor), ...S.pos.map(p => p.vendor)].filter(Boolean))];
-  const body = modal(reviewing ? reviewTitle(d) : (isNew ? 'New document' : 'Edit document') + (file ? ` — ${file.name}` : '') + (rest.length ? ` (${rest.length} more queued)` : ''), `
+  const body = modal(reviewing ? reviewTitle(d) : (isNew ? 'New document' : `${DOC_TYPES[d.type]} ${d.number || ''}`.trim()) + (file ? ` — ${file.name}` : '') + (rest.length ? ` (${rest.length} more queued)` : ''), `
+    ${isNew ? '<div class="small muted" style="margin-bottom:10px">Save first, then link it to quotes, POs, invoices and payments.</div>' : '<div class="linkage" id="lkPanel"></div>'}
     <div class="form">
       <label>Type<select id="dT">${Object.entries(DOC_TYPES).map(([v, l]) => `<option value="${v}" ${d.type === v ? 'selected' : ''}>${l}</option>`).join('')}${isNew || reviewing ? '<option value="po">Purchase order →</option>' : ''}</select></label>
       <label>Vendor<input id="dV" value="${esc(d.vendor)}" list="vendList"></label>
@@ -1341,14 +1416,10 @@ function editDoc(d, file, rest = [], prefill = null) {
       <label>Total amount<input type="number" step="0.01" id="dA" value="${d.amount ?? ''}"></label>
       <label id="dueWrap"><span id="dueLbl">${d.type === 'quote' ? 'Valid until' : 'Due date'}</span><input type="date" id="dDue" value="${d.dueDate || ''}"></label>
       <label>Status<select id="dS"></select></label>
-      <label>Related PO<select id="dPO"><option value="">—</option>${S.pos.map(p => `<option value="${p.id}" ${d.poId === p.id ? 'selected' : ''}>${esc(p.number)} · ${esc(p.vendor)}</option>`).join('')}</select></label>
       <label class="full">Tags (comma-separated)<input id="dTags" value="${esc((d.tags || []).join(', '))}" placeholder="e.g. reagents, grant-A, CRO"></label>
       <label class="full">Description<textarea id="dDesc">${esc(d.description || '')}</textarea></label>
       <label class="full" id="itemsWrap">Line items <span class="muted">(used to generate POs)</span>${itemsEditor(d.items)}</label>
-      <label class="full">${file || d.file ? 'File' : 'Attach file (optional)'}${d.file ? `<div class="small">${esc(d.fileName)} <button class="b sm" id="dView" type="button">View</button> <button class="b sm danger" id="dRmFile" type="button">Remove file</button> <span class="muted">— or choose a file below to replace it</span></div>` : ''}${!file ? `<input type="file" id="dFile"><div class="small" id="dDupWarn" style="color:var(--warn)"></div>` : `<div class="small">${esc(file.name)} · ${(file.size / 1024).toFixed(0)} KB</div>`}</label>
-      <label class="full">Link to bank transactions <span class="sugg" id="suggNote"></span>
-        <input id="txSearch" placeholder="Search transactions by description or amount">
-        <div class="linklist" id="txList"></div></label>
+      <label class="full">${file || d.file ? 'File' : 'Attach file (optional)'}${d.file ? `<div class="small">${esc(d.fileName)} <button class="b sm" id="dView" type="button">Open ↗</button> <button class="b sm danger" id="dRmFile" type="button">Remove file</button> <span class="muted">— or choose a file below to replace it</span></div>` : ''}${!file ? `<input type="file" id="dFile"><div class="small" id="dDupWarn" style="color:var(--warn)"></div>` : `<div class="small">${esc(file.name)} · ${(file.size / 1024).toFixed(0)} KB</div>`}</label>
     </div>
     <datalist id="vendList">${vendors.map(v => `<option value="${esc(v)}">`).join('')}</datalist>
     <div class="mfoot">${!isNew ? '<button class="b danger" id="dDel">Delete</button>' : ''}<span style="flex:1"></span>${rest.length ? '<button class="b" id="dSkip">Skip file</button>' : ''}<button class="b" data-close>Cancel</button><button class="b pri" id="dSave">${rest.length ? 'Save & next' : 'Save'}</button></div>`, { wide: true });
@@ -1370,18 +1441,10 @@ function editDoc(d, file, rest = [], prefill = null) {
     if (reviewing) return convertDocToPO(S.docs.find(x => x.id === d.id) || d, { vendor: $('#dV', body).value.trim(), number: $('#dN', body).value.trim(), date: $('#dD', body).value, amount: +$('#dA', body).value || 0, tags: parseTags($('#dTags', body).value), notes: $('#dDesc', body).value.trim(), items });
     editPO(null, null, file, rest, { vendor: $('#dV', body).value.trim(), number: $('#dN', body).value.trim(), date: $('#dD', body).value, amount: +$('#dA', body).value || 0, tags: parseTags($('#dTags', body).value), notes: $('#dDesc', body).value.trim(), items });
   };
-  const drawTx = () => {
-    const amt = Math.abs(+$('#dA', body).value || 0), dt = $('#dD', body).value, q = $('#txSearch', body).value.toLowerCase();
-    const isS = t => amt && Math.abs(Math.abs(t.amount) - amt) <= Math.max(1, amt * 0.02) && (!dt || Math.abs(ts(t.date) - ts(dt)) < 120 * 864e5);
-    const pool = S.txns.filter(t => sel.has(t.id) || isS(t) || (q && (t.description + ' ' + t.amount).toLowerCase().includes(q)));
-    pool.sort((a, b) => (sel.has(b.id) - sel.has(a.id)) || (isS(b) - isS(a)) || b.date.localeCompare(a.date));
-    $('#suggNote', body).textContent = pool.some(isS) ? '· matches by amount & date shown' : '';
-    $('#txList', body).innerHTML = pool.slice(0, 60).map(t => `<label><input type="checkbox" value="${t.id}" ${sel.has(t.id) ? 'checked' : ''}> ${isS(t) ? '<span class="sugg">MATCH</span>' : ''} ${fmtDate(t.date)} · ${esc(t.description)} <span class="muted small">${esc(acctById(t.accountId)?.name || '')}</span><span class="amt">${money(t.amount)}</span></label>`).join('') || '<div class="muted small" style="padding:8px">Enter an amount to see matching transactions, or search.</div>';
-  };
-  $('#txList', body).onchange = e => { if (e.target.type === 'checkbox') e.target.checked ? sel.add(e.target.value) : sel.delete(e.target.value); };
-  $('#txSearch', body).oninput = drawTx; $('#dA', body).addEventListener('change', drawTx); $('#dD', body).addEventListener('change', drawTx);
   bindItems(body, s => { if (s > 0 && !$('#dA', body).value) { $('#dA', body).placeholder = s.toFixed(2); } });
-  drawTx();
+  let dirty = false; body.addEventListener('input', e => { if (!e.target.closest('.linkage')) dirty = true; }); body.addEventListener('change', e => { if (!e.target.closest('.linkage')) dirty = true; });
+  let navGo = null;
+  if (!isNew) linkagePanel($('#lkPanel', body), 'doc', d.id, { open: (k, x) => navGo ? navGo({ kind: k, rec: recOf(k, x) }) : openRecord(k, x), newPO: q => dirty ? saveDoc(() => editPO(null, recOf('doc', q.id))) : editPO(null, q), changed: live => { if (live && $('#dS', body) && live.status && live.status !== $('#dS', body).value && DOC_STATUS[$('#dT', body).value]?.includes(live.status)) $('#dS', body).value = live.status; } });
   $('#dView', body)?.addEventListener('click', () => openFile(d));
   $('#dSkip', body)?.addEventListener('click', () => queueFiles(rest));
   $('#dRmFile', body)?.addEventListener('click', async () => {
@@ -1397,13 +1460,14 @@ function editDoc(d, file, rest = [], prefill = null) {
     if (!confirm('Delete this document' + (d.file ? ' and its file' : '') + '?')) return;
     if (d.file) await store.removeFile(d.file.path); await store.del('docs', d.id); S.docs = S.docs.filter(x => x.id !== d.id); if (reviewing) return reviewNext(); closeModal(); render();
   });
-  $('#dSave', body).onclick = async () => {
+  const saveDoc = async (after) => {
     const btn = $('#dSave', body); btn.disabled = true; btn.textContent = 'Saving…';
     try {
       const items = readItems(body); const sub = items.reduce((s, i) => s + i.qty * i.price, 0);
-      if ($('#dT', body).value === 'receipt' && sel.size && $('#dS', body).value === 'unreconciled') $('#dS', body).value = 'reconciled';
-      if ($('#dT', body).value === 'invoice' && sel.size && $('#dS', body).value === 'unpaid') $('#dS', body).value = 'paid';
-      Object.assign(d, { type: $('#dT', body).value, vendor: $('#dV', body).value.trim(), number: $('#dN', body).value.trim(), date: $('#dD', body).value, amount: $('#dA', body).value === '' ? +sub.toFixed(2) : +$('#dA', body).value, dueDate: $('#dDue', body).value, status: $('#dS', body).value, poId: $('#dPO', body).value, tags: parseTags($('#dTags', body).value), description: $('#dDesc', body).value.trim(), items, linkedTxnIds: [...sel], updatedAt: new Date().toISOString() });
+      const live = S.docs.find(x => x.id === d.id); if (live) { d.linkedTxnIds = live.linkedTxnIds || []; d.poId = live.poId || ''; }
+      if ($('#dT', body).value === 'receipt' && d.linkedTxnIds?.length && $('#dS', body).value === 'unreconciled') $('#dS', body).value = 'reconciled';
+      if ($('#dT', body).value === 'invoice' && d.linkedTxnIds?.length && $('#dS', body).value === 'unpaid') $('#dS', body).value = 'paid';
+      Object.assign(d, { type: $('#dT', body).value, vendor: $('#dV', body).value.trim(), number: $('#dN', body).value.trim(), date: $('#dD', body).value, amount: $('#dA', body).value === '' ? +sub.toFixed(2) : +$('#dA', body).value, dueDate: $('#dDue', body).value, status: $('#dS', body).value, tags: parseTags($('#dTags', body).value), description: $('#dDesc', body).value.trim(), items, updatedAt: new Date().toISOString() });
       if (!d.date) d.date = today();
       delete d.needsReview;
       const f = file || $('#dFile', body)?.files[0];
@@ -1415,16 +1479,126 @@ function editDoc(d, file, rest = [], prefill = null) {
         d.file = { path: up.path, url: up.url, contentType: f.type || '', size: f.size, ...(h ? { sha256: h } : {}) }; d.fileName = f.name;
       }
       await persist('docs', d); toast('Saved ' + (DOC_TYPES[d.type] || 'document'));
+      dirty = false;
       if (reviewing) return reviewNext();
+      if (after) { render(); return after(); }
       if (rest.length) queueFiles(rest); else { closeModal(); render(); }
       if (rest.length) render();
-    } catch (e) { if (reviewing) d.needsReview = true; btn.disabled = false; btn.textContent = 'Save'; toast('Save failed: ' + e.message, 6000); DBG.err('document save failed', e); }
+    } catch (e) { if (reviewing) d.needsReview = true; btn.disabled = false; btn.textContent = 'Save'; toast('Save failed: ' + e.message, 6000); DBG.err('document save failed', e); return false; }
   };
+  $('#dSave', body).onclick = () => saveDoc();
+  if (!isNew && !reviewing) navGo = attachNav(body, 'doc', d.id, () => dirty, saveDoc);
+}
+
+/* ======================= DOCUMENT EDITOR: navigation + linkage panel ======================= */
+const recOf = (kind, id) => (kind === 'po' ? S.pos : S.docs).find(x => x.id === id);
+function openRecord(kind, id) { const r = recOf(kind, id); if (!r) return toast('Not found'); kind === 'po' ? editPO(r) : editDoc(r); }
+/* Prev / Next follow the Documents list as currently filtered and sorted. */
+function navNeighbors(kind, id) {
+  const L = filteredAll(); const i = L.findIndex(x => x.kind === kind && x.rec.id === id);
+  return { i, n: L.length, prev: i > 0 ? L[i - 1] : null, next: i >= 0 && i < L.length - 1 ? L[i + 1] : null };
+}
+/* Adds ‹ Prev · n of N · Next › to the modal header; leaving a changed form saves it first. */
+function attachNav(body, kind, id, isDirty, save) {
+  const nb = navNeighbors(kind, id); const head = $('#modal .mhead');
+  const go = async target => {
+    if (!target) return;
+    if (isDirty()) { const ok = await save(() => openRecord(target.kind, target.rec.id)); if (ok === false) return; }
+    else openRecord(target.kind, target.rec.id);
+  };
+  const nav = document.createElement('div'); nav.className = 'mnav';
+  nav.innerHTML = `<button class="b sm" data-nav="prev" ${nb.prev ? '' : 'disabled'} title="Previous document (Alt+←)">‹ Prev</button><span class="small muted">${nb.i >= 0 ? `${nb.i + 1} of ${nb.n}` : 'not in current list'}</span><button class="b sm" data-nav="next" ${nb.next ? '' : 'disabled'} title="Next document (Alt+→)">Next ›</button>`;
+  head.insertBefore(nav, $('.x', head));
+  nav.onclick = e => { const b = e.target.closest('[data-nav]'); if (b) go(nb[b.dataset.nav]); };
+  UI.navGo = dir => go(nb[dir]);
+  return go;
+}
+document.addEventListener('keydown', e => {
+  if ($('#modal').hidden || !UI.navGo || !$('#modal .mnav')) return;
+  if (e.altKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) { e.preventDefault(); UI.navGo(e.key === 'ArrowLeft' ? 'prev' : 'next'); }
+});
+/* Linkage panel: Quote › PO › Invoice › Payments for the record being edited — open, unlink, or link in place. */
+function linkagePanel(host, kind, id, hooks = {}) {
+  const draw = () => {
+    const r = recOf(kind, id); if (!r) { host.innerHTML = ''; return; }
+    const c = chainOf(kind, r); const P = chainPayments(kind, r);
+    const myType = kind === 'po' ? 'po' : r.type;
+    const cols = r.type === 'receipt' ? ['self', 'paid'] : r.type === 'other' ? ['paid'] : ['quote', 'po', 'invoice', 'paid'];
+    const label = { quote: 'Quote', po: 'Purchase order', invoice: 'Invoice', paid: 'Payments', self: DOC_TYPES[r.type] };
+    const item = (k, x, step) => `<div class="lkItem"><span><b>${k === 'po' ? 'PO' : DOC_TYPES[x.type]}</b> ${esc(x.number || '')} · ${esc(x.vendor || x.fileName || '')}<br><span class="small muted">${fmtDate(x.date)} · ${money(k === 'po' ? poTotals(x).total : x.amount)}${x.status ? ' · ' + esc(x.status) : ''}</span></span>
+      <span class="lkBtns"><button type="button" class="b sm" data-open="${k}:${x.id}" title="Open this document">Open</button><button type="button" class="b sm danger" data-unlink="${step}:${x.id}" title="Remove this link">✕</button></span></div>`;
+    const sel = (step, opts, extra = '') => `<select class="lkAdd" data-add="${step}"><option value="">＋ Link ${{ paid: 'a payment', po: 'a PO', invoice: 'an invoice', quote: 'a quote' }[step]}…</option>${extra}${opts.map(o => `<option value="${o.id}">${o.score >= 50 ? '★ ' : ''}${esc(o.text)}</option>`).join('')}</select>`;
+    const docOpt = (d, ref) => ({ id: d.id, score: relScore(ref, d), text: `${d.number || '—'} · ${d.vendor || d.fileName || ''} · ${money(d.amount)} · ${fmtDate(d.date)}` });
+    const poOpt = (p, ref) => ({ id: p.id, score: relScore(ref, p), text: `${p.number || '—'} · ${p.vendor || ''} · ${money(poTotals(p).total)} · ${fmtDate(p.date)}` });
+    const rank = L => L.sort((a, b) => b.score - a.score).slice(0, 60);
+    const col = step => {
+      if (step === 'self' || step === myType) return `<div class="lkCol self"><div class="lkHead">● ${label[step === 'self' ? 'self' : step]}</div><div class="small muted">this document</div></div>`;
+      let inner = '', ok = false;
+      if (step === 'quote') {
+        ok = !!c.quotes.length; inner = c.quotes.map(q => item('doc', q, 'quote')).join('');
+        if (!ok) inner += c.pos.length ? sel('quote', rank(S.docs.filter(d => d.type === 'quote').map(d => docOpt(d, c.pos[0])))) : `<div class="small muted">Link a PO first — the quote attaches to the PO.</div>`;
+      }
+      if (step === 'po') {
+        ok = !!c.pos.length; inner = c.pos.map(p => item('po', p, 'po')).join('');
+        if (!ok) inner += r.type === 'quote' ? sel('po', rank(S.pos.filter(p => !p.quoteId).map(p => poOpt(p, r))), '<option value="__new">＋ Create a PO from this quote</option>') : sel('po', rank(S.pos.filter(p => p.status !== 'cancelled').map(p => poOpt(p, r))));
+      }
+      if (step === 'invoice') {
+        ok = !!c.invs.length; inner = c.invs.map(i => item('doc', i, 'invoice')).join('');
+        inner += c.pos.length ? sel('invoice', rank(S.docs.filter(d => d.type === 'invoice' && !d.poId).map(d => docOpt(d, c.pos[0])))) : `<div class="small muted">Link a PO first — invoices attach to the PO.</div>`;
+      }
+      if (step === 'paid') {
+        ok = P.pays.length > 0;
+        const inv1 = c.invs.length === 1 ? c.invs[0] : null;
+        inner = (P.over ? `<div class="small" style="color:var(--warn);font-weight:600;margin-bottom:4px">⚠ ${money(P.paid)} paid vs ${money(P.billed)} billed — likely a duplicate</div>` : '')
+          + P.pays.map(p => `<div class="lkItem"><span>${fmtDate(p.t.date)} · ${esc(p.t.description)}<br><span class="small muted">${money(p.t.amount)} · ${esc(acctName(p.t.accountId))} · on ${p.on.map(o => esc(holderLabel(o))).join(', ')}${isStale(p.t) ? ' · <span style="color:var(--crit)">⚑ not in statement</span>' : ''}</span></span>
+            <span class="lkBtns">${inv1 && !p.on.some(o => o.rec.id === inv1.id) ? `<button type="button" class="b sm" data-move="${p.t.id}" title="Attach to the invoice instead">→ Invoice</button>` : ''}<button type="button" class="b sm danger" data-unpay="${p.t.id}" title="Unlink this payment">✕</button></span></div>`).join('');
+        const tgt = c.invs[0] ? linkItem('doc', c.invs[0]) : c.pos[0] ? linkItem('po', c.pos[0]) : linkItem(kind === 'po' ? 'po' : 'doc', r);
+        const txo = S.txns.filter(t => t.cls !== 'transfer' && !P.pays.some(p => p.t.id === t.id)).map(t => ({ id: t.id, score: matchScore(t, tgt).score, text: `${fmtDate(t.date)} · ${t.description} · ${money(t.amount)}` }));
+        inner += sel('paid', rank(txo));
+      }
+      return `<div class="lkCol ${ok ? 'ok' : 'miss'}"><div class="lkHead">${ok ? '✓' : '○'} ${label[step]}</div>${inner}</div>`;
+    };
+    host.innerHTML = r.needsReview ? '' : `<div class="lkTitle">Linkage <span class="small muted">— ★ = likely match. Changes save immediately.</span></div><div class="lkRow">${cols.map(col).join('<div class="lkArrow">›</div>')}</div>`;
+  };
+  const after = async msg => { if (msg) toast(msg); derive(); draw(); hooks.changed?.(recOf(kind, id)); render(); };
+  host.addEventListener('click', async e => {
+    const r = recOf(kind, id); const c = chainOf(kind, r);
+    const o = e.target.closest('[data-open]'); if (o) { const [k, x] = o.dataset.open.split(':'); return hooks.open ? hooks.open(k, x) : openRecord(k, x); }
+    const u = e.target.closest('[data-unlink]');
+    if (u) { const [step, x] = u.dataset.unlink.split(':');
+      if (step === 'quote') { const p = c.pos[0]; p.quoteId = ''; p.quoteRef = ''; await persist('pos', p); return after('Quote unlinked'); }
+      if (step === 'po') { if (r.type === 'invoice') { r.poId = ''; await persist('docs', r); } else { const p = recOf('po', x); p.quoteId = ''; p.quoteRef = ''; await persist('pos', p); } return after('PO unlinked'); }
+      if (step === 'invoice') { const i = recOf('doc', x); i.poId = ''; await persist('docs', i); return after('Invoice unlinked'); } }
+    const up = e.target.closest('[data-unpay]');
+    if (up) { const p = chainPayments(kind, r).pays.find(q => q.t.id === up.dataset.unpay); let note = ''; for (const h of p.on) note = (await setLink(linkItem(h.kind, h.rec), p.t.id, false)) || note; return after('Payment unlinked' + note); }
+    const mv = e.target.closest('[data-move]');
+    if (mv) { const p = chainPayments(kind, r).pays.find(q => q.t.id === mv.dataset.move); for (const h of p.on) await setLink(linkItem(h.kind, h.rec), p.t.id, false); const note = await setLink(linkItem('doc', c.invs[0]), p.t.id, true); return after('Moved to invoice' + (note || '')); }
+  });
+  host.addEventListener('change', async e => {
+    const s = e.target.closest('.lkAdd'); if (!s || !s.value) return; const v = s.value; s.disabled = true;
+    const r = recOf(kind, id); const c = chainOf(kind, r); const step = s.dataset.add;
+    try {
+      if (step === 'quote') { const p = c.pos[0], q = recOf('doc', v); p.quoteId = q.id; p.quoteRef = q.number || ''; await persist('pos', p); if (q.status === 'open') { q.status = 'accepted'; await persist('docs', q); } return after('Quote linked'); }
+      if (step === 'po') {
+        if (v === '__new') return hooks.newPO ? hooks.newPO(r) : editPO(null, r);
+        const p = recOf('po', v);
+        if (r.type === 'quote') { p.quoteId = r.id; p.quoteRef = r.number || ''; await persist('pos', p); if (r.status === 'open') { r.status = 'accepted'; await persist('docs', r); } }
+        else { r.poId = p.id; await persist('docs', r); }
+        return after('PO linked');
+      }
+      if (step === 'invoice') { const i = recOf('doc', v); i.poId = c.pos[0].id; await persist('docs', i); return after('Invoice linked'); }
+      if (step === 'paid') { const tgt = c.invs[0] ? linkItem('doc', c.invs[0]) : c.pos[0] ? linkItem('po', c.pos[0]) : linkItem(kind === 'po' ? 'po' : 'doc', r); const note = await setLink(tgt, v, true); return after('Payment linked to ' + tgt.typeLabel.toLowerCase() + ' ' + (tgt.number || '') + (note || '')); }
+    } catch (err) { DBG.err('linkage change failed', err); toast('Could not link: ' + (err.code || err.message), 5000); s.disabled = false; }
+  });
+  draw();
+  return draw;
 }
 
 /* ======================= FILE BROWSER ======================= */
 async function openFile(d) { const u = await store.fileUrl(d.file); if (u) window.open(u, '_blank'); else toast('File not found'); }
-function openDocViewer(id) { const list = filteredViewer(); const i = list.findIndex(d => d.id === id); UI.viewIdx = Math.max(0, i); if (i < 0) { UI.docF = { type: '', status: '', q: '', tag: '' }; UI.viewIdx = Math.max(0, filteredViewer().findIndex(d => d.id === id)); } go('files'); }
+function openDocViewer(id) { const k = S.pos.some(p => p.id === id) ? 'po' : 'doc'; return openRecord(k, id);
+}
+function openDocViewerOld(id) { const list = filteredViewer(); const i = list.findIndex(d => d.id === id); UI.viewIdx = Math.max(0, i); if (i < 0) { UI.docF = { type: '', status: '', q: '', tag: '' }; UI.viewIdx = Math.max(0, filteredViewer().findIndex(d => d.id === id)); } go('files'); }
 const VIEW_TYPES = { ...DOC_TYPES, po: 'Purchase order' };
 function filteredViewer() {
   const f = UI.docF, q = f.q.toLowerCase();
@@ -1514,13 +1688,13 @@ function editPO(p, quote, file = null, rest = [], prefill = null) {
   } else p = structuredClone(p);
   const vendors = [...new Set([...S.docs.map(x => x.vendor), ...S.pos.map(x => x.vendor)].filter(Boolean))];
   const quotes = S.docs.filter(d => d.type === 'quote');
-  const body = modal(reviewing ? reviewTitle(p) : (file ? 'Existing PO — ' + file.name : isNew ? 'New purchase order' : 'Edit ' + p.number) + (rest.length ? ` (${rest.length} more queued)` : ''), `
+  const body = modal(reviewing ? reviewTitle(p) : (file ? 'Existing PO — ' + file.name : isNew ? 'New purchase order' : 'Purchase order ' + p.number) + (rest.length ? ` (${rest.length} more queued)` : ''), `
+    ${isNew ? '' : '<div class="linkage" id="lkPanel"></div>'}
     ${(file && isNew) || reviewing ? `<div class="toolbar" style="margin-bottom:8px"><label class="small" style="display:flex;gap:8px;align-items:center;color:var(--text-secondary)">Document type <select id="pType"><option value="po" selected>Purchase order</option><option value="quote">Quote</option><option value="invoice">Invoice</option><option value="receipt">Receipt</option><option value="other">Other</option></select></label><span class="small muted">Fill in the details from this PO. Line items are optional — if you skip them, enter the PO total.</span></div>` : ''}
     <div class="form">
       <label>PO number<input id="pN" value="${esc(p.number)}"></label>
       <label>Date<input type="date" id="pD" value="${p.date}"></label>
       <label>Status<select id="pS">${PO_STATUS.map(s => `<option ${p.status === s ? 'selected' : ''}>${s}</option>`).join('')}</select></label>
-      <label>Based on quote<select id="pQ"><option value="">—</option>${quotes.map(q => `<option value="${q.id}" ${p.quoteId === q.id ? 'selected' : ''}>${esc(q.vendor)} · ${esc(q.number || '')}</option>`).join('')}</select></label>
       <label>Vendor<input id="pV" value="${esc(p.vendor)}" list="poVendList"></label>
       <label>Vendor contact / email<input id="pVC" value="${esc(p.vendorContact || '')}"></label>
       <label>Payment terms<input id="pT" value="${esc(p.terms || '')}"></label>
@@ -1534,7 +1708,7 @@ function editPO(p, quote, file = null, rest = [], prefill = null) {
       <label>PO total (used when there are no line items)<input type="number" step="0.01" id="pOver" value="${p.totalOverride || ''}"></label>
       <label><span>Total</span><div id="pTot" style="font-size:18px;font-weight:650;padding-top:4px"></div></label>
       <label class="full">Notes / special instructions<textarea id="pNotes">${esc(p.notes || '')}</textarea></label>
-      <label class="full">PO document ${p.file ? `<div class="small">${esc(p.fileName)} <button class="b sm" id="pView" type="button">View</button> <button class="b sm danger" id="pRmFile" type="button">Remove file</button> <span class="muted">— or choose a file below to replace it</span></div>` : ''}${file ? `<div class="small">${esc(file.name)} · ${(file.size / 1024).toFixed(0)} KB</div>` : `<input type="file" id="pFile" accept=".pdf,image/*,.doc,.docx,.xls,.xlsx"><div class="small" id="pDupWarn" style="color:var(--warn)"></div>`}</label>
+      <label class="full">PO document ${p.file ? `<div class="small">${esc(p.fileName)} <button class="b sm" id="pView" type="button">Open ↗</button> <button class="b sm danger" id="pRmFile" type="button">Remove file</button> <span class="muted">— or choose a file below to replace it</span></div>` : ''}${file ? `<div class="small">${esc(file.name)} · ${(file.size / 1024).toFixed(0)} KB</div>` : `<input type="file" id="pFile" accept=".pdf,image/*,.doc,.docx,.xls,.xlsx"><div class="small" id="pDupWarn" style="color:var(--warn)"></div>`}</label>
     </div>
     <datalist id="poVendList">${vendors.map(v => `<option value="${esc(v)}">`).join('')}</datalist>
     <div class="mfoot">${!isNew ? '<button class="b danger" id="pDelBtn">Delete</button>' : ''}<span style="flex:1"></span>${rest.length ? '<button class="b" id="pSkip">Skip file</button>' : ''}<button class="b" data-close>Cancel</button>${file || p.imported ? `<button class="b pri" id="pSave">${rest.length ? 'Save &amp; next' : 'Save'}</button>` : '<button class="b" id="pSave">Save</button><button class="b pri" id="pSavePdf">Save &amp; download PDF</button>'}</div>`, { wide: true });
@@ -1548,11 +1722,15 @@ function editPO(p, quote, file = null, rest = [], prefill = null) {
   });
   const tot = () => { const t = poTotals({ items: readItems(body), taxRate: $('#pTax', body).value, shipping: $('#pShip', body).value, totalOverride: $('#pOver', body).value }); $('#pTot', body).textContent = money(t.total); };
   bindItems(body, tot); body.addEventListener('input', tot); tot();
-  const collect = () => Object.assign(p, { number: $('#pN', body).value.trim(), date: $('#pD', body).value, status: $('#pS', body).value, quoteId: $('#pQ', body).value, quoteRef: S.docs.find(d => d.id === $('#pQ', body).value)?.number || '', vendor: $('#pV', body).value.trim(), vendorContact: $('#pVC', body).value.trim(), terms: $('#pT', body).value.trim(), deliveryDate: $('#pDel', body).value, vendorAddress: $('#pVA', body).value.trim(), shipTo: $('#pST', body).value.trim(), items: readItems(body), taxRate: +$('#pTax', body).value || 0, shipping: +$('#pShip', body).value || 0, tags: parseTags($('#pTags', body).value), notes: $('#pNotes', body).value.trim(), totalOverride: +$('#pOver', body).value || 0, updatedAt: new Date().toISOString() });
-  const save = async pdf => {
+  let dirty = false; body.addEventListener('input', e => { if (!e.target.closest('.linkage')) dirty = true; }); body.addEventListener('change', e => { if (!e.target.closest('.linkage')) dirty = true; });
+  let navGo = null;
+  if (!isNew) linkagePanel($('#lkPanel', body), 'po', p.id, { open: (k, x) => navGo ? navGo({ kind: k, rec: recOf(k, x) }) : openRecord(k, x) });
+  const collect = () => Object.assign(p, { number: $('#pN', body).value.trim(), date: $('#pD', body).value, status: $('#pS', body).value, vendor: $('#pV', body).value.trim(), vendorContact: $('#pVC', body).value.trim(), terms: $('#pT', body).value.trim(), deliveryDate: $('#pDel', body).value, vendorAddress: $('#pVA', body).value.trim(), shipTo: $('#pST', body).value.trim(), items: readItems(body), taxRate: +$('#pTax', body).value || 0, shipping: +$('#pShip', body).value || 0, tags: parseTags($('#pTags', body).value), notes: $('#pNotes', body).value.trim(), totalOverride: +$('#pOver', body).value || 0, updatedAt: new Date().toISOString() });
+  const save = async (pdf, after) => {
     collect();
-    if (!p.number) { toast('Enter the PO number'); return; }
-    if (S.pos.some(x => x.number === p.number && x.id !== p.id)) { toast('That PO number is already used'); return; }
+    const live = S.pos.find(x => x.id === p.id); if (live) { p.linkedTxnIds = live.linkedTxnIds || []; p.quoteId = live.quoteId || ''; p.quoteRef = live.quoteRef || ''; }
+    if (!p.number) { toast('Enter the PO number'); return false; }
+    if (S.pos.some(x => x.number === p.number && x.id !== p.id)) { toast('That PO number is already used'); return false; }
     const btn = $('#pSave', body); btn.disabled = true; btn.textContent = 'Saving…';
     if (!p.date) p.date = today(); delete p.needsReview;
     try {
@@ -1564,14 +1742,16 @@ function editPO(p, quote, file = null, rest = [], prefill = null) {
         p.file = { path: up.path, url: up.url, contentType: f.type || '', size: f.size, ...(h ? { sha256: h } : {}) }; p.fileName = f.name;
       }
       await persist('pos', p);
-    } catch (e) { if (reviewing) p.needsReview = true; btn.disabled = false; btn.textContent = 'Save'; DBG.err('PO save failed', e); toast('Save failed: ' + (e.code || e.message), 6000); return; }
+    } catch (e) { if (reviewing) p.needsReview = true; btn.disabled = false; btn.textContent = 'Save'; DBG.err('PO save failed', e); toast('Save failed: ' + (e.code || e.message), 6000); return false; }
     const q = S.docs.find(d => d.id === p.quoteId); if (q && q.status === 'open' && p.status !== 'draft' && p.status !== 'cancelled') { q.status = 'accepted'; await persist('docs', q); }
-    toast('Saved ' + p.number);
+    toast('Saved ' + p.number); dirty = false;
     if (reviewing) return reviewNext();
+    if (after) { render(); return after(); }
     if (rest.length) { render(); queuePOFiles(rest); return; }
     closeModal(); render(); if (pdf) poPDF(p);
   };
   $('#pSave', body).onclick = () => save(false); $('#pSavePdf', body)?.addEventListener('click', () => save(true));
+  if (!isNew && !reviewing) navGo = attachNav(body, 'po', p.id, () => dirty, after => save(false, after));
   $('#pSkip', body)?.addEventListener('click', () => queuePOFiles(rest));
   $('#pView', body)?.addEventListener('click', () => openFile(p));
   $('#pRmFile', body)?.addEventListener('click', async () => {
@@ -1930,6 +2110,9 @@ async function boot() {
       try { await store.delMany('txns', ph.map(x => x.id)); if (origins.length) await persistMany('txns', origins); await autoPairTransfers(); DBG.info(`removed ${ph.length} auto-created transfer entries`); toast(`Removed ${ph.length} auto-created transfer entr${ph.length > 1 ? 'ies' : 'y'} — transfers now pair only with real transactions`, 6000); }
       catch (e) { DBG.err('transfer placeholder cleanup failed', e); }
     }
+    { const ids = new Set(S.txns.map(t => t.id)); const fixD = [], fixP = [];
+      if (S.txns.length) for (const [arr, out] of [[S.docs, fixD], [S.pos, fixP]]) arr.forEach(x => { const L = x.linkedTxnIds || []; const keep = [...new Set(L.filter(id => ids.has(id)))]; if (keep.length !== L.length) { x.linkedTxnIds = keep; out.push(x); } });
+      if (fixD.length || fixP.length) { try { if (fixD.length) await persistMany('docs', fixD); if (fixP.length) await persistMany('pos', fixP); DBG.info(`removed links to deleted transactions from ${fixD.length + fixP.length} document(s)`); } catch (e) { DBG.err('link cleanup failed', e); } } }
     const legacy = S.txns.filter(t => LEGACY_CAPITAL.has(t.cls));
     if (legacy.length) { legacy.forEach(t => t.cls = 'capital'); DBG.info(`migrating ${legacy.length} capital infusion/withdrawal → capital`); persistMany('txns', legacy).catch(e => DBG.err('capital migration failed', e)); }
     setConn(store.kind === 'firebase' ? 'ok' : 'warn', store.kind === 'firebase' ? `Firebase · ${store.projectId}${store.auth.currentUser ? ' · ' + (store.auth.currentUser.email || 'anon') : ''}` : 'Local mode');
