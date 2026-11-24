@@ -161,6 +161,10 @@ tr.pending td:first-child{box-shadow:inset 3px 0 0 var(--warn)}
 .ch.miss{border:1px dashed var(--warn);color:var(--warn);font-weight:600;background:color-mix(in srgb,var(--warn) 8%,transparent)}
 .ch.miss:hover{background:color-mix(in srgb,var(--warn) 18%,transparent)}
 .ch.na{opacity:.5;cursor:default}
+.kpi.kgo{cursor:pointer;transition:border-color .15s,box-shadow .15s}
+.kpi.kgo:hover{border-color:var(--accent);box-shadow:0 1px 6px color-mix(in srgb,var(--accent) 18%,transparent)}
+.kpi .kar{color:var(--text-muted);font-weight:600}
+.kpi.kgo:hover .kar{color:var(--accent)}
 .chsep{color:var(--text-muted);font-size:11px}
 /* editor navigation + linkage panel */
 .mnav{display:flex;align-items:center;gap:8px;margin-right:12px}
@@ -215,8 +219,6 @@ tr.rowlink{cursor:pointer}
     <button data-tab="overview" class="active">Overview</button>
     <button data-tab="txns">Transactions</button>
     <button data-tab="docs">Documents<span id="pendBadge"></span></button>
-    <button data-tab="timeline">Timeline</button>
-    <button data-tab="accounts">Accounts &amp; import</button>
     <button data-tab="settings">Settings</button>
   </nav>
 </header>
@@ -448,14 +450,13 @@ function balanceAt(series, d) { let b = series.opening; for (const p of series.p
 function monthly(from) {
   const m = {};
   for (const t of S.txns) {
-    if (t.date < from || t.cls === 'transfer' || t.cls === 'bank') continue;
-    const k = monthKey(t.date); const r = (m[k] ??= { inflow: 0, outflow: 0, capital: 0 });
-    if (t.cls === 'capital') r.capital += t.amount;
-    else if (t.amount >= 0) r.inflow += t.amount; else r.outflow += -t.amount;
+    if (t.date < from || t.cls === 'transfer') continue;
+    const k = monthKey(t.date); const r = (m[k] ??= { operating: 0, capital: 0, bank: 0 });
+    if (t.cls === 'capital') r.capital += t.amount; else if (t.cls === 'bank') r.bank += t.amount; else r.operating += t.amount;
   }
   const keys = []; let k = monthKey(from); const end = monthKey(today());
   while (k <= end) { keys.push(k); k = monthKey(addMonths(k + '-01', 1)); }
-  return keys.map(k => ({ k, ...(m[k] || { inflow: 0, outflow: 0, capital: 0 }) }));
+  return keys.map(k => ({ k, ...(m[k] || { operating: 0, capital: 0, bank: 0 }) }));
 }
 const monthKey = d => d.slice(0, 7);
 function burn() {
@@ -561,11 +562,11 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape' && !$('#modal
 /* ---------------- tabs ---------------- */
 $('#tabs').addEventListener('click', e => { const b = e.target.closest('button[data-tab]'); if (b) go(b.dataset.tab); });
 window.addEventListener('hashchange', () => { const t = location.hash.slice(1); if (t && t !== UI.tab) go(t); });
-function go(tab) { if (tab === 'pos') { UI.docF.type = 'po'; tab = 'docs'; } if (tab === 'files') tab = 'docs'; UI.tab = tab; if (location.hash.slice(1) !== tab) location.hash = tab; $$('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab)); render(); }
+function go(tab) { if (tab === 'pos') { UI.docF.type = 'po'; tab = 'docs'; } if (tab === 'files') tab = 'docs'; if (tab === 'accounts') tab = 'txns'; if (tab === 'timeline') tab = 'overview'; UI.tab = tab; if (location.hash.slice(1) !== tab) location.hash = tab; $$('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab)); render(); }
 function render() {
   Object.values(charts).forEach(c => c.destroy()); for (const k in charts) delete charts[k];
   derive();
-  const v = { overview: vOverview, txns: vTxns, docs: vDocs, files: vFiles, timeline: vTimeline, accounts: vAccounts, settings: vSettings }[UI.tab] || vOverview;
+  const v = { overview: vOverview, txns: vTxns, docs: vDocs, files: vFiles, settings: vSettings }[UI.tab] || vOverview;
   v($('#main'));
 }
 function banner() {
@@ -605,35 +606,44 @@ function vOverview(root) {
   const openPO = S.pos.filter(p => ['issued','partially received'].includes(p.status));
   const rTx = S.txns.filter(t => t.date >= from && !t.cls);
   const rIn = rTx.filter(t => t.amount > 0).reduce((s, t) => s + t.amount, 0), rOut = rTx.filter(t => t.amount < 0).reduce((s, t) => s - t.amount, 0);
-  const kpi = (l, v, n) => `<div class="kpi"><div class="l">${l}</div><div class="v">${v}</div><div class="n">${n || '&nbsp;'}</div></div>`;
+  const kpi = (l, v, n, goKey) => `<div class="kpi${goKey ? ' kgo' : ''}" ${goKey ? `data-go="${goKey}" title="Click to see these"` : ''}><div class="l">${l}${goKey ? ' <span class="kar">›</span>' : ''}</div><div class="v">${v}</div><div class="n">${n || '&nbsp;'}</div></div>`;
   root.innerHTML = `${banner()}
-  ${S.txns.length === 0 ? `<div class="banner">No transactions yet. Go to <a href="#accounts">Accounts &amp; import</a> to load a Bank of America CSV or QFX export.</div>` : ''}
+  ${S.txns.length === 0 ? `<div class="banner">No transactions yet. Use <b>🏦 Bank transaction import</b> at the top of <a href="#txns">Transactions</a> to load a Bank of America .qbo, .qfx or .csv export.</div>` : ''}
   <div class="toolbar"><b style="font-size:16px">Overview</b><span class="grow"></span>${rangeSeg()}</div>
   <div class="kpis">
-    ${kpi('Cash on hand', money(cash), `${S.accounts.filter(isCash).length} deposit account(s)`)}
+    ${kpi('Cash on hand', money(cash), `${S.accounts.filter(isCash).length} deposit account(s)`, 'cash')}
     ${kpi('Credit card balance', money(credit), credit < 0 ? 'owed' : '')}
     ${kpi('Monthly burn', money(b.burn), `avg operating net, last ${b.months.length} full months`)}
     ${kpi('Runway', runway == null ? '—' : runway > 120 ? '120+ mo' : runway.toFixed(1) + ' mo', runway == null ? 'not burning cash' : 'cash ÷ burn')}
-    ${kpi('Capital infused', money(inf), `withdrawn ${money(-wd)} · net ${money(inf + wd)}`)}
+    ${kpi('Net capital infused', money(inf + wd), `in ${money(inf)} · out ${money(-wd)}`, 'capital')}
     ${kpi('Operating in / out', `${moneyK(rIn)} / ${moneyK(rOut)}`, `selected range (${UI.range.toUpperCase()})`)}
-    ${kpi('Open quotes', money(openQ.reduce((s, d) => s + (+d.amount || 0), 0)), `${openQ.length} open`)}
-    ${kpi('Unpaid invoices', money(unpaid.reduce((s, d) => s + (+d.amount || 0), 0)), overdue.length ? `<span class="status crit">⚠ ${overdue.length} overdue</span>` : `${unpaid.length} unpaid`)}
-    ${kpi('Open POs', money(openPO.reduce((s, p) => s + poTotals(p).total, 0)), `${openPO.length} issued / partial`)}
+    ${kpi('Open quotes', money(openQ.reduce((s, d) => s + (+d.amount || 0), 0)), `${openQ.length} open`, 'quotes')}
+    ${kpi('Unpaid invoices', money(unpaid.reduce((s, d) => s + (+d.amount || 0), 0)), overdue.length ? `<span class="status crit">⚠ ${overdue.length} overdue</span>` : `${unpaid.length} unpaid`, 'invoices')}
+    ${kpi('Open POs', money(openPO.reduce((s, p) => s + poTotals(p).total, 0)), `${openPO.length} issued / partial`, 'pos')}
   </div>
   <div class="card"><h3>Cash trajectory</h3><div class="sub">Total balance across deposit accounts, with capital events marked and a ${b.burn > 0 ? '6-month projection at the current burn rate' : 'flat projection (no burn)'}.</div>
     ${legendHTML([[cssVar('--series-1'), 'Cash balance'], [cssVar('--series-1'), 'Projection', true], [cssVar('--series-3'), 'Capital + (in)'], [cssVar('--series-2'), 'Capital − (out)']])}
     <div class="chartbox tall"><canvas id="cCash"></canvas></div></div>
   <div class="grid g2">
-    <div class="card"><h3>Monthly cash flow</h3><div class="sub">Operating inflow and outflow, plus net capital movement. Internal transfers and 🏦 bank activity excluded.</div>
-      ${legendHTML([[cssVar('--series-1'), 'Operating inflow'], [cssVar('--series-2'), 'Operating outflow'], [cssVar('--series-3'), 'Net capital']])}
+    <div class="card"><h3>Monthly cash flow</h3><div class="sub">Net amount per month by type — above zero is money in, below zero is money out. Internal transfers excluded.</div>
+      ${legendHTML([[cssVar('--series-1'), '⚙️ Net operating'], [cssVar('--series-3'), '💵 Net capital'], [cssVar('--series-4'), '🏦 Net bank activity']])}
       <div class="chartbox"><canvas id="cMonthly"></canvas></div></div>
     <div class="card"><h3>Spending by category</h3><div class="sub">Operating outflow in range, by category (or first tag). Top 8.</div><div class="chartbox"><canvas id="cCat"></canvas></div></div>
   </div>
-  <div class="grid g2">
-    <div class="card"><h3>Capital events</h3><div class="sub">Transactions typed as Capital: + money put in, − money taken out.</div>${capTable()}</div>
+  <div class="grid">
     <div class="card"><h3>Needs attention</h3><div class="sub">Overdue invoices, invoices without a payment link, untagged large transactions.</div>${attention()}</div>
   </div>`;
   bindRange(root);
+  $$('.kpi[data-go]', root).forEach(k => k.onclick = () => {
+    const clearTx = { acct: '', cls: 'all', q: '', tag: '', from: '', to: '', link: '' }, clearDoc = { type: '', status: '', q: '', tag: '', chain: '' };
+    const g = k.dataset.go;
+    if (g === 'cash') { UI.tx = { ...clearTx }; return go('txns'); }
+    if (g === 'capital') { UI.tx = { ...clearTx, cls: 'capital' }; return go('txns'); }
+    if (g === 'quotes') UI.docF = { ...clearDoc, type: 'quote', status: 'open' };
+    if (g === 'invoices') UI.docF = { ...clearDoc, type: 'invoice', status: 'unpaid' };
+    if (g === 'pos') UI.docF = { ...clearDoc, type: 'po', status: 'open POs' };
+    go('docs');
+  });
   drawCash(from, b); drawMonthly(from); drawCats(from);
 }
 function capTable() {
@@ -677,8 +687,9 @@ function drawCash(from, b) {
 function drawMonthly(from) {
   const m = monthly(from); const o = baseOpts(); o.interaction = { mode: 'index', intersect: false };
   o.plugins.tooltip.callbacks = { label: it => `${it.dataset.label}: ${money(it.parsed.y)}` };
-  const ds = (l, k, c) => ({ label: l, data: m.map(r => r[k]), backgroundColor: c, borderRadius: { topLeft: 4, topRight: 4 }, borderSkipped: 'start', maxBarThickness: 22, categoryPercentage: .75, barPercentage: .9 });
-  charts.monthly = new Chart($('#cMonthly'), { type: 'bar', options: o, data: { labels: m.map(r => fmtMonth(r.k)), datasets: [ds('Operating inflow', 'inflow', cssVar('--series-1')), ds('Operating outflow', 'outflow', cssVar('--series-2')), ds('Net capital', 'capital', cssVar('--series-3'))] } });
+  o.scales.y.grid = { color: c => c.tick.value === 0 ? cssVar('--text-muted') : cssVar('--grid') };   // emphasised zero line
+  const ds = (l, k, c) => ({ label: l, data: m.map(r => +r[k].toFixed(2)), backgroundColor: c, borderRadius: 4, borderSkipped: false, maxBarThickness: 22, categoryPercentage: .75, barPercentage: .9 });
+  charts.monthly = new Chart($('#cMonthly'), { type: 'bar', options: o, data: { labels: m.map(r => fmtMonth(r.k)), datasets: [ds('Net operating', 'operating', cssVar('--series-1')), ds('Net capital', 'capital', cssVar('--series-3')), ds('Net bank activity', 'bank', cssVar('--series-4'))] } });
 }
 function drawCats(from) {
   const agg = {};
@@ -990,6 +1001,7 @@ function vTxns(root) {
   const shown = rows.slice(0, 600);
   const total = rows.reduce((s, t) => s + t.amount, 0);
   root.innerHTML = `${banner()}
+  ${importCardHTML()}
   <div class="card">
     <div class="toolbar">
       <select id="fAcct"><option value="">All accounts</option>${S.accounts.map(a => `<option value="${a.id}" ${f.acct === a.id ? 'selected' : ''}>${esc(a.name)}</option>`).join('')}</select>
@@ -1011,7 +1023,7 @@ function vTxns(root) {
     </div>
     ${(() => { const st = S.txns.filter(isStale); return st.length ? `<div class="banner warn" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span>⚑ <b>${st.length} entr${st.length > 1 ? 'ies are' : 'y is'} not in the bank statement</b> covering ${st.length > 1 ? 'their' : 'its'} dates.</span><span style="flex:1"></span>${f.link === 'stale' ? `<button class="b danger" id="stDelAll">Delete all ${st.length}</button>` : '<button class="b" id="stShow">Show them</button>'}</div>` : ''; })()}
     <div class="small muted" style="margin-bottom:6px">${rows.length} transactions · net ${money(total)}${rows.length > shown.length ? ` · showing first ${shown.length} in this order` : ''}</div>
-    <div class="tw"><table><thead><tr><th><input type="checkbox" id="selAll"></th>${[['date', 'Date'], ['acct', 'Account'], ['desc', 'Description'], ['amount', 'Amount', 'r'], ['bal', 'Balance', 'r', "Running balance of this transaction's account, after the transaction"], ['type', 'Type'], ['tags', 'Tags / category'], ['docs', 'Quotes · invoices · POs']].map(([k, l, c, tt]) => `<th class="sortable ${c || ''}" data-tsort="${k}" ${tt ? `title="${tt}"` : ''}>${l}${UI.txSort.key === k ? `<span class="arr">${UI.txSort.dir === 'asc' ? '▲' : '▼'}</span>` : ''}</th>`).join('')}<th></th></tr></thead><tbody>
+    <div class="tw"><table id="txTable"><thead><tr><th><input type="checkbox" id="selAll"></th>${[['date', 'Date'], ['acct', 'Account'], ['desc', 'Description'], ['amount', 'Amount', 'r'], ['bal', 'Balance', 'r', "Running balance of this transaction's account, after the transaction"], ['type', 'Type'], ['tags', 'Tags / category'], ['docs', 'Quotes · invoices · POs']].map(([k, l, c, tt]) => `<th class="sortable ${c || ''}" data-tsort="${k}" ${tt ? `title="${tt}"` : ''}>${l}${UI.txSort.key === k ? `<span class="arr">${UI.txSort.dir === 'asc' ? '▲' : '▼'}</span>` : ''}</th>`).join('')}<th></th></tr></thead><tbody>
     ${(() => { const cands = linkCandidates(); return shown.map(t => { const ds = docsByTxn[t.id] || []; const sg = ds.length ? [] : suggestionsFor(t, cands); return `<tr data-id="${t.id}">
       <td><input type="checkbox" class="sel" ${UI.sel.has(t.id) ? 'checked' : ''}></td>
       <td style="white-space:nowrap">${fmtDate(t.date)}</td>
@@ -1041,12 +1053,13 @@ function vTxns(root) {
   let qh; $('#fQ').oninput = e => { clearTimeout(qh); qh = setTimeout(() => { f.q = e.target.value; rf(); setTimeout(() => { const i = $('#fQ'); i.focus(); i.setSelectionRange(i.value.length, i.value.length); }); }, 300); };
   $('#addTx').onclick = () => editTxn(null);
   $('#selAll').onchange = e => { shown.forEach(t => e.target.checked ? UI.sel.add(t.id) : UI.sel.delete(t.id)); rf(); };
-  root.querySelector('tbody').addEventListener('change', async e => {
+  bindImportCard(root);
+  $('#txTable tbody', root).addEventListener('change', async e => {
     const tr = e.target.closest('tr'); const t = S.txns.find(x => x.id === tr?.dataset.id); if (!t) return;
     if (e.target.classList.contains('sel')) { e.target.checked ? UI.sel.add(t.id) : UI.sel.delete(t.id); $('#bulk').style.display = UI.sel.size ? '' : 'none'; $('#bulk b').textContent = UI.sel.size + ' selected'; }
     if (e.target.classList.contains('clsSel')) await changeType(t, e.target.value);
   });
-  root.querySelector('tbody').addEventListener('click', e => {
+  $('#txTable tbody', root).addEventListener('click', e => {
     const tr = e.target.closest('tr'); if (e.target.classList.contains('editTx')) editTxn(S.txns.find(x => x.id === tr.dataset.id));
     if (e.target.closest('.linkTx')) linkPicker(S.txns.find(x => x.id === tr.dataset.id));
     if (e.target.closest('.xfer')) { e.preventDefault(); transferDialog(S.txns.find(x => x.id === tr.dataset.id)); }
@@ -1068,7 +1081,7 @@ function vTxns(root) {
 function editTxn(t) {
   const isNew = !t; t = t ? structuredClone(t) : { id: 'm_' + uid(), date: today(), description: '', amount: 0, accountId: S.accounts[0]?.id || '', cls: '', tags: [], manual: true };
   const nSug = isNew ? 0 : suggestionsFor(t).length;
-  if (!S.accounts.length) { toast('Create an account first (Accounts & import).'); return; }
+  if (!S.accounts.length) { toast('Add an account first (Settings → Accounts), or import a bank file at the top of Transactions.', 5000); return; }
   const body = modal(isNew ? 'New transaction' : 'Edit transaction', `
     <div class="form">
       <label>Date<input type="date" id="tDate" value="${t.date}" ${t.manual ? '' : 'disabled'}></label>
@@ -1293,7 +1306,7 @@ function linkStep(kind, r, step, onDone) {
 function filteredAll() {
   const f = UI.docF, q = f.q.toLowerCase();
   const docs = f.type === 'po' ? [] : filteredDocs().map(d => ({ kind: 'doc', rec: d, type: d.type, date: d.date || '', amount: +d.amount || 0 }));
-  const pos = f.type && f.type !== 'po' ? [] : S.pos.filter(p => (!f.status || (f.status === 'needs review' ? p.needsReview : p.status === f.status)) && (!f.tag || (p.tags || []).includes(f.tag)) && (!q || [p.vendor, p.number, p.notes, p.quoteRef, p.fileName, poTotals(p).total, (p.tags || []).join(' ')].join(' ').toLowerCase().includes(q)))
+  const pos = f.type && f.type !== 'po' ? [] : S.pos.filter(p => (!f.status || (f.status === 'needs review' ? p.needsReview : f.status === 'open POs' ? ['issued', 'partially received'].includes(p.status) && !p.needsReview : p.status === f.status)) && (!f.tag || (p.tags || []).includes(f.tag)) && (!q || [p.vendor, p.number, p.notes, p.quoteRef, p.fileName, poTotals(p).total, (p.tags || []).join(' ')].join(' ').toLowerCase().includes(q)))
     .map(p => ({ kind: 'po', rec: p, type: 'po', date: p.date || '', amount: poTotals(p).total }));
   const all = [...docs, ...pos].filter(x => !f.chain || (f.chain === 'gaps' ? chainOf(x.kind, x.rec).missing.length : !chainOf(x.kind, x.rec).missing.length && !x.rec.needsReview));
   const k = UI.docSort.key, dir = UI.docSort.dir === 'asc' ? 1 : -1;
@@ -1309,7 +1322,7 @@ function vDocs(root) {
     ['receipt', 'Receipts', cnt('receipt').length, `${cnt('receipt').filter(d => d.status !== 'reconciled').length} unreconciled`],
     ['po', 'POs', S.pos.length, `${S.pos.filter(p => ['issued', 'partially received'].includes(p.status)).length} open`]];
   const quotes = S.docs.filter(d => d.type === 'quote' && ['open', 'accepted'].includes(d.status));
-  const allStatus = ['needs review', ...new Set([...Object.values(DOC_STATUS).flat(), ...PO_STATUS])];
+  const allStatus = ['needs review', 'open POs', ...new Set([...Object.values(DOC_STATUS).flat(), ...PO_STATUS])];
   const pend = pendingList();
   root.innerHTML = `${banner()}
   <div class="card"><h3>Upload documents</h3><div class="sub">Drop any mix of quotes, invoices, receipts and purchase orders — PDF, images, Word/Excel. Files are saved right away and marked <b>needs review</b>; then each opens with a preview so you can confirm its type and fill in details. Stop whenever you like — the rest stay highlighted. Files go to ${store.kind === 'firebase' ? 'Firebase Storage' : 'this browser'}.</div>
@@ -2018,33 +2031,44 @@ function vTimeline(root) {
 }
 
 /* ======================= ACCOUNTS & IMPORT ======================= */
-function vAccounts(root) {
+/* Accounts card (lives in Settings) */
+function accountsCardHTML() {
+  return `<div class="card" id="acctCard"><div class="toolbar"><b style="font-size:15px">Accounts</b><span class="grow"></span><button class="b" id="addAcct">+ Add account</button></div>
+    <table id="acctTable"><thead><tr><th>Name</th><th>Type</th><th>Last 4</th><th class="r">Balance</th><th>Balance anchor</th><th class="r">Transactions</th><th>Latest</th><th></th></tr></thead><tbody>
+    ${S.accounts.map(a => `<tr data-id="${a.id}"><td><b>${esc(a.name)}</b></td><td>${esc(a.type)}</td><td>${esc(a.last4 || '')}</td><td class="r">${money(a._balance)}</td><td class="small muted">${a.anchorDate ? `${money(a.anchorBalance)} on ${fmtDate(a.anchorDate)}` : `opening ${money(a.anchorBalance || 0)}`}</td><td class="r">${a._count}</td><td>${a._last ? fmtDate(a._last) : '—'}</td><td><button class="b sm edit">Edit</button></td></tr>`).join('') || '<tr><td colspan="8" class="muted">No accounts yet. Add one here, or import a bank file on the Transactions tab — you can create the account during import.</td></tr>'}
+    </tbody></table></div>`;
+}
+function bindAccountsCard(root) {
+  $('#addAcct', root).onclick = () => editAcct(null);
+  $('#acctTable tbody', root).addEventListener('click', e => { if (e.target.classList.contains('edit')) editAcct(acctById(e.target.closest('tr').dataset.id)); });
+}
+/* Bank transaction import card (top of Transactions) */
+function importCardHTML() {
   const pi = UI.pendingImport;
-  root.innerHTML = `${banner()}
-  <div class="card"><div class="toolbar"><b style="font-size:15px">Accounts</b><span class="grow"></span><button class="b" id="addAcct">+ Add account</button></div>
-    <table><thead><tr><th>Name</th><th>Type</th><th>Last 4</th><th class="r">Balance</th><th>Balance anchor</th><th class="r">Transactions</th><th>Latest</th><th></th></tr></thead><tbody>
-    ${S.accounts.map(a => `<tr data-id="${a.id}"><td><b>${esc(a.name)}</b></td><td>${esc(a.type)}</td><td>${esc(a.last4 || '')}</td><td class="r">${money(a._balance)}</td><td class="small muted">${a.anchorDate ? `${money(a.anchorBalance)} on ${fmtDate(a.anchorDate)}` : `opening ${money(a.anchorBalance || 0)}`}</td><td class="r">${a._count}</td><td>${a._last ? fmtDate(a._last) : '—'}</td><td><button class="b sm edit">Edit</button></td></tr>`).join('') || '<tr><td colspan="8" class="muted">No accounts yet. Add one, or just import a file — you can create the account during import.</td></tr>'}
-    </tbody></table></div>
-  <div class="card"><h3>Sync from Bank of America</h3>
-    <div class="sub">Bank of America has no API a web page can call, so syncing works by importing the statement export. Re-importing an overlapping date range is safe: duplicates are skipped and your tags are kept.</div>
-    <ol class="small" style="margin:0 0 12px 18px;color:var(--text-secondary)">
-      <li>Sign in at bankofamerica.com → open the account → <b>Download</b> (above the transaction list).</li>
-      <li>Choose a date range and file type <b>QuickBooks Web Connect (.qbo)</b>, <b>Quicken Web Connect (.qfx)</b> or <b>Microsoft Excel (.csv)</b>. QBO/QFX include bank transaction IDs and the ledger balance — the most reliable option.</li>
-      <li>Drop the file below, choose the account, review, and import.</li>
-    </ol>
-    <div class="drop" id="impDrop">Drop a BofA .qbo / .qfx / .csv file here or <u>click to choose</u><input type="file" id="impFile" hidden accept=".csv,.qfx,.qbo,.ofx,.txt"></div>
-    <div id="impPrev" style="margin-top:12px">${pi ? importPreviewHTML(pi) : ''}</div>
-  </div>
-  <div class="card"><h3>Auto-classification on import</h3><div class="sub">Transactions that look like card payments or transfers between your own accounts (e.g. "PAYMENT - THANK YOU", "Online Banking transfer to …") are marked <i>Internal transfer</i> so they don't count as income or spending. You can change any of them on the Transactions tab.</div></div>`;
-  $('#addAcct').onclick = () => editAcct(null);
-  root.querySelector('tbody').addEventListener('click', e => { if (e.target.classList.contains('edit')) editAcct(acctById(e.target.closest('tr').dataset.id)); });
-  const drop = $('#impDrop'), inp = $('#impFile');
+  return `<div class="card" id="impCard" style="padding:12px 16px">
+    <div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap">
+      <b style="font-size:15px">🏦 Bank transaction import</b>
+      <div class="drop" id="impDrop" style="flex:1;min-width:260px;padding:10px">Drop a Bank of America <b>.qbo</b> / .qfx / .csv file here or <u>click to choose</u><input type="file" id="impFile" hidden accept=".csv,.qfx,.qbo,.ofx,.txt"></div>
+    </div>
+    <details class="small" style="margin-top:8px;color:var(--text-secondary)"><summary style="cursor:pointer">How to download from Bank of America, and what happens on import</summary>
+      <ol style="margin:6px 0 6px 18px">
+        <li>Sign in at bankofamerica.com → open the account → <b>Download</b> (above the transaction list).</li>
+        <li>Choose a date range and file type <b>QuickBooks Web Connect (.qbo)</b>, <b>Quicken Web Connect (.qfx)</b> or <b>Microsoft Excel (.csv)</b>. QBO/QFX include bank transaction IDs, the statement period and the ledger balance — the most reliable option.</li>
+        <li>Drop the file above, choose the account, review, and import.</li>
+      </ol>
+      <div>Re-importing an overlapping period is safe: duplicates are skipped and your tags and links are kept. Anything else in that account during the statement period is flagged. Card payments and transfers between your own accounts are marked <b>⇄ Internal transfer</b>, and interest and fees <b>🏦 Bank activity</b> — change any of them in the table below. Accounts are managed in <a href="#settings">Settings</a>.</div>
+    </details>
+    <div id="impPrev" style="${pi ? 'margin-top:12px' : ''}">${pi ? importPreviewHTML(pi) : ''}</div>
+  </div>`;
+}
+function bindImportCard(root) {
+  const drop = $('#impDrop', root), inp = $('#impFile', root);
   drop.onclick = e => { if (e.target !== inp) inp.click(); };
   drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); };
   drop.ondragleave = () => drop.classList.remove('over');
   drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); if (e.dataTransfer.files[0]) readImport(e.dataTransfer.files[0]); };
-  inp.onchange = () => inp.files[0] && readImport(inp.files[0]);
-  if (pi) bindImportPreview();
+  inp.onchange = () => { const f = inp.files[0]; inp.value = ''; f && readImport(f); };
+  if (UI.pendingImport) bindImportPreview();
 }
 function editAcct(a) {
   const isNew = !a; a = a ? structuredClone(a) : { id: 'a_' + uid(), name: '', type: 'checking', last4: '', anchorBalance: 0, anchorDate: '' };
@@ -2204,6 +2228,7 @@ function vSettings(root) {
   const st = S.settings; const cfg = LS.get('ledger.fbConfig', FIREBASE_CONFIG);
   const user = store?.auth?.currentUser;
   root.innerHTML = `
+  ${accountsCardHTML()}
   <div class="card"><h3>Firebase connection</h3><div class="sub">Paste the <code>firebaseConfig</code> object from your firebase.js (or Firebase console → Project settings → Your apps). Records go to Firestore under the path prefix below; files go to Firebase Storage under <code>accounting/docs/</code>.</div>
     <div class="form"><label class="full">firebaseConfig<textarea id="sCfg" style="min-height:120px;font-family:ui-monospace,monospace;font-size:12px" placeholder='{ apiKey: "...", authDomain: "...", projectId: "...", storageBucket: "...", appId: "..." }'>${cfg ? esc(JSON.stringify(cfg, null, 2)) : ''}</textarea></label>
     <label>Collection path prefix<input id="sPre" value="${esc(LS.get('ledger.prefix', defaultPrefix(cfg)))}"></label>
@@ -2223,6 +2248,7 @@ function vSettings(root) {
   </div><div class="mfoot" style="justify-content:flex-start"><button class="b pri" id="sSave">Save settings</button></div></div>
   <div class="card"><h3>Backup</h3><div class="sub">Export everything (records, not file contents — file links are included) as JSON, or merge a backup back in. Useful for moving between local mode and Firebase.</div>
     <div class="toolbar"><button class="b" id="sExp">Export JSON</button><button class="b" id="sExpCsv">Export transactions CSV</button><button class="b" id="sImp">Import JSON…</button><input type="file" id="sImpF" accept=".json" hidden></div></div>`;
+  bindAccountsCard(root);
   $('#sConnect').onclick = async () => {
     const raw = $('#sCfg').value.trim(); let c = null;
     if (raw) { try { c = JSON.parse(raw); } catch { try { c = Function('"use strict";return (' + raw.replace(/^[^{]*/, '').replace(/;?\s*$/, '') + ')')(); } catch { toast('Could not parse config'); return; } } }
