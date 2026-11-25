@@ -73,6 +73,8 @@ td.r,th.r{text-align:right}
 tr:hover td{background:color-mix(in srgb,var(--surface-2) 60%,transparent)}
 .tw{overflow:auto;max-height:68vh}
 .muted{color:var(--text-muted)}.small{font-size:12px}
+.vguess{color:var(--text-muted);font-style:italic;cursor:pointer;border-bottom:1px dotted var(--border)}
+.vguess:hover{color:var(--accent)}
 .chip{display:inline-block;font-size:11.5px;padding:1px 7px;border-radius:99px;background:var(--surface-2);border:1px solid var(--border);color:var(--text-secondary);margin:1px 2px 1px 0}
 .cls{font-size:11.5px;padding:2px 7px;border-radius:99px;border:1px solid var(--border);white-space:nowrap}
 .cls.capital{border-color:var(--series-3);color:var(--text-primary);background:color-mix(in srgb,var(--series-3) 14%,transparent)}
@@ -342,6 +344,59 @@ const DEFAULT_SETTINGS = { id:'main', company:'', address:'', email:'', phone:''
 const BANK_RE = /(interest earned|interest paid|interest payment|monthly fee|monthly maintenance|maintenance fee|service fee|service charge|account fee|analysis fee|wire (transfer )?fee|wire in fee|wire out fee|incoming wire fee|outgoing wire fee|overdraft|nsf fee|returned item fee|stop payment fee|atm fee|non-bofa atm|foreign transaction fee|intl transaction fee|international transaction fee|annual fee|late fee|finance charge|interest charge|paper statement fee|cashier'?s check fee|card replacement fee)/i;
 const autoClass = desc => TRANSFER_RE.test(desc) ? 'transfer' : BANK_RE.test(desc) ? 'bank' : '';
 const TRANSFER_RE = /(payment\s*-?\s*thank you|online banking transfer|transfer (to|from)|bank of america credit card bill payment|online payment|autopay)/i;
+/* ======================= VENDOR GUESSING (from the bank description) ======================= */
+const VENDOR_ALIAS = [[/^(amzn|amazon)\b|amazon\.com|amzn mktp|amazon mktpl/i, 'Amazon'], [/^aws\b|amazon web services/i, 'Amazon Web Services'], [/^google\b|^goog\b|google \*/i, 'Google'], [/^apple\.com|^apple\b/i, 'Apple'], [/^msft|microsoft/i, 'Microsoft'], [/^uber\b/i, 'Uber'], [/^lyft\b/i, 'Lyft'], [/fedex/i, 'FedEx'], [/^ups\b/i, 'UPS'], [/^usps\b/i, 'USPS'], [/thermo ?fisher/i, 'Thermo Fisher Scientific'], [/sigma[- ]?aldrich|millipore/i, 'MilliporeSigma'], [/vwr/i, 'VWR'], [/genscript/i, 'GenScript'], [/idt\b|integrated dna/i, 'IDT'], [/twist bio/i, 'Twist Bioscience'], [/^adp\b/i, 'ADP'], [/gusto/i, 'Gusto'], [/^intuit|quickbooks/i, 'Intuit'], [/zoom\.us|^zoom\b/i, 'Zoom'], [/slack/i, 'Slack'], [/dropbox/i, 'Dropbox'], [/github/i, 'GitHub'], [/openai|chatgpt/i, 'OpenAI'], [/anthropic|claude\.ai/i, 'Anthropic'], [/staples/i, 'Staples'], [/home ?depot/i, 'The Home Depot'], [/costco/i, 'Costco'], [/target\b/i, 'Target'], [/walmart|wal-mart/i, 'Walmart'], [/comcast|xfinity/i, 'Comcast'], [/verizon/i, 'Verizon'], [/at&t|\batt\b/i, 'AT&T'], [/eversource/i, 'Eversource'], [/national grid/i, 'National Grid']];
+const US_STATES = new Set('AL AK AZ AR CA CO CT DE FL GA HI ID IL IN IA KS KY LA ME MD MA MI MN MS MO MT NE NV NH NJ NM NY NC ND OH OK OR PA RI SC SD TN TX UT VT VA WA WV WI WY DC PR'.split(' '));
+const titleCase = s => s.toLowerCase().replace(/\b([a-z])/g, c => c.toUpperCase()).replace(/\b(Llc|Inc|Ltd|Usa|Us|Ii|Iii|Lp|Llp|Pc|Na|Ups|Ibm|Aws|Idt|Hr)\b/g, w => w.toUpperCase()).replace(/\bLLC\b/g, 'LLC');
+/* The raw guess, before learning from earlier choices. Returns '' when nothing sensible is found. */
+function rawVendor(desc) {
+  let s = String(desc || '').replace(/\s+/g, ' ').trim(); if (!s) return '';
+  let m;
+  if ((m = s.match(/\bBNF:\s*(.+?)(?=\s+(ID|BNF BK|PMT DET|SERVICE REF|TRN|OBI|ORIG):|$)/i))) s = m[1];          // wire out → beneficiary
+  else if ((m = s.match(/\bORIG:\s*(.+?)(?=\s+(ID|ORIG BK|PMT DET|SERVICE REF|TRN|BNF):|$)/i))) s = m[1];        // wire in → originator
+  else if ((m = s.match(/zelle (?:payment|transfer) (?:to|from)\s+(.+?)(?=\s+(conf#|for\b)|$)/i))) s = m[1];
+  else if ((m = s.match(/^(.+?)\s+DES:/i))) s = m[1];                                                            // ACH: "COMPANY DES:PAYMENT ID:…"
+  else if ((m = s.match(/^(?:bill ?pay(?:ment)?|online (?:bill )?payment)\s+(?:to\s+)?(.+?)(?=\s+(conf#|confirmation)|$)/i))) s = m[1];
+  else if ((m = s.match(/^(?:check ?card|purchase|pos purchase|debit card purchase|recurring)\s+\d{4}\s+(.+)$/i))) s = m[1];   // "CHECKCARD 0312 MERCHANT CITY ST 2443…"
+  else if (/^check\s*#?\s*\d+/i.test(s) || /^(deposit|counter credit|mobile deposit|atm)/i.test(s)) return '';
+  s = s.replace(/^(sq|tst|sp|py|pp|paypal|ppl|dd|ck|in|ec|fs|gg|bt|pyc)\s*\*\s*/i, '').replace(/^paypal\s+\*?/i, '');
+  for (const [re, name] of VENDOR_ALIAS) if (re.test(s)) return name;
+  if (/^[^*]{3,}\*/.test(s)) s = s.split('*')[0];                                                                   // "ADOBE *ACROPRO" → Adobe
+  s = s.split(/\s+(?:\d{6,}|x{2,}\S*|\d{3}[-.]?\d{3}[-.]?\d{4}|\S+\.(?:com|net|org|io)\/\S*)\b/i)[0];             // cut at long ref numbers, phones, urls
+  s = s.replace(/\*\S*/g, ' ').replace(/#\s*\d+/g, ' ').replace(/\b\d[\d-]*\b/g, ' ').replace(/[^A-Za-z0-9&.' -]/g, ' ').replace(/\s+/g, ' ').trim();
+  const w = s.split(' ');
+  if (w.length > 1 && US_STATES.has(w[w.length - 1].toUpperCase()) && w[w.length - 1].length === 2) { w.pop(); if (w.length > 2) w.pop(); }  // drop "… CITY ST"
+  s = w.join(' ').replace(/\.(com|net|org|io)$/i, '').replace(/\b(inc|llc|ltd|corp|co)\.?$/i, m => m).trim();
+  if (s.length < 2 || /^(online|transfer|payment|withdrawal|deposit)$/i.test(s)) return '';
+  return titleCase(s.slice(0, 40));
+}
+/* Known vendor names (documents + transactions you've set) — a description that mentions one maps to it. */
+function knownVendors() {
+  const v = new Map();
+  [...S.docs, ...S.pos].forEach(d => d.vendor && v.set(d.vendor.toLowerCase(), d.vendor));
+  S.txns.forEach(t => t.vendor && v.set(t.vendor.toLowerCase(), t.vendor));
+  return [...v.values()];
+}
+let _vg = null;   // cache: rebuilt whenever derive() runs
+function vendorGuesser() {
+  if (_vg) return _vg;
+  const learned = new Map();   // raw guess → vendor you chose for transactions with the same raw guess
+  S.txns.forEach(t => { if (!t.vendor) return; const r = rawVendor(t.description).toLowerCase(); if (r) { const m = learned.get(r) || {}; m[t.vendor] = (m[t.vendor] || 0) + 1; learned.set(r, m); } });
+  const known = knownVendors().map(n => ({ n, tk: tokens(n) })).filter(x => x.tk.length).sort((a, b) => b.tk.length - a.tk.length);
+  _vg = t => {
+    if (t.cls === 'transfer') return '';
+    if (t.cls === 'bank') return acctById(t.accountId)?.bank || 'Bank of America';
+    const ld = (docsByTxn[t.id] || []).find(d => d.vendor); if (ld) return ld.vendor;   // linked quote/invoice/PO knows the vendor
+    const raw = rawVendor(t.description), l = learned.get(raw.toLowerCase());
+    if (l) return Object.entries(l).sort((a, b) => b[1] - a[1])[0][0];
+    const d = tokens(t.description).join(' ');
+    const k = known.find(x => x.tk.every(w => d.includes(w))) || known.find(x => x.tk[0].length >= 5 && d.includes(x.tk[0]));
+    return k ? k.n : raw;
+  };
+  return _vg;
+}
+const guessVendor = t => vendorGuesser()(t);
+const vendorOf = t => t.vendor || guessVendor(t);
 
 /* ---------------- storage adapters ---------------- */
 const FB_VER = '10.12.2';
@@ -415,11 +470,12 @@ async function makeLocal() {
 /* ---------------- state ---------------- */
 let store = null;
 const S = { accounts: [], txns: [], docs: [], pos: [], settings: {...DEFAULT_SETTINGS} };
-const UI = { tab: location.hash.slice(1) || 'overview', range: LS.get('ledger.range', '12m'), tx: { acct:'', cls:'all', q:'', tag:'', from:'', to:'', link:'' }, txSort: LS.get('ledger.txSort', { key: 'date', dir: 'desc' }), sel: new Set(), hideBank: LS.get('ledger.hideBank', false), docF: { type:'', status:'', q:'', tag:'', chain:'' }, docSort: LS.get('ledger.docSort', { key: 'date', dir: 'desc' }), skipped: new Set(), viewIdx: 0, pendingImport: null };
+const UI = { tab: location.hash.slice(1) || 'overview', range: LS.get('ledger.range', '12m'), tx: { acct:'', cls:'all', q:'', tag:'', from:'', to:'', link:'' }, txSort: LS.get('ledger.txSort', { key: 'date', dir: 'desc' }), sel: new Set(), hideBank: LS.get('ledger.hideBank', false), docF: { type:'', status:'', q:'', tag:'', chain:'' }, docSort: LS.get('ledger.docSort', { key: 'date', dir: 'desc' }), skipped: new Set(), viewIdx: 0, pendingImport: null, split: LS.get('ledger.split', 'category') };
 let docsByTxn = {};
 const charts = {};
 
 function derive() {
+  _vg = null;
   { const n = S.docs.filter(d => d.needsReview).length + S.pos.filter(p => p.needsReview).length; const b = document.getElementById('pendBadge'); if (b) b.innerHTML = n ? `<span class="pbadge" title="${n} uploaded file(s) need details">${n}</span>` : ''; }
   S.docs.forEach(d => { if (d.type === 'receipt' && (!d.status || d.status === 'filed')) d.status = (d.linkedTxnIds || []).length ? 'reconciled' : 'unreconciled'; });
   S.txns.forEach(t => { if (LEGACY_CAPITAL.has(t.cls)) t.cls = 'capital'; });
@@ -639,12 +695,14 @@ function vOverview(root) {
     <div class="card"><h3>Monthly cash flow</h3><div class="sub">Net amount per month by type — above zero is money in, below zero is money out. Internal transfers excluded.</div>
       ${legendHTML([[cssVar('--series-1'), '⚙️ Net operating'], [cssVar('--series-3'), '💵 Net capital'], [cssVar('--series-4'), '🏦 Net bank activity']])}
       <div class="chartbox"><canvas id="cMonthly"></canvas></div></div>
-    <div class="card"><h3>Spending by category</h3><div class="sub">Operating outflow in range, by category (or first tag). Top 8.</div><div class="chartbox"><canvas id="cCat"></canvas></div></div>
+    <div class="card"><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><h3 style="margin:0">Spending by ${SPLITS[UI.split][0].toLowerCase()}</h3><span style="flex:1"></span><label class="small muted" style="display:flex;align-items:center;gap:6px">Split by<select id="splitSel" style="padding:2px 6px;font-size:12px">${Object.entries(SPLITS).map(([k, [l]]) => `<option value="${k}" ${UI.split === k ? 'selected' : ''}>${l}</option>`).join('')}</select></label></div>
+      <div class="sub">${SPLITS[UI.split][1]} Top 8. Click a bar to see its transactions.</div><div class="chartbox"><canvas id="cCat"></canvas></div></div>
   </div>
   <div class="grid">
     <div class="card"><h3>Needs attention</h3><div class="sub">Click an item to open it and fix it — or add a note explaining it.</div>${attention()}</div>
   </div>`;
   bindRange(root);
+  $('#splitSel', root).onchange = e => { UI.split = e.target.value; LS.set('ledger.split', UI.split); render(); };
   $$('.att', root).forEach(el => el.onclick = () => UI.attActs[+el.dataset.i]?.());
   $$('.kpi[data-go]', root).forEach(k => k.onclick = () => {
     const clearTx = { acct: '', cls: 'all', q: '', tag: '', from: '', to: '', link: '' }, clearDoc = { type: '', status: '', q: '', tag: '', chain: '' };
@@ -714,14 +772,38 @@ function drawMonthly(from) {
   const ds = (l, k, c) => ({ label: l, data: m.map(r => +r[k].toFixed(2)), backgroundColor: c, borderRadius: 4, borderSkipped: false, maxBarThickness: 22, categoryPercentage: .75, barPercentage: .9 });
   charts.monthly = new Chart($('#cMonthly'), { type: 'bar', options: o, data: { labels: m.map(r => fmtMonth(r.k)), datasets: [ds('Net operating', 'operating', cssVar('--series-1')), ds('Net capital', 'capital', cssVar('--series-3')), ds('Net bank activity', 'bank', cssVar('--series-4'))] } });
 }
+const SPLITS = {
+  category: ['Category', 'Operating outflow in range, by category.'],
+  vendor: ['Vendor', 'Operating outflow in range, by vendor (yours, or guessed from the description).'],
+  tag: ['Tag', 'Operating outflow in range, by tag — a transaction with several tags counts under each.'],
+  account: ['Account', 'Operating outflow in range, by bank account or card.'],
+  doctype: ['Linked document', 'Operating outflow in range, by what it is linked to (invoice, receipt, PO…).'],
+};
+const splitKeys = t => ({
+  category: () => [t.category || 'Uncategorized'],
+  vendor: () => [vendorOf(t) || 'Unknown vendor'],
+  tag: () => (t.tags || []).length ? t.tags : ['Untagged'],
+  account: () => [acctById(t.accountId)?.name || '?'],
+  doctype: () => { const ds = docsByTxn[t.id] || []; return [ds.length ? [...new Set(ds.map(d => d.typeLabel))].join(' + ') : 'Not linked']; },
+})[UI.split]();
 function drawCats(from) {
-  const agg = {};
-  S.txns.filter(t => t.date >= from && !t.cls && t.amount < 0).forEach(t => { const k = t.category || (t.tags || [])[0] || 'Uncategorized'; agg[k] = (agg[k] || 0) - t.amount; });
-  let rows = Object.entries(agg).sort((a, b) => b[1] - a[1]);
-  if (rows.length > 8) { const other = rows.slice(7).reduce((s, r) => s + r[1], 0); rows = [...rows.slice(0, 7), ['Other', other]]; }
+  const agg = {}, cnt = {};
+  S.txns.filter(t => t.date >= from && !t.cls && t.amount < 0).forEach(t => splitKeys(t).forEach(k => { agg[k] = (agg[k] || 0) - t.amount; cnt[k] = (cnt[k] || 0) + 1; }));
+  let rows = Object.entries(agg).sort((a, b) => b[1] - a[1]), rest = [];
+  if (rows.length > 8) { rest = rows.slice(7); rows = [...rows.slice(0, 7), [`Other (${rest.length})`, rest.reduce((s, r) => s + r[1], 0)]]; }
   const o = baseOpts({ indexAxis: 'y' });
-  o.scales = { x: { ...o.scales.y, grid: { color: cssVar('--grid') } }, y: { grid: { display: false }, ticks: { color: cssVar('--text-secondary') }, border: { display: false } } };
-  o.plugins.tooltip.callbacks = { label: it => money(it.parsed.x) };
+  o.scales = { x: { ...o.scales.y, grid: { color: cssVar('--grid') } }, y: { grid: { display: false }, ticks: { color: cssVar('--text-secondary'), callback(v) { const l = this.getLabelForValue(v); return l.length > 24 ? l.slice(0, 23) + '…' : l; } }, border: { display: false } } };
+  o.plugins.tooltip.callbacks = { title: it => it[0].label, label: it => { const k = rows[it.dataIndex][0]; return `${money(it.parsed.x)}${cnt[k] ? ` · ${cnt[k]} transaction${cnt[k] > 1 ? 's' : ''}` : ''}`; }, afterLabel: it => it.dataIndex === 7 && rest.length ? rest.slice(0, 6).map(r => `${r[0]}: ${money(r[1])}`).join('\n') + (rest.length > 6 ? '\n…' : '') : '' };
+  o.onHover = (e, el) => { e.native.target.style.cursor = el.length ? 'pointer' : 'default'; };
+  o.onClick = (e, el) => {
+    if (!el.length) return; const k = rows[el[0].index][0]; if (/^Other \(/.test(k) && rest.length) return;
+    const f = { acct: '', cls: '', q: '', tag: '', from, to: '', link: '' };
+    if (UI.split === 'tag') { if (k === 'Untagged') f.cls = 'untagged'; else f.tag = k; }
+    else if (UI.split === 'account') f.acct = S.accounts.find(a => a.name === k)?.id || '';
+    else if (UI.split === 'doctype') f.link = k === 'Not linked' ? 'unlinked' : 'linked';
+    else if (!/^(Uncategorized|Unknown vendor)$/.test(k)) f.q = k;
+    UI.tx = f; UI.txSort = { key: 'amount', dir: 'asc' }; setTimeout(() => go('txns'));   // after Chart.js finishes the click
+  };
   charts.cat = new Chart($('#cCat'), { type: 'bar', options: o, data: { labels: rows.map(r => r[0]), datasets: [{ data: rows.map(r => r[1]), backgroundColor: cssVar('--series-1'), borderRadius: { topRight: 4, bottomRight: 4 }, borderSkipped: 'start', maxBarThickness: 18 }] } });
 }
 
@@ -748,7 +830,7 @@ function matchScore(t, c) {
     const days = Math.abs(ts(t.date) - ts(c.date)) / 864e5;
     if (days <= 7) { sc += 15; why.push('≤1 wk'); } else if (days <= 45) { sc += 10; why.push('≤45 d'); } else if (days <= 120) sc += 4; else if (days > 365) sc -= 20;
   }
-  const desc = (t.description + ' ' + (t.notes || '')).toLowerCase();
+  const desc = (t.description + ' ' + (t.notes || '') + ' ' + (t.vendor || '')).toLowerCase();
   const vt = tokens(c.vendor);
   if (vt.length && vt.some(w => desc.includes(w))) { sc += 35; why.push('vendor name'); }
   if (c.number && c.number.length >= 3 && desc.includes(c.number.toLowerCase().replace(/^po[-\s]*/, ''))) { sc += 40; why.push('number in memo'); }
@@ -1012,12 +1094,12 @@ function transferBadge(t) {
 function filteredTxns() {
   const f = UI.tx, q = f.q.toLowerCase();
   const cands = f.link === 'suggested' ? linkCandidates() : null;
-  return S.txns.filter(t => (!UI.hideBank || t.cls !== 'bank' || f.cls === 'bank') && (!f.link || (f.link === 'stale' ? isStale(t) : f.link === 'xfer' ? isUnmatchedTransfer(t) : f.link === 'linked' ? (docsByTxn[t.id] || []).length : f.link === 'unlinked' ? !(docsByTxn[t.id] || []).length : !(docsByTxn[t.id] || []).length && suggestionsFor(t, cands).length)) && (!f.acct || t.accountId === f.acct) && (f.cls === 'all' || (f.cls === 'untagged' ? (!t.cls && !(t.tags || []).length && !t.category) : (t.cls || '') === f.cls)) && (!f.tag || (t.tags || []).includes(f.tag)) && (!f.from || t.date >= f.from) && (!f.to || t.date <= f.to) && (!q || (t.description + ' ' + (t.notes || '') + ' ' + (t.category || '') + ' ' + t.amount).toLowerCase().includes(q)));
+  return S.txns.filter(t => (!UI.hideBank || t.cls !== 'bank' || f.cls === 'bank') && (!f.link || (f.link === 'stale' ? isStale(t) : f.link === 'xfer' ? isUnmatchedTransfer(t) : f.link === 'linked' ? (docsByTxn[t.id] || []).length : f.link === 'unlinked' ? !(docsByTxn[t.id] || []).length : !(docsByTxn[t.id] || []).length && suggestionsFor(t, cands).length)) && (!f.acct || t.accountId === f.acct) && (f.cls === 'all' || (f.cls === 'untagged' ? (!t.cls && !(t.tags || []).length && !t.category) : (t.cls || '') === f.cls)) && (!f.tag || (t.tags || []).includes(f.tag)) && (!f.from || t.date >= f.from) && (!f.to || t.date <= f.to) && (!q || (t.description + ' ' + (t.notes || '') + ' ' + (t.category || '') + ' ' + vendorOf(t) + ' ' + t.amount).toLowerCase().includes(q)));
 }
 function vTxns(root) {
   const f = UI.tx; if (f.link === 'stale' && !S.txns.some(isStale)) { f.link = ''; f.acct = ''; }
   const ts0 = UI.txSort, dir = ts0.dir === 'asc' ? 1 : -1;
-  const tval = t => ({ date: 0, acct: acctName(t.accountId).toLowerCase(), desc: t.description.toLowerCase(), amount: t.amount, bal: t._bal ?? 0, type: t.cls === 'capital' ? capLabel(t) : CLASSES[t.cls || ''], tags: [t.category, ...(t.tags || [])].filter(Boolean).join(',').toLowerCase() || '~', docs: (docsByTxn[t.id] || []).length })[ts0.key];
+  const tval = t => ({ date: 0, acct: acctName(t.accountId).toLowerCase(), desc: t.description.toLowerCase(), vendor: vendorOf(t).toLowerCase() || '~', amount: t.amount, bal: t._bal ?? 0, type: t.cls === 'capital' ? capLabel(t) : CLASSES[t.cls || ''], tags: [t.category, ...(t.tags || [])].filter(Boolean).join(',').toLowerCase() || '~', docs: (docsByTxn[t.id] || []).length })[ts0.key];
   const base = filteredTxns();   // chronological (date, then statement order)
   const rows = ts0.key === 'date' ? (ts0.dir === 'asc' ? base.slice() : base.slice().reverse())
     : base.map((t, i) => [t, i]).sort((a, b) => { const A = tval(a[0]), B = tval(b[0]); return (A < B ? -1 : A > B ? 1 : 0) * dir || b[1] - a[1]; }).map(x => x[0]);
@@ -1042,16 +1124,18 @@ function vTxns(root) {
       <select id="bCls">${Object.entries(CLASSES).map(([v, l]) => `<option value="${v}">${l}</option>`).join('')}</select><button class="b sm" id="bClsGo">Set type</button>
       <input id="bTag" placeholder="tag to add" list="tagList" style="width:140px"><button class="b sm" id="bTagGo">Add tag</button>
       <input id="bCat" placeholder="category" style="width:140px"><button class="b sm" id="bCatGo">Set category</button>
+      <input id="bVen" placeholder="vendor" list="venList" style="width:140px"><button class="b sm" id="bVenGo">Set vendor</button><button class="b sm" id="bVenGuess" title="Save the guessed vendor on each selected transaction that has none">Accept guesses</button>
       <button class="b sm" id="bClear">Clear selection</button>
     </div>
     ${(() => { const st = S.txns.filter(isStale); return st.length ? `<div class="banner warn" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><span>⚑ <b>${st.length} entr${st.length > 1 ? 'ies are' : 'y is'} not in the bank statement</b> covering ${st.length > 1 ? 'their' : 'its'} dates.</span><span style="flex:1"></span>${f.link === 'stale' ? `<button class="b danger" id="stDelAll">Delete all ${st.length}</button>` : '<button class="b" id="stShow">Show them</button>'}</div>` : ''; })()}
     <div class="small muted" style="margin-bottom:6px">${rows.length} transactions · net ${money(total)}${rows.length > shown.length ? ` · showing first ${shown.length} in this order` : ''}</div>
-    <div class="tw"><table id="txTable"><thead><tr><th><input type="checkbox" id="selAll"></th>${[['date', 'Date'], ['acct', 'Account'], ['desc', 'Description'], ['amount', 'Amount', 'r'], ['bal', 'Balance', 'r', "Running balance of this transaction's account, after the transaction"], ['type', 'Type'], ['tags', 'Tags / category'], ['docs', 'Quotes · invoices · POs']].map(([k, l, c, tt]) => `<th class="sortable ${c || ''}" data-tsort="${k}" ${tt ? `title="${tt}"` : ''}>${l}${UI.txSort.key === k ? `<span class="arr">${UI.txSort.dir === 'asc' ? '▲' : '▼'}</span>` : ''}</th>`).join('')}<th></th></tr></thead><tbody>
+    <div class="tw"><table id="txTable"><thead><tr><th><input type="checkbox" id="selAll"></th>${[['date', 'Date'], ['acct', 'Account'], ['desc', 'Description'], ['vendor', 'Vendor', '', 'Vendor you set, or a guess from the description (shown in grey italics)'], ['amount', 'Amount', 'r'], ['bal', 'Balance', 'r', "Running balance of this transaction's account, after the transaction"], ['type', 'Type'], ['tags', 'Tags / category'], ['docs', 'Quotes · invoices · POs']].map(([k, l, c, tt]) => `<th class="sortable ${c || ''}" data-tsort="${k}" ${tt ? `title="${tt}"` : ''}>${l}${UI.txSort.key === k ? `<span class="arr">${UI.txSort.dir === 'asc' ? '▲' : '▼'}</span>` : ''}</th>`).join('')}<th></th></tr></thead><tbody>
     ${(() => { const cands = linkCandidates(); return shown.map(t => { const ds = docsByTxn[t.id] || []; const sg = ds.length ? [] : suggestionsFor(t, cands); return `<tr data-id="${t.id}">
       <td><input type="checkbox" class="sel" ${UI.sel.has(t.id) ? 'checked' : ''}></td>
       <td style="white-space:nowrap">${fmtDate(t.date)}</td>
       <td class="small muted">${esc(acctById(t.accountId)?.name || '?')}</td>
       <td>${esc(t.description)}${t.notes ? `<div class="small muted">${esc(t.notes)}</div>` : ''}${isStale(t) ? `<div class="small" style="color:var(--crit);font-weight:600">⚑ Not in bank statement ${esc(t.notInStatement.file || '')} (${fmtDate(t.notInStatement.from)} – ${fmtDate(t.notInStatement.to)}) <button class="b sm danger stDel">Delete</button> <button class="b sm stKeep" title="Keep it and stop flagging it">Keep</button></div><div class="small muted">${staleNote(t)}</div>` : ''}</td>
+      <td class="small">${t.vendor ? esc(t.vendor) : (() => { const g = guessVendor(t); return g ? `<span class="vguess" title="Guessed from the description — click to confirm or change">${esc(g)}</span>` : ''; })()}</td>
       <td class="r" style="white-space:nowrap">${money(t.amount)}</td>
       <td class="r small" style="white-space:nowrap;color:var(--text-secondary)" title="${esc(acctById(t.accountId)?.name || '')} balance after this transaction">${t._bal != null ? money(t._bal) : ''}</td>
       <td><select class="clsSel" style="padding:2px 4px;font-size:12px">${Object.entries(CLASSES).map(([v, l]) => `<option value="${v}" ${(t.cls || '') === v ? 'selected' : ''}>${v === 'capital' ? (t.cls === 'capital' ? capLabel(t) : '💵 Capital') : l}</option>`).join('')}</select>${transferBadge(t)}</td>
@@ -1060,6 +1144,7 @@ function vTxns(root) {
       <td><button class="b sm editTx">Edit</button></td></tr>`; }).join(''); })()}
     </tbody></table></div>
     <datalist id="tagList">${allTags().map(t => `<option value="${esc(t)}">`).join('')}</datalist>
+    <datalist id="venList">${knownVendors().sort().map(v => `<option value="${esc(v)}">`).join('')}</datalist>
   </div>`;
   const rf = () => render();
   $('#fAcct').onchange = e => { f.acct = e.target.value; rf(); };
@@ -1083,7 +1168,7 @@ function vTxns(root) {
     if (e.target.classList.contains('clsSel')) await changeType(t, e.target.value);
   });
   $('#txTable tbody', root).addEventListener('click', e => {
-    const tr = e.target.closest('tr'); if (e.target.classList.contains('editTx')) editTxn(S.txns.find(x => x.id === tr.dataset.id));
+    const tr = e.target.closest('tr'); if (e.target.classList.contains('editTx') || e.target.classList.contains('vguess')) editTxn(S.txns.find(x => x.id === tr.dataset.id));
     if (e.target.closest('.linkTx')) linkPicker(S.txns.find(x => x.id === tr.dataset.id));
     if (e.target.closest('.xfer')) { e.preventDefault(); transferDialog(S.txns.find(x => x.id === tr.dataset.id)); }
     if (e.target.classList.contains('stDel')) { const t = S.txns.find(x => x.id === tr.dataset.id); if (confirm(`Delete "${t.description}" (${money(t.amount)}, ${fmtDate(t.date)})? It isn't in the bank statement for that period.`)) deleteStale([t]).then(r => { toast(r.moved ? 'Deleted — details moved to the statement entry' : 'Deleted'); render(); }); }
@@ -1099,6 +1184,8 @@ function vTxns(root) {
   };
   $('#bTagGo').onclick = () => { const g = $('#bTag').value.trim(); if (g) bulk(t => t.tags = [...new Set([...(t.tags || []), g])]); };
   $('#bCatGo').onclick = () => bulk(t => t.category = $('#bCat').value.trim());
+  $('#bVenGo').onclick = () => bulk(t => t.vendor = $('#bVen').value.trim());
+  $('#bVenGuess').onclick = () => { const g = new Map(S.txns.filter(t => UI.sel.has(t.id)).map(t => [t.id, guessVendor(t)])); bulk(t => { if (!t.vendor && g.get(t.id)) t.vendor = g.get(t.id); }); };
   $('#bClear').onclick = () => { UI.sel.clear(); rf(); };
 }
 function editTxn(t) {
@@ -1112,19 +1199,22 @@ function editTxn(t) {
       <label>Amount (− = money out)<input type="number" step="0.01" id="tAmt" value="${t.amount}" ${t.manual ? '' : 'disabled'}></label>
       <label>Type<select id="tCls">${Object.entries(CLASSES).map(([v, l]) => `<option value="${v}" ${(t.cls || '') === v ? 'selected' : ''}>${l}</option>`).join('')}</select>${t.cls === 'transfer' ? transferBadge(t).replace('class="xfer', 'id="tXfer" class="xfer') : ''}</label>
       <label class="full">Description<input id="tDesc" value="${esc(t.description)}" ${t.manual ? '' : 'disabled'}></label>
+      <label>Vendor<input id="tVen" value="${esc(t.vendor || '')}" list="tVenList" placeholder="${esc(guessVendor(t) || 'e.g. Thermo Fisher')}">${!t.vendor && guessVendor(t) ? `<span class="small muted">Guess: <b>${esc(guessVendor(t))}</b> <button class="b sm" type="button" id="tVenUse">Use</button> — or type another</span>` : ''}</label>
       <label>Category<input id="tCat" value="${esc(t.category || '')}" list="catList" placeholder="e.g. Lab supplies"></label>
       <label>Tags (comma-separated)<input id="tTags" value="${esc((t.tags || []).join(', '))}"></label>
       <label class="full">Notes<textarea id="tNotes">${esc(t.notes || '')}</textarea></label>
       ${isNew ? '' : `<label class="full">Linked quotes / invoices / POs<div>${linkChips(t) || '<span class="muted small">None linked.</span>'} <button class="b sm" id="tLinks" type="button">🔗 Manage links${nSug ? ` (${nSug} suggested)` : ''}</button></div></label>`}
     </div>
     <datalist id="catList">${[...new Set(S.txns.map(x => x.category).filter(Boolean))].map(c => `<option value="${esc(c)}">`).join('')}</datalist>
+    <datalist id="tVenList">${knownVendors().sort().map(v => `<option value="${esc(v)}">`).join('')}</datalist>
     <div class="mfoot">${!isNew && t.manual ? '<button class="b danger" id="tDel">Delete</button>' : ''}<span style="flex:1"></span><button class="b" data-close>Cancel</button><button class="b pri" id="tSave">Save</button></div>`);
+  $('#tVenUse', body)?.addEventListener('click', () => { $('#tVen', body).value = guessVendor(t); });
   $('#tXfer', body)?.addEventListener('click', e => { e.preventDefault(); transferDialog(S.txns.find(x => x.id === t.id)); });
   $('#tDel', body)?.addEventListener('click', async () => { if (!confirm('Delete this manual transaction?')) return; { const o = t.transferPairId && S.txns.find(x => x.id === t.transferPairId); if (o) { o.transferPairId = ''; await persist('txns', o); } } await store.del('txns', t.id); S.txns = S.txns.filter(x => x.id !== t.id); for (const [n, arr] of [['docs', S.docs], ['pos', S.pos]]) for (const r of arr.filter(r => (r.linkedTxnIds || []).includes(t.id))) { r.linkedTxnIds = r.linkedTxnIds.filter(id => id !== t.id); await persist(n, r); } closeModal(); render(); });
   $('#tSave', body).onclick = async () => {
     const newCls = $('#tCls', body).value; const wasCls = (S.txns.find(x => x.id === t.id) || {}).cls || '';
     if (wasCls === 'transfer' && newCls !== 'transfer') { const live = S.txns.find(x => x.id === t.id); await clearTransferPair(live); t.transferPairId = ''; t.transferAcct = ''; }
-    Object.assign(t, { cls: newCls, category: $('#tCat', body).value.trim(), tags: parseTags($('#tTags', body).value), notes: $('#tNotes', body).value.trim() });
+    Object.assign(t, { cls: newCls, category: $('#tCat', body).value.trim(), vendor: $('#tVen', body).value.trim(), tags: parseTags($('#tTags', body).value), notes: $('#tNotes', body).value.trim() });
     if (t.manual) Object.assign(t, { date: $('#tDate', body).value, accountId: $('#tAcct', body).value, amount: +$('#tAmt', body).value || 0, description: $('#tDesc', body).value.trim() });
     await persist('txns', t);
     if (newCls === 'transfer' && wasCls !== 'transfer') { transferDialog(S.txns.find(x => x.id === t.id)); return; }
@@ -2228,6 +2318,7 @@ async function deleteStale(list) {
       taken.add(cp.id);
       if (!cp.cls && t.cls) cp.cls = t.cls;
       if (!cp.category && t.category) cp.category = t.category;
+      if (!cp.vendor && t.vendor) cp.vendor = t.vendor;
       cp.tags = [...new Set([...(cp.tags || []), ...(t.tags || [])])];
       if (t.notes && !(cp.notes || '').includes(t.notes)) cp.notes = [cp.notes, t.notes].filter(Boolean).join(' · ');
       if (t.transferPairId && !cp.transferPairId) { const o = S.txns.find(x => x.id === t.transferPairId); if (o) { o.transferPairId = cp.id; txChanged.set(o.id, o); } Object.assign(cp, { transferPairId: t.transferPairId, transferAcct: t.transferAcct }); }
@@ -2336,7 +2427,7 @@ function vSettings(root) {
   $('#sSave').onclick = async () => { Object.assign(S.settings, { id: 'main', company: $('#sCo').value.trim(), email: $('#sEm').value.trim(), phone: $('#sPh').value.trim(), poPrefix: $('#sPP').value.trim() || 'PO', address: $('#sAd').value.trim(), paymentTerms: $('#sTerms').value.trim(), taxRate: +$('#sTax').value || 0, burnMonths: Math.max(1, +$('#sBurn').value || 3), largeTxn: +$('#sLg').value || 5000 }); await persist('settings', S.settings); toast('Settings saved'); };
   const dl = (name, text, type) => { const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type })); a.download = name; a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 4000); };
   $('#sExp').onclick = () => dl(`ledger-backup-${today()}.json`, JSON.stringify(clean({ exportedAt: new Date().toISOString(), accounts: S.accounts, txns: S.txns, docs: S.docs, pos: S.pos, settings: S.settings }), null, 1), 'application/json');
-  $('#sExpCsv').onclick = () => { const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`; dl(`transactions-${today()}.csv`, ['Date,Account,Description,Amount,Type,Category,Tags,Notes,Linked documents', ...S.txns.map(t => [t.date, acctById(t.accountId)?.name, t.description, t.amount, CLASSES[t.cls || ''], t.category, (t.tags || []).join('; '), t.notes, (docsByTxn[t.id] || []).map(d => `${d.typeLabel} ${d.number || ''} ${d.vendor || ''}`).join('; ')].map(q).join(','))].join('\n'), 'text/csv'); };
+  $('#sExpCsv').onclick = () => { const q = v => `"${String(v ?? '').replace(/"/g, '""')}"`; dl(`transactions-${today()}.csv`, ['Date,Account,Description,Vendor,Amount,Type,Category,Tags,Notes,Linked documents', ...S.txns.map(t => [t.date, acctById(t.accountId)?.name, t.description, vendorOf(t), t.amount, CLASSES[t.cls || ''], t.category, (t.tags || []).join('; '), t.notes, (docsByTxn[t.id] || []).map(d => `${d.typeLabel} ${d.number || ''} ${d.vendor || ''}`).join('; ')].map(q).join(','))].join('\n'), 'text/csv'); };
   $('#sImp').onclick = () => $('#sImpF').click();
   $('#sImpF').onchange = async e => { try { const j = JSON.parse(await e.target.files[0].text()); for (const n of ['accounts', 'txns', 'docs', 'pos']) if (Array.isArray(j[n]) && j[n].length) await persistMany(n, j[n]); if (j.settings) { S.settings = { ...DEFAULT_SETTINGS, ...j.settings, id: 'main' }; await persist('settings', S.settings); } toast('Backup merged'); render(); } catch (err) { toast('Import failed: ' + err.message, 5000); } };
 }
