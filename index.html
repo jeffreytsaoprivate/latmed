@@ -168,6 +168,13 @@ tr.pending td:first-child{box-shadow:inset 3px 0 0 var(--warn)}
 .racts{white-space:nowrap;text-align:right}
 .racts .ract{min-width:30px;padding:2px 6px;margin-left:3px;line-height:1.3}
 .racts .ract[data-act=edit]{font-weight:700;letter-spacing:1px}
+.lkSupport{margin-top:10px;padding-top:8px;border-top:1px dashed var(--border)}
+.lkSupRow{display:flex;gap:6px;margin:6px 0;overflow-x:auto}
+.lkSupRow .lkCol{min-width:150px}
+.feed .att{cursor:pointer;align-items:center;border-radius:6px;padding:7px 6px}
+.feed .att:hover{background:color-mix(in srgb,var(--accent) 8%,transparent)}
+.feed .att .kar{color:var(--text-muted);font-weight:700;padding-left:8px}
+.feed .att:hover .kar{color:var(--accent)}
 .chsep{color:var(--text-muted);font-size:11px}
 /* editor navigation + linkage panel */
 .mnav{display:flex;align-items:center;gap:8px;margin-right:12px}
@@ -325,8 +332,9 @@ function parseCSV(text) {
 const CLASSES = { '': '⚙️ Operating', bank: '🏦 Bank activity', capital: '💵 Capital (+ in / − out)', transfer: '⇄ Internal transfer' };
 const LEGACY_CAPITAL = new Set(['infusion', 'withdrawal']);
 const capLabel = t => t.amount >= 0 ? '💵 Capital +' : '💵 Capital −';
-const DOC_TYPES = { quote: 'Quote', invoice: 'Invoice', receipt: 'Receipt', other: 'Other' };
-const DOC_STATUS = { quote: ['open','accepted','rejected','expired'], invoice: ['unpaid','paid','void'], receipt: ['unreconciled','reconciled'], other: ['filed'] };
+const DOC_TYPES = { quote: 'Quote', invoice: 'Invoice', receipt: 'Receipt', proposal: 'Proposal', result: 'Result', other: 'Other' };
+const ATTACH = new Set(['proposal', 'result', 'other']);   // supporting documents that hang off a quote
+const DOC_STATUS = { quote: ['open','accepted','rejected','expired'], invoice: ['unpaid','paid','void'], receipt: ['unreconciled','reconciled'], proposal: ['open','accepted','rejected'], result: ['received','reviewed'], other: ['filed'] };
 const PO_STATUS = ['draft','issued','partially received','received','closed','cancelled'];
 const COLS = ['accounts','txns','docs','pos','settings'];
 const DEFAULT_SETTINGS = { id:'main', company:'', address:'', email:'', phone:'', poPrefix:'PO', taxRate:0, burnMonths:3, largeTxn:5000, paymentTerms:'Net 30', currency:'USD' };
@@ -634,9 +642,10 @@ function vOverview(root) {
     <div class="card"><h3>Spending by category</h3><div class="sub">Operating outflow in range, by category (or first tag). Top 8.</div><div class="chartbox"><canvas id="cCat"></canvas></div></div>
   </div>
   <div class="grid">
-    <div class="card"><h3>Needs attention</h3><div class="sub">Overdue invoices, invoices without a payment link, untagged large transactions.</div>${attention()}</div>
+    <div class="card"><h3>Needs attention</h3><div class="sub">Click an item to open it and fix it — or add a note explaining it.</div>${attention()}</div>
   </div>`;
   bindRange(root);
+  $$('.att', root).forEach(el => el.onclick = () => UI.attActs[+el.dataset.i]?.());
   $$('.kpi[data-go]', root).forEach(k => k.onclick = () => {
     const clearTx = { acct: '', cls: 'all', q: '', tag: '', from: '', to: '', link: '' }, clearDoc = { type: '', status: '', q: '', tag: '', chain: '' };
     const g = k.dataset.go;
@@ -654,22 +663,33 @@ function capTable() {
   if (!rows.length) return `<div class="muted small">None yet. Set a transaction's type to Capital on the Transactions tab.</div>`;
   return `<div class="tw" style="max-height:300px"><table><thead><tr><th>Date</th><th>Description</th><th>Type</th><th class="r">Amount</th></tr></thead><tbody>${rows.map(t => `<tr><td>${fmtDate(t.date)}</td><td>${esc(t.description)}</td><td><span class="cls capital ${t.amount < 0 ? 'neg' : ''}">${capLabel(t)}</span></td><td class="r">${money(t.amount)}</td></tr>`).join('')}</tbody></table></div>`;
 }
+/* "Needs attention": every item is clickable and opens the place to fix it (editors have notes/description for comments). */
 function attention() {
-  const out = [];
-  S.docs.filter(d => d.type === 'invoice' && d.status === 'unpaid' && d.dueDate && d.dueDate < today()).forEach(d => out.push(`<span class="status crit">⚠ Overdue</span> invoice ${esc(d.number || '')} · ${esc(d.vendor)} · ${money(d.amount)} · due ${fmtDate(d.dueDate)}`));
-  S.docs.filter(d => d.type === 'invoice' && d.status === 'paid' && !(d.linkedTxnIds || []).length).forEach(d => out.push(`<span class="status warn">● Unlinked</span> paid invoice ${esc(d.number || '')} · ${esc(d.vendor)} · ${money(d.amount)}`));
+  const out = []; UI.attActs = [];
+  const add = (html, act, title, front) => { const i = UI.attActs.push(act) - 1; const h = `<div class="ev att" data-i="${i}" title="${esc(title)}"><span style="flex:1">${html}</span><span class="kar">›</span></div>`; front ? out.unshift(h) : out.push(h); };
+  const clearTx = { acct: '', cls: 'all', q: '', tag: '', from: '', to: '', link: '' }, clearDoc = { type: '', status: '', q: '', tag: '', chain: '' };
+  const openDoc = (k, id) => () => { UI.docF = { ...clearDoc }; go('docs'); openRecord(k, id); };
+  S.docs.filter(d => d.type === 'invoice' && d.status === 'unpaid' && d.dueDate && d.dueDate < today()).forEach(d =>
+    add(`<span class="status crit">⚠ Overdue</span> invoice ${esc(d.number || '')} · ${esc(d.vendor)} · ${money(d.amount)} · due ${fmtDate(d.dueDate)}`, openDoc('doc', d.id), 'Open the invoice — link its payment, change its status, or add a note'));
+  S.docs.filter(d => d.type === 'invoice' && d.status === 'paid' && !(d.linkedTxnIds || []).length).forEach(d =>
+    add(`<span class="status warn">● Unlinked</span> paid invoice ${esc(d.number || '')} · ${esc(d.vendor)} · ${money(d.amount)}`, openDoc('doc', d.id), 'Open the invoice and link the payment that paid it'));
   const lg = +S.settings.largeTxn || 5000;
-  S.txns.filter(t => Math.abs(t.amount) >= lg && !t.cls && !(t.tags || []).length && !t.category && !docsByTxn[t.id]).slice(-15).reverse().forEach(t => out.push(`<span class="status warn">● Untagged</span> ${fmtDate(t.date)} · ${esc(t.description)} · ${money(t.amount)}`));
-  const stn = S.txns.filter(isStale).length;
-  if (stn) out.unshift(`<span class="status crit">⚑ Not in statement</span> ${stn} transaction${stn > 1 ? 's' : ''} fall${stn > 1 ? '' : 's'} inside an imported statement period but ${stn > 1 ? 'are' : 'is'} not in the statement — Transactions → filter "Not in bank statement"`);
-  const pn = pendingList().length;
-  if (pn) out.unshift(`<span class="status warn">⚑ To review</span> ${pn} uploaded file${pn > 1 ? 's need' : ' needs'} details — <a href="#docs">Documents</a>`);
+  S.txns.filter(t => Math.abs(t.amount) >= lg && !t.cls && !(t.tags || []).length && !t.category && !t.notes && !docsByTxn[t.id]).slice(-15).reverse().forEach(t =>
+    add(`<span class="status warn">● Untagged</span> ${fmtDate(t.date)} · ${esc(t.description)} · ${money(t.amount)}`, () => { UI.tx = { ...clearTx }; go('txns'); editTxn(t); }, 'Open the transaction — set its type, category or tags, link documents, or add a note'));
+  const gaps = [...S.docs.filter(d => !d.needsReview).map(d => chainOf('doc', d)), ...S.pos.filter(p => !p.needsReview).map(p => chainOf('po', p))].filter(c => c.missing.length).length;
+  if (gaps) add(`<span class="status warn">● Links</span> ${gaps} document${gaps > 1 ? 's have' : ' has'} missing links or totals that don't agree`, () => { UI.docF = { ...clearDoc, chain: 'gaps' }; go('docs'); }, 'Show them on the Documents tab');
   const ur = S.docs.filter(d => d.type === 'receipt' && d.status !== 'reconciled' && !d.needsReview);
-  if (ur.length) out.push(`<span class="status warn">● Receipts</span> ${ur.length} receipt${ur.length > 1 ? 's are' : ' is'} not linked to a bank/card transaction`);
+  if (ur.length === 1) add(`<span class="status warn">● Receipt</span> ${esc(ur[0].vendor || ur[0].fileName || '')} ${money(ur[0].amount)} is not linked to a bank/card transaction`, openDoc('doc', ur[0].id), 'Open the receipt and link its transaction');
+  else if (ur.length) add(`<span class="status warn">● Receipts</span> ${ur.length} receipts are not linked to a bank/card transaction`, () => { UI.docF = { ...clearDoc, type: 'receipt', status: 'unreconciled' }; go('docs'); }, 'Show them on the Documents tab');
   const unp = S.txns.filter(isUnmatchedTransfer);
-  if (unp.length) out.push(`<span class="status warn">● Transfers</span> ${unp.length} internal transfer${unp.length > 1 ? 's have' : ' has'} no balancing entry yet — Transactions → filter "Unmatched transfers"`);
+  if (unp.length === 1) add(`<span class="status warn">● Transfer</span> ${fmtDate(unp[0].date)} · ${esc(unp[0].description)} · ${money(unp[0].amount)} has no balancing entry`, () => { UI.tx = { ...clearTx }; go('txns'); transferDialog(unp[0]); }, 'Open the transfer and pick its balancing entry');
+  else if (unp.length) add(`<span class="status warn">● Transfers</span> ${unp.length} internal transfers have no balancing entry yet`, () => { UI.tx = { ...clearTx, link: 'xfer' }; go('txns'); }, 'Show them on the Transactions tab');
+  const stn = S.txns.filter(isStale).length;
+  if (stn) add(`<span class="status crit">⚑ Not in statement</span> ${stn} transaction${stn > 1 ? 's' : ''} fall${stn > 1 ? '' : 's'} inside an imported statement period but ${stn > 1 ? 'are' : 'is'} not in the statement`, () => { UI.tx = { ...clearTx, link: 'stale' }; go('txns'); }, 'Show them on the Transactions tab to delete or keep', true);
+  const pn = pendingList().length;
+  if (pn) add(`<span class="status warn">⚑ To review</span> ${pn} uploaded file${pn > 1 ? 's need' : ' needs'} details`, () => { UI.docF = { ...clearDoc }; UI.skipped = new Set(); go('docs'); reviewNext(); }, 'Start reviewing them', true);
   if (!out.length) return `<div class="muted small"><span class="status good">✓</span> Nothing needs attention.</div>`;
-  return `<div class="feed" style="max-height:300px">${out.map(o => `<div class="ev">${o}</div>`).join('')}</div>`;
+  return `<div class="feed" style="max-height:340px">${out.join('')}</div>`;
 }
 function drawCash(from, b) {
   const ser = cashSeries(); const t = today();
@@ -706,12 +726,12 @@ function drawCats(from) {
 }
 
 /* ======================= LINKING (transactions ↔ quotes / invoices / POs) ======================= */
-const LINK_TYPES = { quote: ['Quote', 'Q'], invoice: ['Invoice', 'INV'], receipt: ['Receipt', 'R'], other: ['Other', 'D'], po: ['Purchase order', 'PO'] };
+const LINK_TYPES = { quote: ['Quote', 'Q'], invoice: ['Invoice', 'INV'], receipt: ['Receipt', 'R'], proposal: ['Proposal', 'PR'], result: ['Result', 'RES'], other: ['Other', 'D'], po: ['Purchase order', 'PO'] };
 function linkItem(kind, r) {
   const type = kind === 'po' ? 'po' : r.type;
   return { kind, id: r.id, rec: r, type, typeLabel: LINK_TYPES[type]?.[0] || type, short: LINK_TYPES[type]?.[1] || '?', number: r.number || '', vendor: r.vendor || '', date: r.date || '', amount: kind === 'po' ? poTotals(r).total : (+r.amount || 0), status: r.status || '', file: r.file, fileName: r.fileName, linked: r.linkedTxnIds || [] };
 }
-const linkCandidates = () => [...S.docs.map(d => linkItem('doc', d)), ...S.pos.map(p => linkItem('po', p))];
+const linkCandidates = () => [...S.docs.filter(d => !ATTACH.has(d.type)).map(d => linkItem('doc', d)), ...S.pos.map(p => linkItem('po', p))];
 const STOP = new Set(['inc','llc','ltd','corp','corporation','company','the','and','usa','co','of','group','services','international','intl','des','ach','pos','purchase','payment','online','bank']);
 const tokens = s => String(s || '').toLowerCase().split(/[^a-z0-9]+/).filter(w => w.length >= 3 && !STOP.has(w));
 /* Score how likely transaction t pays/relates to item c. ≥50 = suggested, ≥90 = strong. */
@@ -1156,6 +1176,12 @@ function payCheck(recs, txns, billed) {
   return { paid, over, ack, flagged: over && !ack, matches };
 }
 function chainOf(kind, r) {
+  if (kind !== 'po' && ATTACH.has(r.type)) {
+    const q = r.quoteId && S.docs.find(d => d.id === r.quoteId); const quotes = q ? [q] : [];
+    const closed = r.type === 'proposal' && r.status === 'rejected';
+    return { quotes, pos: [], invs: [], txns: [], steps: [['quote', 'Quote', quotes], ['self', DOC_TYPES[r.type], [r]]], closed,
+      missing: closed || r.needsReview || r.type === 'other' || quotes.length ? [] : ['quote'], ac: amountCheck([], [], [], [], {}) };
+  }
   let quotes = [], pos = [];
   if (kind === 'po') pos = [r];
   else if (r.type === 'quote') { quotes = [r]; pos = S.pos.filter(p => p.quoteId === r.id); }
@@ -1172,7 +1198,6 @@ function chainOf(kind, r) {
   const txns = [...txIds].map(id => S.txns.find(t => t.id === id)).filter(Boolean);
   const closed = (r.type === 'invoice' && r.status === 'void') || (kind === 'po' && r.status === 'cancelled') || (r.type === 'quote' && ['rejected', 'expired'].includes(r.status) && !pos.length);
   const steps = r.type === 'receipt' ? [['self', 'Receipt', [r]], ['paid', 'Paid', txns]]
-    : r.type === 'other' ? []
     : [['quote', 'Quote', quotes], ['po', 'PO', pos], ['invoice', 'Invoice', invs], ['paid', 'Paid', txns]].map(st => (st[0] === (kind === 'po' ? 'po' : r.type)) ? ['self', st[1], st[0] === 'invoice' ? invs : [r]] : st);
   const missing = closed || r.needsReview ? [] : steps.filter(st => !st[2].length).map(st => st[0]);
   const billed0 = invs.length ? invs.reduce((s, i) => s + (+i.amount || 0), 0) : pos.length ? pos.reduce((s, p) => s + poTotals(p).total, 0) : +r.amount || 0;
@@ -1264,6 +1289,11 @@ async function setPOQuote(po, q) {
   if (q.status === 'open') { q.status = 'accepted'; await persist('docs', q); }
   toast(`Linked quote ${q.number || ''} → ${po.number}`);
 }
+async function setAttachQuote(d, q) {
+  const was = d.quoteId && d.quoteId !== q.id ? (S.docs.find(x => x.id === d.quoteId)?.number || 'another quote') : '';
+  d.quoteId = q.id; await persist('docs', d);
+  toast(`Linked ${DOC_TYPES[d.type].toLowerCase()} ${d.number || d.fileName || ''} → quote ${q.number || ''}${was ? ` (moved from ${was})` : ''}`, was ? 5000 : 2600);
+}
 async function setInvQuote(inv, q) {
   const was = inv.poId ? poNum(inv.poId) : inv.quoteId && inv.quoteId !== q.id ? 'quote ' + (S.docs.find(d => d.id === inv.quoteId)?.number || '') : '';
   inv.quoteId = q.id; inv.poId = ''; await persist('docs', inv);
@@ -1277,6 +1307,7 @@ async function setInvPO(inv, po) {
   const was = inv.poId && inv.poId !== po.id ? poNum(inv.poId) : ''; inv.poId = po.id; await persist('docs', inv); toast(`Linked ${inv.number || 'invoice'} → ${po.number}${was ? ` (moved from ${was})` : ''}`, was ? 5000 : 2600); }
 function linkStep(kind, r, step, onDone) {
   const c = chainOf(kind, r);
+  if (step === 'quote' && ATTACH.has(r.type)) return pickDialog(`Quote for ${DOC_TYPES[r.type].toLowerCase()} ${r.number || r.fileName || ''}`, 'Choose the quote this document belongs to.', S.docs.filter(d => d.type === 'quote').map(q => relRow('doc', q, r, '')), it => setAttachQuote(r, it.rec));
   if (step === 'quote') {
     const po = c.pos[0];
     if (!po && r.type === 'invoice') return pickDialog(`Quote for invoice ${r.number || ''}`, 'Choose the quote this invoice bills against (no PO needed).', S.docs.filter(d => d.type === 'quote').map(q => relRow('doc', q, r, '')), it => setInvQuote(r, it.rec));
@@ -1306,18 +1337,20 @@ function linkStep(kind, r, step, onDone) {
   }
 }
 
-/* Row quick actions: 🆗 close, ❌ cancel, ↺ reopen — status meaning depends on the document type */
+/* Row quick actions: ✅ close, ❌ cancel, ↺ reopen — status meaning depends on the document type */
 const QUICK = {
   quote:   { close: 'accepted',   cancel: 'rejected',  open: 'open',         done: ['accepted', 'rejected', 'expired'] },
   invoice: { close: 'paid',       cancel: 'void',      open: 'unpaid',       done: ['paid', 'void'] },
   po:      { close: 'closed',     cancel: 'cancelled', open: 'issued',       done: ['received', 'closed', 'cancelled'] },
-  receipt: { close: 'reconciled', cancel: null,        open: 'unreconciled', done: ['reconciled'] } };
+  receipt: { close: 'reconciled', cancel: null,        open: 'unreconciled', done: ['reconciled'] },
+  proposal:{ close: 'accepted',   cancel: 'rejected',  open: 'open',         done: ['accepted', 'rejected'] },
+  result:  { close: 'reviewed',   cancel: null,        open: 'received',     done: ['reviewed'] } };
 function rowActions(kind, r) {
   const q = QUICK[kind === 'po' ? 'po' : r.type];
   let h = `<button class="b sm ract" data-act="edit" title="Open / edit">…</button>`;
   if (q && !r.needsReview) {
     if (q.done.includes(r.status)) h = `<button class="b sm ract" data-act="reopen" title="Reopen — set back to “${q.open}”">↺</button>` + h;
-    else h = `<button class="b sm ract" data-act="close" title="Close — mark as “${q.close}”">🆗</button>${q.cancel ? `<button class="b sm ract" data-act="cancel" title="Cancel — mark as “${q.cancel}”">❌</button>` : ''}` + h;
+    else h = `<button class="b sm ract" data-act="close" title="Close — mark as “${q.close}”">✅</button>${q.cancel ? `<button class="b sm ract" data-act="cancel" title="Cancel — mark as “${q.cancel}”">❌</button>` : ''}` + h;
   }
   return h;
 }
@@ -1571,7 +1604,7 @@ function queueAny(files) { if (!files.length) return; const f = files.shift(); g
 const queueFiles = queueAny, queuePOFiles = queueAny;
 function guessFromName(name) {
   const n = name.toLowerCase();
-  const type = /(^|[^a-z])p\.?o([^a-z]|$)|purchase[\s_-]*order/.test(n) ? 'po' : /receipt|rcpt/.test(n) ? 'receipt' : /quot|estimate|proposal/.test(n) ? 'quote' : 'invoice';
+  const type = /(^|[^a-z])p\.?o([^a-z]|$)|purchase[\s_-]*order/.test(n) ? 'po' : /receipt|rcpt/.test(n) ? 'receipt' : /proposal/.test(n) ? 'proposal' : /result/.test(n) ? 'result' : /quot|estimate/.test(n) ? 'quote' : 'invoice';
   // number = a filename token containing a digit (not a date), preferring ones like INV-55, Q-1001, PO-4512, #123
   const toks = name.replace(/\.[a-z0-9]+$/i, '').split(/[\s_()]+/).filter(t => /\d/.test(t) && !/^\d{4}-?\d{2}-?\d{2}$|^\d{1,2}[-.]\d{1,2}[-.]\d{2,4}$/.test(t));
   const num = (toks.find(t => /^(inv|q|qt|quote|po|rcpt|#)/i.test(t)) || toks[toks.length - 1] || '').replace(/^#/, '');
@@ -1605,7 +1638,7 @@ function editDoc(d, file, rest = [], prefill = null) {
       <label id="dueWrap"><span id="dueLbl">${d.type === 'quote' ? 'Valid until' : 'Due date'}</span><input type="date" id="dDue" value="${d.dueDate || ''}"></label>
       <label>Status<select id="dS"></select></label>
       <label class="full">Tags (comma-separated)<input id="dTags" value="${esc((d.tags || []).join(', '))}" placeholder="e.g. reagents, grant-A, CRO"></label>
-      <label class="full">Description<textarea id="dDesc">${esc(d.description || '')}</textarea></label>
+      <label class="full">Description / notes<textarea id="dDesc">${esc(d.description || '')}</textarea></label>
       <label class="full" id="itemsWrap">Line items <span class="muted">(used to generate POs)</span>${itemsEditor(d.items)}</label>
       <label class="full">${file || d.file ? 'File' : 'Attach file (optional)'}${d.file ? `<div class="small">${esc(d.fileName)} <button class="b sm" id="dView" type="button">Open ↗</button> <button class="b sm danger" id="dRmFile" type="button">Remove file</button> <span class="muted">— or choose a file below to replace it</span></div>` : ''}${!file ? `<input type="file" id="dFile"><div class="small" id="dDupWarn" style="color:var(--warn)"></div>` : `<div class="small">${esc(file.name)} · ${(file.size / 1024).toFixed(0)} KB</div>`}</label>
     </div>
@@ -1618,9 +1651,9 @@ function editDoc(d, file, rest = [], prefill = null) {
   const fillStatus = () => {
     const t = $('#dT', body).value; if (t === 'po') return;
     $('#dS', body).innerHTML = DOC_STATUS[t].map(s => `<option ${d.status === s ? 'selected' : ''}>${s}</option>`).join('');
-    $('#dueLbl', body).textContent = t === 'quote' ? 'Valid until' : 'Due date';
-    $('#dueWrap', body).style.display = t === 'receipt' || t === 'other' ? 'none' : '';
-    $('#itemsWrap', body).style.display = t === 'receipt' ? 'none' : '';
+    $('#dueLbl', body).textContent = t === 'quote' || t === 'proposal' ? 'Valid until' : 'Due date';
+    $('#dueWrap', body).style.display = ['receipt', 'result', 'other'].includes(t) ? 'none' : '';
+    $('#itemsWrap', body).style.display = ['receipt', 'result', 'other'].includes(t) ? 'none' : '';
   };
   fillStatus();
   $('#dT', body).onchange = () => {
@@ -1726,7 +1759,8 @@ async function addFilesToChain(files, step, kind, id, payTxnId) {
         const d = { id: 'd_' + uid(), type, number: g.number, vendor: r.vendor || '', date: '', amount: '', status: DOC_STATUS[type][0], tags: [], description: step === 'paid' ? 'Payment confirmation' : '', items: [], linkedTxnIds: [], needsReview: true, createdAt: new Date().toISOString(), fileName: f.name };
         d.file = await fileObj(`accounting/docs/${d.id}/${safeId(f.name)}`); await persist('docs', d);
         if (type === 'invoice') { if (c.pos[0]) await setInvPO(d, c.pos[0]); else if (c.quotes[0]) await setInvQuote(d, c.quotes[0]); }
-        if (type === 'quote') { if (c.pos[0]) await setPOQuote(c.pos[0], d); else if (r.type === 'invoice') await setInvQuote(r, d); }
+        if (type === 'quote') { if (ATTACH.has(r.type)) await setAttachQuote(r, d); else if (c.pos[0]) await setPOQuote(c.pos[0], d); else if (r.type === 'invoice') await setInvQuote(r, d); }
+        if (ATTACH.has(type)) { const q = r.type === 'quote' ? r : c.quotes[0]; if (q) await setAttachQuote(d, q); }
         if (type === 'receipt') { const pays = chainPayments(kind, r).pays; const tid = payTxnId || (pays.length === 1 ? pays[0].t.id : null); if (tid) { const t = S.txns.find(x => x.id === tid); d.amount = Math.abs(t.amount); d.date = t.date; await persist('docs', d); await setLink(linkItem('doc', d), tid, true); } }
         made.push(DOC_TYPES[type].toLowerCase());
       }
@@ -1743,13 +1777,14 @@ function linkagePanel(host, kind, id, hooks = {}) {
     const r = recOf(kind, id); if (!r) { host.innerHTML = ''; return; }
     const c = chainOf(kind, r); const P = chainPayments(kind, r);
     const myType = kind === 'po' ? 'po' : r.type;
-    const cols = r.type === 'receipt' ? ['self', 'paid'] : r.type === 'other' ? ['paid'] : ['quote', 'po', 'invoice', 'paid'];
+    const isAtt = kind !== 'po' && ATTACH.has(r.type);
+    const cols = r.type === 'receipt' ? ['self', 'paid'] : isAtt ? ['quote', 'self'] : ['quote', 'po', 'invoice', 'paid'];
     const label = { quote: 'Quote', po: 'Purchase order', invoice: 'Invoice', paid: 'Payments', self: DOC_TYPES[r.type] };
     const item = (k, x, step) => `<div class="lkItem"><span><b>${k === 'po' ? 'PO' : DOC_TYPES[x.type]}</b> ${esc(x.number || '')} · ${esc(x.vendor || x.fileName || '')}<br><span class="small muted">${fmtDate(x.date)} · ${money(k === 'po' ? poTotals(x).total : x.amount)}${x.status ? ' · ' + esc(x.status) : ''}</span></span>
       <span class="lkBtns"><button type="button" class="b sm" data-open="${k}:${x.id}" title="Open this document">Open</button><button type="button" class="b sm danger" data-unlink="${step}:${x.id}" title="Remove this link">✕</button></span></div>`;
     const opt = o => `<option value="${o.id}">${o.score >= 50 ? '★ ' : ''}${esc(o.text)}${o.taken ? ' — ' + esc(o.taken) : ''}</option>`;
     const sel = (step, opts, extra = '') => { const av = opts.filter(o => !o.taken), tk = opts.filter(o => o.taken);
-      return `<select class="lkAdd" data-add="${step}"><option value="">＋ Link ${{ paid: 'a payment', po: 'a PO', invoice: 'an invoice', quote: 'a quote' }[step]}…</option>${extra}${av.map(opt).join('')}${tk.length ? `<optgroup label="Linked elsewhere — choosing one moves it here">${tk.map(opt).join('')}</optgroup>` : ''}</select>`; };
+      return `<select class="lkAdd" data-add="${step}"><option value="">＋ Link ${{ paid: 'a payment', po: 'a PO', invoice: 'an invoice', quote: 'a quote', attach: 'an existing proposal, result or other document' }[step]}…</option>${extra}${av.map(opt).join('')}${tk.length ? `<optgroup label="Linked elsewhere — choosing one moves it here">${tk.map(opt).join('')}</optgroup>` : ''}</select>`; };
     const docOpt = (d, ref) => ({ id: d.id, score: relScore(ref, d), text: `${d.number || '—'} · ${d.vendor || d.fileName || ''} · ${money(d.amount)} · ${fmtDate(d.date)}` });
     const poOpt = (p, ref) => ({ id: p.id, score: relScore(ref, p), text: `${p.number || '—'} · ${p.vendor || ''} · ${money(poTotals(p).total)} · ${fmtDate(p.date)}` });
     const rank = L => L.sort((a, b) => b.score - a.score).slice(0, 60);
@@ -1759,7 +1794,10 @@ function linkagePanel(host, kind, id, hooks = {}) {
         return `<div class="lkCol self"><div class="lkHead">● ${label[step === 'self' ? 'self' : step]}${sib.length ? ` <span class="muted">(${c.invs.length})</span>` : ''}</div><div class="small muted">this document</div>${sib.map(i => item('doc', i, 'invoice')).join('')}${sib.length ? '' : ''}</div>`;
       }
       let inner = '', ok = false;
-      if (step === 'quote') {
+      if (step === 'quote' && isAtt) {
+        ok = !!c.quotes.length; inner = c.quotes.map(q => item('doc', q, 'quote')).join('');
+        if (!ok) inner += sel('quote', rank(S.docs.filter(d => d.type === 'quote').map(d => docOpt(d, r))));
+      } else if (step === 'quote') {
         ok = !!c.quotes.length; inner = c.quotes.map(q => item('doc', q, 'quote')).join('');
         if (!ok) inner += c.pos.length ? sel('quote', rank(S.docs.filter(d => d.type === 'quote').map(d => { const u = S.pos.find(p => p.quoteId === d.id && p.id !== c.pos[0].id); return { ...docOpt(d, c.pos[0]), taken: u ? 'on ' + u.number : '' }; })))
           : r.type === 'invoice' ? sel('quote', rank(S.docs.filter(d => d.type === 'quote').map(d => docOpt(d, r)))) : `<div class="small muted">Link a PO first.</div>`;
@@ -1787,7 +1825,14 @@ function linkagePanel(host, kind, id, hooks = {}) {
     const ac = c.ac; const keys = ['quote', 'po', 'invoice', 'receipt', 'paid'].filter(k => k in ac.vals);
     const totals = keys.length > 1 ? `<div class="lkSum ${c.closed ? '' : ac.flagged ? 'bad' : ''}"><b>Totals</b> ${keys.map(k => `<span class="${ac.flagged && !c.closed && ac.bad.includes(k) ? 'amtx' : ''}">${AMT_LBL[k]} ${money(ac.vals[k])}</span>`).join('<span class="muted"> · </span>')}
       <span style="flex:1"></span>${c.closed ? '<span class="muted">closed</span>' : ac.flagged ? `<span>⚠ ${esc(ac.msg)}</span> <button type="button" class="b sm" data-amtok title="The amounts are correct as they are — stop flagging this chain">Mark as OK</button>` : ac.ack ? `<span class="muted">✓ difference marked OK — ${esc(ac.msg)}</span> <a href="#" data-amtundo>undo</a>` : `<span style="color:var(--good)">✓ totals agree${P.pays.length > 1 ? ` (${P.pays.length} payments)` : ''}</span>`}</div>` : '';
-    host.innerHTML = r.needsReview ? '' : `<div class="lkTitle">Linkage <span class="small muted">— ★ = likely match. Changes save immediately.</span></div><div class="lkRow">${cols.map(col).join('<div class="lkArrow">›</div>')}</div>${totals}`;
+    const q0 = r.type === 'quote' ? r : !isAtt ? c.quotes[0] : null;
+    const support = q0 ? (() => {
+      const att = S.docs.filter(d => ATTACH.has(d.type) && d.quoteId === q0.id);
+      const opts = rank(S.docs.filter(d => ATTACH.has(d.type) && d.quoteId !== q0.id).map(d => ({ ...docOpt(d, q0), text: `${DOC_TYPES[d.type]} · ${d.number || d.fileName || '—'} · ${d.vendor || ''} · ${fmtDate(d.date)}`, taken: d.quoteId ? 'on quote ' + (S.docs.find(x => x.id === d.quoteId)?.number || '?') : '' })));
+      return `<div class="lkSupport"><div class="lkHead">📎 Supporting documents for quote ${esc(q0.number || '')} <span class="muted">(${att.length})</span></div>
+        <div class="lkSupRow">${['proposal', 'result', 'other'].map(t => `<div class="lkCol" data-step="${t}"><div class="lkHead">${DOC_TYPES[t]}s</div>${att.filter(d => d.type === t).map(d => item('doc', d, 'attach')).join('') || '<div class="small muted">none</div>'}<label class="lkUp" title="Add a ${DOC_TYPES[t].toLowerCase()} from a file — linked to this quote and marked needs review">📎 Drop ${t === 'other' ? 'a document' : 'a ' + DOC_TYPES[t].toLowerCase()} or <u>choose</u><input type="file" multiple hidden accept=".pdf,image/*,.doc,.docx,.xls,.xlsx,.csv,.txt,.eml,.msg,.heic"></label></div>`).join('')}</div>
+        ${opts.length ? sel('attach', opts) : ''}</div>`; })() : '';
+    host.innerHTML = r.needsReview ? '' : `<div class="lkTitle">Linkage <span class="small muted">— ★ = likely match. Changes save immediately.</span></div><div class="lkRow">${cols.map(col).join('<div class="lkArrow">›</div>')}</div>${totals}${support}`;
   };
   const after = async msg => { if (msg) toast(msg); derive(); draw(); hooks.changed?.(recOf(kind, id)); render(); };
   host.addEventListener('click', async e => {
@@ -1795,6 +1840,8 @@ function linkagePanel(host, kind, id, hooks = {}) {
     const o = e.target.closest('[data-open]'); if (o) { e.preventDefault(); const [k, x] = o.dataset.open.split(':'); return hooks.open ? hooks.open(k, x) : openRecord(k, x); }
     const u = e.target.closest('[data-unlink]');
     if (u) { const [step, x] = u.dataset.unlink.split(':');
+      if (step === 'attach') { const d = recOf('doc', x); d.quoteId = ''; await persist('docs', d); return after('Unlinked from the quote'); }
+      if (step === 'quote' && ATTACH.has(r.type)) { r.quoteId = ''; await persist('docs', r); return after('Quote unlinked'); }
       if (step === 'quote') { if (c.pos[0]) { const p = c.pos[0]; p.quoteId = ''; p.quoteRef = ''; await persist('pos', p); } for (const i of c.invs.filter(i => !i.poId && i.quoteId === x)) { i.quoteId = ''; await persist('docs', i); } return after('Quote unlinked'); }
       if (step === 'po') { if (r.type === 'invoice') { r.poId = ''; await persist('docs', r); } else { const p = recOf('po', x); p.quoteId = ''; p.quoteRef = ''; await persist('pos', p); } return after('PO unlinked'); }
       if (step === 'invoice') { const i = recOf('doc', x); i.poId = ''; i.quoteId = ''; await persist('docs', i); return after('Invoice unlinked'); } }
@@ -1814,6 +1861,8 @@ function linkagePanel(host, kind, id, hooks = {}) {
     const s = e.target.closest('.lkAdd'); if (!s || !s.value) return; const v = s.value; s.disabled = true;
     const r = recOf(kind, id); const c = chainOf(kind, r); const step = s.dataset.add;
     try {
+      if (step === 'attach') { await setAttachQuote(recOf('doc', v), r.type === 'quote' ? r : c.quotes[0]); return after(); }
+      if (step === 'quote' && ATTACH.has(r.type)) { await setAttachQuote(r, recOf('doc', v)); return after(); }
       if (step === 'quote') { if (c.pos[0]) await setPOQuote(c.pos[0], recOf('doc', v)); else await setInvQuote(r, recOf('doc', v)); return after(); }
       if (step === 'po') {
         if (v === '__new') return hooks.newPO ? hooks.newPO(r) : editPO(null, r);
